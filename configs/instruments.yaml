@@ -1,0 +1,64 @@
+MES:
+  exchange: CME
+  symbol: MES
+  tick_size: 0.25
+  point_value: 5.0
+  tick_value: 1.25
+  rth_tz: America/New_York
+  rth_start: "09:30"
+  rth_end: "16:00"
+  contract_multiplier: 5.0
+  min_tick: 0.25
+  currency: USD
+
+MICRO10Y:
+  exchange: CBOT
+  symbol: 10Y
+  tick_size: 0.001   # 0.1bp
+  point_value: 100.0
+  tick_value: 1.0
+  rth_tz: America/New_York
+  rth_start: "08:20"
+  rth_end: "15:00"
+  contract_multiplier: 100.0
+  min_tick: 0.001
+  currency: USD
+
+MNQ:
+  exchange: CME
+  symbol: MNQ
+  tick_size: 0.25
+  point_value: 2.0
+  tick_value: 0.5
+  rth_tz: America/New_York
+  rth_start: "09:30"
+  rth_end: "16:00"
+  contract_multiplier: 2.0
+  min_tick: 0.25
+  currency: USD
+
+MCL:
+  exchange: NYMEX
+  symbol: MCL
+  tick_size: 0.01
+  point_value: 10.0
+  tick_value: 0.1
+  rth_tz: America/New_York
+  rth_start: "09:00"
+  rth_end: "17:00"
+  contract_multiplier: 10.0
+  min_tick: 0.01
+  currency: USD
+
+6E:
+  exchange: CME
+  symbol: 6E
+  tick_size: 0.0001
+  point_value: 12500.0
+  tick_value: 1.25
+  rth_tz: America/New_York
+  rth_start: "23:00"  # Sunday evening
+  rth_end: "22:00"    # Friday afternoon
+  contract_multiplier: 12500.0
+  min_tick: 0.0001
+  currency: USD
