@@ -606,3 +606,17 @@ class TechnicalIndicators:
         reversal_down = (price_change > 0.02) & (data['close'] < data['open'])
         
         return reversal_up | reversal_down
+
+
+def calculate_returns(series: pd.Series, periods: int = 1) -> pd.Series:
+    """
+    Calculate returns for a given series.
+    
+    Args:
+        series: Price series
+        periods: Number of periods to look back
+        
+    Returns:
+        Returns series
+    """
+    return series.pct_change(periods)

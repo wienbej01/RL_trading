@@ -476,3 +476,91 @@ def calculate_performance_metrics(
         alpha=alpha,
         tracking_error=tracking_error
     )
+
+
+def calculate_risk_metrics(returns: pd.Series, portfolio_value: float = 100000.0) -> Dict[str, float]:
+    """
+    Calculate comprehensive risk metrics for portfolio management.
+    
+    Args:
+        returns: Series of portfolio returns
+        portfolio_value: Current portfolio value
+        
+    Returns:
+        Dictionary of risk metrics
+    """
+    if len(returns) == 0:
+        return {
+            'var_95': 0.0,
+            'var_99': 0.0,
+            'cvar_95': 0.0,
+            'cvar_99': 0.0,
+            'volatility': 0.0,
+            'max_drawdown': 0.0,
+            'calmar_ratio': 0.0,
+            'sharpe_ratio': 0.0,
+            'sortino_ratio': 0.0,
+            'beta': 0.0,
+            'alpha': 0.0,
+            'tracking_error': 0.0,
+            'information_ratio': 0.0
+        }
+    
+    # Basic risk metrics
+    var_95 = RiskMetricsCalculator.calculate_var(returns, 0.95)
+    var_99 = RiskMetricsCalculator.calculate_var(returns, 0.99)
+    cvar_95 = RiskMetricsCalculator.calculate_cvar(returns, 0.95)
+    cvar_99 = RiskMetricsCalculator.calculate_cvar(returns, 0.99)
+    volatility = returns.std() * np.sqrt(252)
+    
+    # Drawdown analysis
+    equity_curve = portfolio_value * (1 + returns.cumsum())
+    drawdown_analyzer = DrawdownAnalyzer()
+    for equity in equity_curve:
+        drawdown_analyzer.update(equity)
+    max_drawdown = drawdown_analyzer.max_drawdown
+    
+    # Risk-adjusted ratios
+    sharpe_ratio = RiskMetricsCalculator.calculate_sharpe_ratio(returns)
+    sortino_ratio = RiskMetricsCalculator.calculate_sortino_ratio(returns)
+    calmar_ratio = RiskMetricsCalculator.calculate_calmar_ratio(returns, max_drawdown)
+    
+    # Additional metrics (relative to S&P 500 as benchmark)
+    benchmark_returns = returns * 0.8  # Simplified benchmark
+    if len(returns) == len(benchmark_returns):
+        excess_returns = returns - benchmark_returns
+        if excess_returns.std() > 0:
+            information_ratio = np.sqrt(252) * excess_returns.mean() / excess_returns.std()
+        else:
+            information_ratio = 0.0
+        
+        if benchmark_returns.std() > 0:
+            covariance = np.cov(returns, benchmark_returns)[0, 1]
+            beta = covariance / (benchmark_returns.var() + 1e-8)
+            alpha = returns.mean() * 252 - (0.02 + beta * (benchmark_returns.mean() * 252 - 0.02))
+            tracking_error = returns.std() * np.sqrt(252)
+        else:
+            beta = 0.0
+            alpha = 0.0
+            tracking_error = 0.0
+    else:
+        information_ratio = 0.0
+        beta = 0.0
+        alpha = 0.0
+        tracking_error = 0.0
+    
+    return {
+        'var_95': var_95,
+        'var_99': var_99,
+        'cvar_95': cvar_95,
+        'cvar_99': cvar_99,
+        'volatility': volatility,
+        'max_drawdown': max_drawdown,
+        'calmar_ratio': calmar_ratio,
+        'sharpe_ratio': sharpe_ratio,
+        'sortino_ratio': sortino_ratio,
+        'beta': beta,
+        'alpha': alpha,
+        'tracking_error': tracking_error,
+        'information_ratio': information_ratio
+    }

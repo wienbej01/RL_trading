@@ -13,6 +13,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class ConfigError(Exception):
+    """Exception raised for configuration errors."""
+    pass
+
+
 @dataclass
 class Settings:
     """
@@ -163,3 +168,32 @@ def get_config_path(config_name: str = "settings.yaml") -> Path:
         Full path to configuration file
     """
     return get_project_root() / "configs" / config_name
+
+
+def load_yaml(file_path: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Load YAML configuration file.
+    
+    Args:
+        file_path: Path to YAML file
+        
+    Returns:
+        Configuration dictionary
+        
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        yaml.YAMLError: If YAML is malformed
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"YAML file not found: {file_path}")
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing YAML file {file_path}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error loading YAML file {file_path}: {e}")
+        raise

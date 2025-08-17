@@ -24,6 +24,23 @@ except ImportError:
     IBKR_AVAILABLE = False
     print("Warning: ib_insync not available. Install with: pip install ib_insync")
 
+# Mock classes for testing without IBKR
+if not IBKR_AVAILABLE:
+    class Contract:
+        pass
+    class Trade:
+        pass
+    class Fill:
+        pass
+    class Position:
+        pass
+    class Ticker:
+        pass
+    class Order:
+        pass
+    class BarData:
+        pass
+
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
 from ..sim.risk import RiskManager, RiskConfig
@@ -206,7 +223,7 @@ class IBKRClient:
             self.connected = False
             logger.info("Disconnected from IBKR")
     
-    def get_contract(self, symbol: str, exchange: str = "CME", currency: str = "USD", **kwargs) -> Optional[Contract]:
+    async def get_contract(self, symbol: str, exchange: str = "CME", currency: str = "USD", **kwargs) -> Optional[Contract]:
         """
         Get contract for a symbol.
         

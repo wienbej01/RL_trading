@@ -289,7 +289,7 @@ class TimeFeatures:
         result['time_momentum_regime'] = pd.cut(
             result['time_weighted_momentum'],
             bins=[-np.inf, -0.02, 0.02, np.inf],
-            labels['negative', 'neutral', 'positive']
+            labels=['negative', 'neutral', 'positive']
         )
         
         # Momentum time patterns
