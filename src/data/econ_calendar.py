@@ -575,3 +575,5 @@ class EconomicCalendar:
             'total_size_mb': total_size / (1024 * 1024),
             'files': [f.name for f in cache_files]
         }
+# Alias for compatibility
+EconCalendar = EconomicCalendar

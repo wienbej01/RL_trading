@@ -142,30 +142,35 @@ class TestSetupLogging:
             'symbol': 'MES'
         })
     
-    @patch('logging.handlers.RotatingFileHandler')
+    @patch('src.utils.logging.RotatingFileHandler')
     def test_setup_logging_rotation(self, mock_handler):
         """Test logging setup with file rotation."""
         mock_handler_instance = MagicMock()
         mock_handler.return_value = mock_handler_instance
-        
+
         with tempfile.NamedTemporaryFile(suffix='.log', delete=False) as tmp_file:
             log_file = tmp_file.name
-        
+
         try:
             setup_logging(
                 log_file=log_file,
                 max_bytes=1024*1024,  # 1MB
                 backup_count=5
             )
-            
+
             # Verify that RotatingFileHandler was called with correct parameters
             mock_handler.assert_called_with(
-                log_file,
+                str(log_file),
                 maxBytes=1024*1024,
-                backupCount=5
+                backupCount=5,
+                encoding='utf-8'
             )
-            
+
+            # Verify that the handler was added to the root logger
+            assert mock_handler_instance in logging.getLogger().handlers
+
         finally:
+            # Clean up
             if os.path.exists(log_file):
                 os.unlink(log_file)
 

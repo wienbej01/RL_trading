@@ -206,7 +206,7 @@ class PolicyHead(nn.Module):
         
         # Policy head layers
         policy_layers = []
-        input_dim = config.shared_layers[-1] if config.shared_layers else config.lstm_hidden_dim
+        input_dim = config.shared_layers[-1] if config.shared_layers else config.lstm_hidden_size
         
         for hidden_dim in config.policy_head_layers:
             policy_layers.extend([
@@ -244,30 +244,54 @@ class PPOLSTMPolicy(nn.Module):
     policy and value heads.
     """
     
-    def __init__(self, config: PolicyConfig):
+    def __init__(self, config=None, obs_dim=None, action_dim=None, hidden_dim=None, sequence_length=None):
         """
         Initialize PPO-LSTM policy.
         
         Args:
-            config: Policy configuration
+            config: Policy configuration (optional)
+            obs_dim: Observation dimension (for test compatibility)
+            action_dim: Action dimension (for test compatibility)
+            hidden_dim: Hidden dimension (for test compatibility)
+            sequence_length: Sequence length (for test compatibility)
         """
         super().__init__()
-        self.config = config
+        
+        # Handle test compatibility mode
+        if config is None and obs_dim is not None:
+            # Create config from individual parameters for test compatibility
+            self.config = PolicyConfig(
+                feature_dim=obs_dim,
+                action_dim=action_dim,
+                lstm_hidden_size=hidden_dim,
+                lstm_num_layers=1,
+                lstm_dropout=0.1,
+                shared_layers=[hidden_dim, hidden_dim//2],
+                value_head_layers=[hidden_dim//2, hidden_dim//4],
+                policy_head_layers=[hidden_dim//2, hidden_dim//4]
+            )
+        else:
+            # Use provided config
+            self.config = config if config is not None else PolicyConfig()
         
         # Feature extractor
-        self.feature_extractor = LSTMFeatureExtractor(config)
+        self.feature_extractor = LSTMFeatureExtractor(self.config)
         
         # Shared feature extractor
-        self.shared_extractor = SharedFeatureExtractor(config)
+        self.shared_extractor = SharedFeatureExtractor(self.config)
         
         # Value head
-        self.value_head = ValueHead(config)
+        self.value_head = ValueHead(self.config)
         
         # Policy head
-        self.policy_head = PolicyHead(config)
+        self.policy_head = PolicyHead(self.config)
         
         # Initialize weights
         self._initialize_weights()
+        
+        # For test compatibility - create actor_critic attribute
+        self.actor_critic = self
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=3e-4)
         
     def _initialize_weights(self):
         """Initialize network weights."""
@@ -390,6 +414,114 @@ class PPOLSTMPolicy(nn.Module):
         entropy = -(probs * log_probs).sum(dim=-1)
         
         return action_log_probs, entropy, value
+    
+    def init_hidden_state(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Initialize hidden state for LSTM (for test compatibility).
+        
+        Args:
+            batch_size: Batch size
+            
+        Returns:
+            Initial hidden state
+        """
+        return self.get_initial_hidden(batch_size, next(self.parameters()).device)
+    
+    def act(self, x: torch.Tensor, hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Get action, log probabilities, and value estimate (for test compatibility).
+        
+        Args:
+            x: Input tensor
+            hidden: Optional hidden state
+            
+        Returns:
+            Action, log probabilities, value estimate, and hidden state
+        """
+        with torch.no_grad():
+            logits, value, hidden = self.forward(x, hidden)
+            
+            # Sample action
+            action_probs = F.softmax(logits, dim=-1)
+            action = torch.multinomial(action_probs, num_samples=1).squeeze()
+            
+            # Get log probabilities
+            log_probs = F.log_softmax(logits, dim=-1)
+            action_log_probs = log_probs.gather(1, action.unsqueeze(1)).squeeze()
+            
+            return action, action_log_probs, value.squeeze(), hidden
+    
+    def update(self, obs_batch: torch.Tensor, actions_batch: torch.Tensor, old_log_probs: torch.Tensor, returns: torch.Tensor, advantages: torch.Tensor) -> Tuple[float, float, float]:
+        """
+        Update policy using PPO (for test compatibility).
+        
+        Args:
+            obs_batch: Observation batch
+            actions_batch: Action batch
+            old_log_probs: Old log probabilities
+            returns: Returns
+            advantages: Advantages
+            
+        Returns:
+            Policy loss, value loss, entropy loss
+        """
+        # Forward pass
+        log_probs, entropy, values = self.evaluate_actions(obs_batch, actions_batch)
+        
+        # Compute ratio
+        ratio = torch.exp(log_probs.squeeze() - old_log_probs)
+        
+        # PPO loss
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - 0.2, 1 + 0.2) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
+        
+        # Value loss
+        value_loss = F.mse_loss(values.squeeze(), returns)
+        
+        # Entropy loss
+        entropy_loss = -entropy.mean()
+        
+        # Total loss
+        total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
+        
+        # Backward pass
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
+        self.optimizer.step()
+        
+        return policy_loss.item(), value_loss.item(), entropy_loss.item()
+    
+    def save_model(self, filepath: str):
+        """
+        Save model to file (for test compatibility).
+        
+        Args:
+            filepath: Path to save file
+        """
+        torch.save({
+            'policy_state_dict': self.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config
+        }, filepath)
+        
+        logger.info(f"Model saved to {filepath}")
+    
+    def load_model(self, filepath: str):
+        """
+        Load model from file (for test compatibility).
+        
+        Args:
+            filepath: Path to load file
+        """
+        checkpoint = torch.load(filepath, map_location='cpu')
+        
+        self.load_state_dict(checkpoint['policy_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.config = checkpoint['config']
+        
+        logger.info(f"Model loaded from {filepath}")
 
 
 class PPOLSTMPolicyWrapper:

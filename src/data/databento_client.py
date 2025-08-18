@@ -130,7 +130,7 @@ class DatabentoClient:
             logger.error(f"Failed to get historical data for {symbol}: {e}")
             raise
     
-    def _timeseries_to_dataframe(self, data: db.Timeseries) -> pd.DataFrame:
+    def _timeseries_to_dataframe(self, data) -> pd.DataFrame:
         """
         Convert Databento timeseries data to DataFrame.
         

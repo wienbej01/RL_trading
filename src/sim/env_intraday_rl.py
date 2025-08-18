@@ -15,7 +15,7 @@ from gymnasium.spaces import Box, Discrete
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
 from ..utils.metrics import DifferentialSharpe
-from .execution import ExecutionSimulator, estimate_tc
+from .execution import ExecutionSimulator, estimate_tc, ExecParams
 from .risk import RiskManager, RiskConfig
 
 logger = get_logger(__name__)
@@ -50,7 +50,8 @@ class IntradayRLEnv(Env):
                  exec_params: Optional[Dict] = None,
                  risk_cfg: Optional[RiskConfig] = None,
                  point_value: float = 5.0,
-                 env_config: Optional[EnvConfig] = None):
+                 env_config: Optional[EnvConfig] = None,
+                 config: Optional[Dict] = None):
         """
         Initialize RL environment.
         
@@ -62,6 +63,7 @@ class IntradayRLEnv(Env):
             risk_cfg: Risk configuration
             point_value: Point value (e.g., $5 for MES)
             env_config: Environment configuration
+            config: Configuration dictionary (for compatibility)
         """
         super().__init__()
         
@@ -69,21 +71,73 @@ class IntradayRLEnv(Env):
         self.cash = cash
         self.point_value = point_value
         self.env_config = env_config or EnvConfig(cash=cash)
+        self.config = config  # Store config for compatibility
         
         # Data
         self.ohlcv = ohlcv[['open', 'high', 'low', 'close', 'volume']]
         self.features = features.reindex(ohlcv.index, method='ffill')
+        self.df = ohlcv  # For compatibility
+        self.X = features  # For compatibility
         
         # Ensure alignment
         self.ohlcv = self.ohlcv.loc[self.features.index]
         
         # Initialize components
+        logger.debug("Initializing ExecutionSimulator with empty Settings()")
         self.exec_sim = ExecutionSimulator(Settings())
         if exec_params:
-            self.exec_sim.exec_params = self.exec_sim.ExecParams(**exec_params)
+            logger.debug(f"Mapping exec_params: {exec_params}")
+            # Map parameter names from test format to ExecParams format
+            exec_params_mapped = {
+                'commission_per_contract': exec_params.get('transaction_cost', 2.5),
+                'slippage_bps': exec_params.get('slippage', 0.01) * 100,  # Convert to bps
+                'tick_value': exec_params.get('tick_value', 1.25),
+                'spread_ticks': exec_params.get('spread_ticks', 1),
+                'impact_bps': exec_params.get('impact_bps', 0.5),
+                'min_commission': exec_params.get('min_commission', 1.0),
+                'liquidity_threshold': exec_params.get('liquidity_threshold', 1000)
+            }
+            logger.debug(f"Mapped exec_params: {exec_params_mapped}")
+            self.exec_sim.exec_params = ExecParams(**exec_params_mapped)
         
-        self.risk_manager = RiskManager(Settings())
+        # Create a proper Settings object from the config
+        logger.debug("Creating Settings object for configuration")
+        settings = Settings()
+        logger.debug(f"Checking for config attribute: hasattr(self, 'config') = {hasattr(self, 'config')}")
+        
+        if hasattr(self, 'config') and self.config:
+            logger.debug(f"Found config attribute with content: {self.config}")
+            # Ensure config keys are strings and update proper Settings format
+            config_dict = {
+                str(key): value
+                for key, value in self.config.items()
+            }
+            logger.debug(f"Converted config_dict: {config_dict}")
+            
+            # Set defaults for required keys
+            settings._config.update({
+                'risk': {
+                    'max_position_size': config_dict.get('max_position_size', 5),
+                    'max_daily_loss_r': config_dict.get('risk', {}).get('max_daily_loss_r', 0.05),
+                    'stop_r_multiple': config_dict.get('risk', {}).get('stop_r_multiple', 2.0),
+                    'VaR_level': config_dict.get('risk', {}).get('VaR_level', 0.95),
+                    'cvar_level': config_dict.get('risk', {}).get('cvar_level', 0.99)
+                },
+                'execution': {
+                    'transaction_cost': config_dict.get('transaction_cost', 2.5),
+                    'slippage': config_dict.get('slippage', 0.01)
+                }
+            })
+            logger.debug(f"Updated settings._config: {settings._config}")
+        else:
+            logger.warning("No config attribute found or config is empty - using default settings")
+        
+        logger.debug(f"Final settings object: {settings._config}")
+        self.settings = settings
+        logger.debug("Initializing RiskManager with settings")
+        self.risk_manager = RiskManager(settings)
         if risk_cfg:
+            logger.debug(f"Updating RiskManager with risk_cfg: {risk_cfg}")
             self.risk_manager.risk_config = risk_cfg
         
         # State tracking
@@ -374,3 +428,211 @@ def create_env(settings: Settings) -> IntradayRLEnv:
         risk_cfg=RiskConfig(),
         point_value=5.0
     )
+
+
+# Alias for compatibility
+class IntradayRLEnvironment(IntradayRLEnv):
+    """
+    Compatibility wrapper for IntradayRLEnvironment to match test expectations.
+    
+    This class provides the interface expected by the tests while internally
+    using the enhanced IntradayRLEnv implementation.
+    """
+    
+    def __init__(self, market_data=None, config=None, **kwargs):
+        """
+        Initialize environment with test-compatible interface.
+        
+        Args:
+            market_data: DataFrame with market data (OHLCV and microstructure)
+            config: Configuration dictionary
+            **kwargs: Additional arguments for compatibility
+        """
+        logger.debug(f"IntradayRLEnvironment.__init__ called with market_data={market_data is not None}, config={config is not None}")
+        logger.debug(f"Config content: {config}")
+        
+        if market_data is None or config is None:
+            logger.debug("Using default initialization for empty environment")
+            # Default initialization for empty environment
+            super().__init__(
+                ohlcv=pd.DataFrame(),
+                features=pd.DataFrame(),
+                cash=100000.0,
+                exec_params={},
+                risk_cfg=RiskConfig(),
+                point_value=5.0
+            )
+            return
+        
+        logger.debug("Processing market_data and config for full initialization")
+        # Extract OHLCV data
+        ohlcv = market_data[['open', 'high', 'low', 'close', 'volume']].copy()
+        logger.debug(f"Extracted OHLCV data shape: {ohlcv.shape}")
+        
+        # Extract features from config
+        features_list = []
+        if 'features' in config:
+            logger.debug(f"Processing features config: {config['features']}")
+            # Technical features
+            if 'technical' in config['features']:
+                logger.debug(f"Processing technical features: {config['features']['technical']}")
+                for feat in config['features']['technical']:
+                    if feat.startswith('sma_'):
+                        window = int(feat.split('_')[1])
+                        ohlcv[feat] = ohlcv['close'].rolling(window=window).mean()
+                    elif feat.startswith('rsi_'):
+                        window = int(feat.split('_')[1])
+                        delta = ohlcv['close'].diff()
+                        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+                        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+                        rs = gain / loss
+                        ohlcv[feat] = 100 - (100 / (1 + rs))
+                    elif feat.startswith('atr_'):
+                        window = int(feat.split('_')[1])
+                        high_low = ohlcv['high'] - ohlcv['low']
+                        high_close = np.abs(ohlcv['high'] - ohlcv['close'].shift())
+                        low_close = np.abs(ohlcv['low'] - ohlcv['close'].shift())
+                        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+                        true_range = ranges.max(axis=1)
+                        ohlcv[feat] = true_range.rolling(window=window).mean()
+            
+            # Microstructure features
+            if 'microstructure' in config['features']:
+                logger.debug(f"Processing microstructure features: {config['features']['microstructure']}")
+                for feat in config['features']['microstructure']:
+                    if feat == 'spread':
+                        ohlcv[feat] = market_data['ask_price'] - market_data['bid_price']
+                    elif feat == 'imbalance':
+                        ohlcv[feat] = (market_data['ask_size'] - market_data['bid_size']) / \
+                                    (market_data['ask_size'] + market_data['bid_size'])
+            
+            # Time features
+            if 'time' in config['features']:
+                logger.debug(f"Processing time features: {config['features']['time']}")
+                for feat in config['features']['time']:
+                    if feat == 'hour':
+                        ohlcv[feat] = ohlcv.index.hour
+                    elif feat == 'minute':
+                        ohlcv[feat] = ohlcv.index.minute
+                    elif feat == 'time_to_close':
+                        # Calculate minutes until 16:00 close
+                        close_time = pd.Timestamp('16:00').time()
+                        current_time = ohlcv.index.time
+                        ohlcv[feat] = [(close_time.hour - t.hour) * 60 + (close_time.minute - t.minute) 
+                                      for t in current_time]
+        
+        # Create features DataFrame
+        feature_cols = []
+        if 'features' in config:
+            feature_cols = (config['features'].get('technical', []) + 
+                          config['features'].get('microstructure', []) + 
+                          config['features'].get('time', []))
+        
+        logger.debug(f"Feature columns: {feature_cols}")
+        features = ohlcv[feature_cols].copy() if feature_cols else pd.DataFrame(index=ohlcv.index)
+        logger.debug(f"Features DataFrame shape: {features.shape}")
+        
+        # Create execution parameters
+        exec_params = {
+            'transaction_cost': config.get('transaction_cost', 2.5),
+            'slippage': config.get('slippage', 0.01)
+        }
+        logger.debug(f"Execution parameters: {exec_params}")
+        
+        # Create risk configuration
+        risk_cfg = RiskConfig()
+        risk_cfg.max_position_size = config.get('max_position_size', 5)
+        logger.debug(f"Risk config: max_position_size={risk_cfg.max_position_size}")
+        
+        # Initialize parent class
+        logger.debug("Calling parent IntradayRLEnv.__init__")
+        super().__init__(
+            ohlcv=ohlcv,
+            features=features,
+            cash=config.get('initial_cash', 100000.0),
+            exec_params=exec_params,
+            risk_cfg=risk_cfg,
+            point_value=5.0,
+            config=config  # Pass the config to parent class
+        )
+        
+        # Store test-compatible attributes
+        logger.debug("Storing test-compatible attributes")
+        self.config = config
+        self.market_data = market_data
+        
+        # Initialize test-compatible state variables
+        self.current_step = 0
+        self.position = 0
+        self.trade_history = []
+        self.current_price = 0.0
+        self.entry_price = None
+        self.entry_time = None
+        
+        logger.debug("IntradayRLEnvironment initialization completed")
+    
+    def reset(self):
+        """Reset environment with test-compatible interface."""
+        # Call parent reset
+        obs, info = super().reset()
+        
+        # Update test-compatible state
+        self.current_step = 0
+        self.position = self.pos
+        self.trade_history = []
+        
+        return obs
+    
+    def step(self, action):
+        """Step environment with test-compatible interface."""
+        # Map test actions (0=hold, 1=buy, 2=sell) to internal actions (-1, 0, 1)
+        internal_action = {0: 0, 1: 1, 2: -1}[action]
+        
+        # Call parent step
+        obs, reward, done, truncated, info = super().step(internal_action + 1)  # Convert to 0,1,2
+        
+        # Update test-compatible state
+        self.current_step += 1
+        self.position = self.pos
+        
+        # Update trade history if position changed
+        if self.pos != 0 and len(self.trades) > len(self.trade_history):
+            self.trade_history.append({
+                'step': self.current_step,
+                'position': self.pos,
+                'price': self.entry_price,
+                'timestamp': self.df.index[self.i-1] if self.i > 0 else self.df.index[0]
+            })
+        
+        # Update current price
+        if self.i < len(self.df):
+            self.current_price = float(self.df["close"].iloc[self.i])
+        
+        # Create test-compatible info dictionary
+        info = {
+            'position': self.position,
+            'cash': self.cash,
+            'portfolio_value': self.equity,
+            'unrealized_pnl': self.equity - self.cash
+        }
+        
+        return obs, reward, done, info
+    
+    def get_cash(self):
+        """Get current cash for test compatibility."""
+        return self.cash
+    
+    def get_portfolio_value(self):
+        """Get current portfolio value for test compatibility."""
+        return self.equity
+    
+    def check_triple_barrier(self):
+        """Check triple barrier conditions for test compatibility."""
+        # This would be implemented based on the current price and barrier prices
+        return False  # Placeholder
+
+
+# Keep the original alias for backward compatibility
+# IntradayRLEnv = IntradayRLEnv  // Remove this circular reference
+
+

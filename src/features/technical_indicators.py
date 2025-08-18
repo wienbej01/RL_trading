@@ -445,58 +445,58 @@ class TechnicalIndicators:
         length = len(data)
         sar = pd.Series(index=data.index, dtype=float)
         ep = pd.Series(index=data.index, dtype=float)
-        af = pd.Series(index=data.index, dtype=float)
+        af_series = pd.Series(index=data.index, dtype=float)
         
         # Initialize
         sar.iloc[0] = data['low'].iloc[0]
         ep.iloc[0] = data['high'].iloc[0]
-        af.iloc[0] = af
+        af_series.iloc[0] = af
         
         for i in range(1, length):
             if (data['close'].iloc[i] > data['close'].iloc[i-1] and data['close'].iloc[i-1] > data['close'].iloc[i-2]):
                 # Uptrend
-                sar.iloc[i] = sar.iloc[i-1] + af.iloc[i-1] * (ep.iloc[i-1] - sar.iloc[i-1])
+                sar.iloc[i] = sar.iloc[i-1] + af_series.iloc[i-1] * (ep.iloc[i-1] - sar.iloc[i-1])
                 
                 if data['high'].iloc[i] > ep.iloc[i-1]:
                     ep.iloc[i] = data['high'].iloc[i]
-                    af.iloc[i] = min(af.iloc[i-1] + af, max_af)
+                    af_series.iloc[i] = min(af_series.iloc[i-1] + af, max_af)
                 else:
                     ep.iloc[i] = ep.iloc[i-1]
-                    af.iloc[i] = af.iloc[i-1]
+                    af_series.iloc[i] = af_series.iloc[i-1]
                     
                 if data['low'].iloc[i] < sar.iloc[i]:
                     sar.iloc[i] = data['high'].iloc[i]
                     ep.iloc[i] = data['low'].iloc[i]
-                    af.iloc[i] = af
+                    af_series.iloc[i] = af
                     
             elif (data['close'].iloc[i] < data['close'].iloc[i-1] and data['close'].iloc[i-1] < data['close'].iloc[i-2]):
                 # Downtrend
-                sar.iloc[i] = sar.iloc[i-1] - af.iloc[i-1] * (sar.iloc[i-1] - ep.iloc[i-1])
+                sar.iloc[i] = sar.iloc[i-1] - af_series.iloc[i-1] * (sar.iloc[i-1] - ep.iloc[i-1])
                 
                 if data['low'].iloc[i] < ep.iloc[i-1]:
                     ep.iloc[i] = data['low'].iloc[i]
-                    af.iloc[i] = min(af.iloc[i-1] + af, max_af)
+                    af_series.iloc[i] = min(af_series.iloc[i-1] + af, max_af)
                 else:
                     ep.iloc[i] = ep.iloc[i-1]
-                    af.iloc[i] = af.iloc[i-1]
+                    af_series.iloc[i] = af_series.iloc[i-1]
                     
                 if data['high'].iloc[i] > sar.iloc[i]:
                     sar.iloc[i] = data['low'].iloc[i]
                     ep.iloc[i] = data['high'].iloc[i]
-                    af.iloc[i] = af
+                    af_series.iloc[i] = af
             else:
                 # Continue trend
-                sar.iloc[i] = sar.iloc[i-1] + af.iloc[i-1] * (ep.iloc[i-1] - sar.iloc[i-1])
+                sar.iloc[i] = sar.iloc[i-1] + af_series.iloc[i-1] * (ep.iloc[i-1] - sar.iloc[i-1])
                 
                 if data['high'].iloc[i] > ep.iloc[i-1]:
                     ep.iloc[i] = data['high'].iloc[i]
-                    af.iloc[i] = min(af.iloc[i-1] + af, max_af)
+                    af_series.iloc[i] = min(af_series.iloc[i-1] + af, max_af)
                 elif data['low'].iloc[i] < ep.iloc[i-1]:
                     ep.iloc[i] = data['low'].iloc[i]
-                    af.iloc[i] = min(af.iloc[i-1] + af, max_af)
+                    af_series.iloc[i] = min(af_series.iloc[i-1] + af, max_af)
                 else:
                     ep.iloc[i] = ep.iloc[i-1]
-                    af.iloc[i] = af.iloc[i-1]
+                    af_series.iloc[i] = af_series.iloc[i-1]
         
         return sar
     
@@ -608,6 +608,7 @@ class TechnicalIndicators:
         return reversal_up | reversal_down
 
 
+# Standalone functions for direct use
 def calculate_returns(series: pd.Series, periods: int = 1) -> pd.Series:
     """
     Calculate returns for a given series.
@@ -620,3 +621,192 @@ def calculate_returns(series: pd.Series, periods: int = 1) -> pd.Series:
         Returns series
     """
     return series.pct_change(periods)
+
+
+def calculate_log_returns(series: pd.Series, periods: int = 1) -> pd.Series:
+    """
+    Calculate log returns for a given series.
+    
+    Args:
+        series: Price series
+        periods: Number of periods to look back
+        
+    Returns:
+        Log returns series
+    """
+    return np.log(series / series.shift(periods))
+
+
+def calculate_sma(prices: pd.Series, window: int = 20) -> pd.Series:
+    """
+    Calculate Simple Moving Average (SMA).
+    
+    Args:
+        prices: Price series
+        window: Lookback window
+        
+    Returns:
+        SMA series
+    """
+    return prices.rolling(window=window).mean()
+
+
+def calculate_ema(prices: pd.Series, window: int = 20) -> pd.Series:
+    """
+    Calculate Exponential Moving Average (EMA).
+    
+    Args:
+        prices: Price series
+        window: Lookback window
+        
+    Returns:
+        EMA series
+    """
+    return prices.ewm(span=window, adjust=False).mean()
+
+
+def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    """
+    Calculate Average True Range (ATR).
+    
+    Args:
+        high: High price series
+        low: Low price series
+        close: Close price series
+        window: Lookback window for ATR
+        
+    Returns:
+        ATR series
+    """
+    # Calculate True Range
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # Calculate ATR
+    atr = true_range.rolling(window=window).mean()
+    
+    return atr
+
+
+def calculate_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
+    """
+    Calculate Relative Strength Index (RSI).
+    
+    Args:
+        prices: Price series
+        window: Lookback window for RSI
+        
+    Returns:
+        RSI series
+    """
+    # Calculate price changes
+    delta = prices.diff()
+    
+    # Separate gains and losses
+    gains = delta.where(delta > 0, 0)
+    losses = -delta.where(delta < 0, 0)
+    
+    # Calculate average gains and losses
+    avg_gains = gains.rolling(window=window).mean()
+    avg_losses = losses.rolling(window=window).mean()
+    
+    # Calculate RSI
+    rs = avg_gains / avg_losses
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+
+def calculate_macd(prices: pd.Series, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Calculate MACD (Moving Average Convergence Divergence).
+    
+    Args:
+        prices: Price series
+        fast_period: Fast EMA period
+        slow_period: Slow EMA period
+        signal_period: Signal line EMA period
+        
+    Returns:
+        Tuple with MACD line, signal line, and histogram
+    """
+    # Calculate EMAs
+    ema_fast = prices.ewm(span=fast_period).mean()
+    ema_slow = prices.ewm(span=slow_period).mean()
+    
+    # Calculate MACD line
+    macd_line = ema_fast - ema_slow
+    
+    # Calculate signal line
+    signal_line = macd_line.ewm(span=signal_period).mean()
+    
+    # Calculate histogram
+    histogram = macd_line - signal_line
+    
+    return macd_line, signal_line, histogram
+
+
+def calculate_bollinger_bands(prices: pd.Series, window: int = 20, num_std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Calculate Bollinger Bands.
+    
+    Args:
+        prices: Price series
+        window: Lookback window
+        num_std: Number of standard deviations
+        
+    Returns:
+        Tuple with upper band, middle band, and lower band
+    """
+    rolling_mean = prices.rolling(window=window).mean()
+    rolling_std = prices.rolling(window=window).std()
+    
+    upper_band = rolling_mean + (rolling_std * num_std)
+    lower_band = rolling_mean - (rolling_std * num_std)
+    
+    return upper_band, rolling_mean, lower_band
+
+
+def calculate_stochastic_oscillator(high: pd.Series, low: pd.Series, close: pd.Series, 
+                                  k_window: int = 14, d_window: int = 3) -> Tuple[pd.Series, pd.Series]:
+    """
+    Calculate Stochastic Oscillator.
+    
+    Args:
+        high: High price series
+        low: Low price series
+        close: Close price series
+        k_window: Period for %K calculation
+        d_window: Period for %D calculation
+        
+    Returns:
+        Tuple with %K and %D series
+    """
+    low_min = low.rolling(window=k_window).min()
+    high_max = high.rolling(window=k_window).max()
+    k_percent = 100 * ((close - low_min) / (high_max - low_min))
+    d_percent = k_percent.rolling(window=d_window).mean()
+    
+    return k_percent, d_percent
+
+
+def calculate_williams_r(high: pd.Series, low: pd.Series, close: pd.Series, 
+                        window: int = 14) -> pd.Series:
+    """
+    Calculate Williams %R.
+    
+    Args:
+        high: High price series
+        low: Low price series
+        close: Close price series
+        window: Lookback window
+        
+    Returns:
+        Williams %R series
+    """
+    high_max = high.rolling(window=window).max()
+    low_min = low.rolling(window=window).min()
+    wr = -100 * (high_max - close) / (high_max - low_min)
+    return wr

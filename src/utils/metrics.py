@@ -375,192 +375,380 @@ class TradeAnalyzer:
         }
 
 
-def calculate_performance_metrics(
-    equity_curve: pd.Series,
-    risk_free_rate: float = 0.0,
-    benchmark_returns: Optional[pd.Series] = None
-) -> PerformanceMetrics:
-    """
-    Calculate comprehensive performance metrics from equity curve.
+def calculate_drawdown(equity_curve: Union[pd.Series, np.ndarray]) -> Union[pd.Series, np.ndarray]:
+    """Calculate drawdown from equity curve."""
+    if isinstance(equity_curve, np.ndarray):
+        equity_curve = pd.Series(equity_curve)
+        return_numpy = True
+    else:
+        return_numpy = False
     
-    Args:
-        equity_curve: Series of equity values with datetime index
-        risk_free_rate: Risk-free rate (annualized)
-        benchmark_returns: Optional benchmark returns for alpha/beta calculation
-        
-    Returns:
-        PerformanceMetrics object with all calculated metrics
-    """
-    if len(equity_curve) < 2:
-        return PerformanceMetrics(
-            total_return=0.0, annualized_return=0.0, volatility=0.0,
-            sharpe_ratio=0.0, sortino_ratio=0.0, max_drawdown=0.0,
-            calmar_ratio=0.0, var_95=0.0, var_99=0.0, cvar_95=0.0,
-            cvar_99=0.0, win_rate=0.0, profit_factor=0.0, avg_win=0.0,
-            avg_loss=0.0, largest_win=0.0, largest_loss=0.0,
-            total_trades=0, information_ratio=0.0, beta=0.0,
-            alpha=0.0, tracking_error=0.0
-        )
+    rolling_max = equity_curve.cummax()
+    drawdown = (equity_curve - rolling_max) / rolling_max
     
-    # Calculate returns
-    returns = equity_curve.pct_change().dropna()
+    # Return numpy array if input was numpy array
+    if return_numpy:
+        return drawdown.values
     
-    # Basic metrics
-    total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0]) - 1
-    annualized_return = (1 + total_return) ** (252 / len(returns)) - 1
-    volatility = returns.std() * np.sqrt(252)
+    return drawdown
+
+
+def calculate_max_drawdown(equity_curve: Union[pd.Series, np.ndarray]) -> float:
+    """Calculate maximum drawdown from equity curve."""
+    drawdown = calculate_drawdown(equity_curve)
+    return float(np.min(drawdown))
+
+
+def calculate_sharpe_ratio(returns: Union[pd.Series, np.ndarray], 
+                          risk_free_rate: float = 0.0, 
+                          periods_per_year: int = 252) -> float:
+    """Calculate Sharpe ratio."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    
+    if len(returns) == 0:
+        raise ValueError("Returns array cannot be empty")
+    
+    # Check for infinite values
+    if np.any(np.isinf(returns)):
+        raise ValueError("Returns array contains infinite values")
+    
+    if returns.std() == 0:
+        return 0.0
+    
+    excess_returns = returns - risk_free_rate / periods_per_year
+    return float(excess_returns.mean() / returns.std() * np.sqrt(periods_per_year))
+
+
+def calculate_sortino_ratio(returns: Union[pd.Series, np.ndarray], 
+                           risk_free_rate: float = 0.0, 
+                           periods_per_year: int = 252) -> float:
+    """Calculate Sortino ratio."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    
+    if len(returns) == 0:
+        raise ValueError("Returns array cannot be empty")
+    
+    excess_returns = returns - risk_free_rate / periods_per_year
+    downside_returns = returns[returns < 0]
+    
+    if len(downside_returns) == 0 or downside_returns.std() == 0:
+        return 0.0
+    
+    return float(excess_returns.mean() / downside_returns.std() * np.sqrt(periods_per_year))
+
+
+def calculate_calmar_ratio(returns: Union[pd.Series, np.ndarray], 
+                          equity_curve: Union[pd.Series, np.ndarray] = None,
+                          periods_per_year: int = 252) -> float:
+    """Calculate Calmar ratio."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    
+    if len(returns) == 0:
+        raise ValueError("Returns array cannot be empty")
+    
+    annualized_return = float((1 + returns.mean()) ** periods_per_year - 1)
+    
+    if equity_curve is None:
+        equity_curve = (1 + returns).cumprod()
+    
+    max_dd = calculate_max_drawdown(equity_curve)
+    
+    if max_dd == 0:
+        return 0.0
+    
+    return float(annualized_return / abs(max_dd))
+
+
+def calculate_alpha(returns: Union[pd.Series, np.ndarray], 
+                   benchmark_returns: Union[pd.Series, np.ndarray],
+                   risk_free_rate: float = 0.0,
+                   periods_per_year: int = 252) -> float:
+    """Calculate alpha relative to benchmark."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    if isinstance(benchmark_returns, np.ndarray):
+        benchmark_returns = pd.Series(benchmark_returns)
+    
+    if len(returns) != len(benchmark_returns):
+        raise ValueError("Returns and benchmark returns must have same length")
+    
+    # Remove any NaN values
+    mask = ~(np.isnan(returns) | np.isnan(benchmark_returns))
+    returns_clean = returns[mask]
+    benchmark_clean = benchmark_returns[mask]
+    
+    if len(returns_clean) < 2:
+        return 0.0
+    
+    beta = calculate_beta(returns_clean, benchmark_clean)
+    
+    # Annualized returns
+    portfolio_return = float((1 + returns_clean.mean()) ** periods_per_year - 1)
+    benchmark_return = float((1 + benchmark_clean.mean()) ** periods_per_year - 1)
+    
+    # Alpha = portfolio_return - (risk_free_rate + beta * (benchmark_return - risk_free_rate))
+    alpha = portfolio_return - (risk_free_rate + beta * (benchmark_return - risk_free_rate))
+    
+    return alpha
+
+
+def calculate_information_ratio(returns: Union[pd.Series, np.ndarray], 
+                              benchmark_returns: Union[pd.Series, np.ndarray]) -> float:
+    """Calculate Information ratio."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    if isinstance(benchmark_returns, np.ndarray):
+        benchmark_returns = pd.Series(benchmark_returns)
+    
+    if len(returns) != len(benchmark_returns):
+        raise ValueError("Returns and benchmark returns must have same length")
+    
+    # Remove any NaN values
+    mask = ~(np.isnan(returns) | np.isnan(benchmark_returns))
+    returns_clean = returns[mask]
+    benchmark_clean = benchmark_returns[mask]
+    
+    if len(returns_clean) < 2:
+        return 0.0
+    
+    excess_returns = returns_clean - benchmark_clean
+    tracking_error = excess_returns.std()
+    
+    if tracking_error == 0:
+        return 0.0
+    
+    return float(excess_returns.mean() / tracking_error * np.sqrt(252))
+
+
+def calculate_tracking_error(returns: Union[pd.Series, np.ndarray], 
+                           benchmark_returns: Union[pd.Series, np.ndarray]) -> float:
+    """Calculate tracking error."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    if isinstance(benchmark_returns, np.ndarray):
+        benchmark_returns = pd.Series(benchmark_returns)
+    
+    if len(returns) != len(benchmark_returns):
+        raise ValueError("Returns and benchmark returns must have same length")
+    
+    # Remove any NaN values
+    mask = ~(np.isnan(returns) | np.isnan(benchmark_returns))
+    returns_clean = returns[mask]
+    benchmark_clean = benchmark_returns[mask]
+    
+    if len(returns_clean) < 2:
+        return 0.0
+    
+    excess_returns = returns_clean - benchmark_clean
+    return float(excess_returns.std() * np.sqrt(252))
+
+
+def calculate_upside_capture(returns: Union[pd.Series, np.ndarray], 
+                           benchmark_returns: Union[pd.Series, np.ndarray]) -> float:
+    """Calculate upside capture ratio."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    if isinstance(benchmark_returns, np.ndarray):
+        benchmark_returns = pd.Series(benchmark_returns)
+    
+    if len(returns) != len(benchmark_returns):
+        raise ValueError("Returns and benchmark returns must have same length")
+    
+    # Remove any NaN values
+    mask = ~(np.isnan(returns) | np.isnan(benchmark_returns))
+    returns_clean = returns[mask]
+    benchmark_clean = benchmark_returns[mask]
+    
+    if len(returns_clean) < 1:
+        return 0.0
+    
+    # Only consider periods where benchmark is positive
+    positive_benchmark_mask = benchmark_clean > 0
+    
+    if not positive_benchmark_mask.any():
+        return 0.0
+    
+    portfolio_positive_returns = returns_clean[positive_benchmark_mask]
+    benchmark_positive_returns = benchmark_clean[positive_benchmark_mask]
+    
+    if benchmark_positive_returns.mean() == 0:
+        return 0.0
+    
+    return float(portfolio_positive_returns.mean() / benchmark_positive_returns.mean())
+
+
+def calculate_downside_capture(returns: Union[pd.Series, np.ndarray], 
+                             benchmark_returns: Union[pd.Series, np.ndarray]) -> float:
+    """Calculate downside capture ratio."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    if isinstance(benchmark_returns, np.ndarray):
+        benchmark_returns = pd.Series(benchmark_returns)
+    
+    if len(returns) != len(benchmark_returns):
+        raise ValueError("Returns and benchmark returns must have same length")
+    
+    # Remove any NaN values
+    mask = ~(np.isnan(returns) | np.isnan(benchmark_returns))
+    returns_clean = returns[mask]
+    benchmark_clean = benchmark_returns[mask]
+    
+    if len(returns_clean) < 1:
+        return 0.0
+    
+    # Only consider periods where benchmark is negative
+    negative_benchmark_mask = benchmark_clean < 0
+    
+    if not negative_benchmark_mask.any():
+        return 0.0
+    
+    portfolio_negative_returns = returns_clean[negative_benchmark_mask]
+    benchmark_negative_returns = benchmark_clean[negative_benchmark_mask]
+    
+    if benchmark_negative_returns.mean() == 0:
+        return 0.0
+    
+    return float(portfolio_negative_returns.mean() / benchmark_negative_returns.mean())
+
+
+def calculate_var(returns: Union[pd.Series, np.ndarray], confidence: float = 0.05) -> float:
+    """Calculate Value at Risk (VaR)."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    
+    if len(returns) == 0:
+        raise ValueError("Returns array cannot be empty")
+    
+    return float(np.percentile(returns, confidence * 100))
+
+
+def calculate_cvar(returns: Union[pd.Series, np.ndarray], confidence: float = 0.05) -> float:
+    """Calculate Conditional Value at Risk (CVaR)."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    
+    if len(returns) == 0:
+        raise ValueError("Returns array cannot be empty")
+    
+    var = calculate_var(returns, confidence)
+    tail_returns = returns[returns <= var]
+    return float(np.mean(tail_returns))
+
+
+def calculate_beta(returns: Union[pd.Series, np.ndarray], 
+                  benchmark_returns: Union[pd.Series, np.ndarray]) -> float:
+    """Calculate beta relative to benchmark."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    if isinstance(benchmark_returns, np.ndarray):
+        benchmark_returns = pd.Series(benchmark_returns)
+    
+    if len(returns) != len(benchmark_returns):
+        raise ValueError("Returns and benchmark returns must have same length")
+    
+    # Check if arrays are identical (same object or same values)
+    if returns is benchmark_returns or np.array_equal(returns.values, benchmark_returns.values):
+        return 1.0
+    
+    # Remove any NaN values
+    mask = ~(np.isnan(returns) | np.isnan(benchmark_returns))
+    returns_clean = returns[mask]
+    benchmark_clean = benchmark_returns[mask]
+    
+    if len(returns_clean) < 2:
+        return 0.0
+    
+    covariance = np.cov(returns_clean, benchmark_clean)[0, 1]
+    benchmark_variance = np.var(benchmark_clean)
+    
+    if benchmark_variance == 0:
+        return 0.0
+    
+    return float(covariance / benchmark_variance)
+
+
+def calculate_performance_metrics(returns: Union[pd.Series, np.ndarray],
+                                benchmark_returns: Union[pd.Series, np.ndarray] = None,
+                                risk_free_rate: float = 0.0,
+                                periods_per_year: int = 252) -> Dict[str, float]:
+    """Calculate comprehensive performance metrics."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    
+    if len(returns) == 0:
+        raise ValueError("Returns array cannot be empty")
+    
+    metrics = {}
+    
+    # Basic return metrics
+    metrics['total_return'] = float((1 + returns).prod() - 1)
+    metrics['annual_return'] = float((1 + returns.mean()) ** periods_per_year - 1)  # Changed from annualized_return
+    metrics['annual_volatility'] = float(returns.std() * np.sqrt(periods_per_year))
     
     # Risk-adjusted metrics
-    sharpe_ratio = RiskMetricsCalculator.calculate_sharpe_ratio(returns, risk_free_rate)
-    sortino_ratio = RiskMetricsCalculator.calculate_sortino_ratio(returns, risk_free_rate)
-    
-    # Drawdown analysis
-    drawdown_analyzer = DrawdownAnalyzer()
-    for equity in equity_curve:
-        drawdown_analyzer.update(equity)
-    max_drawdown = drawdown_analyzer.max_drawdown
-    calmar_ratio = RiskMetricsCalculator.calculate_calmar_ratio(returns, max_drawdown)
-    
-    # Value at Risk and CVaR
-    var_95 = RiskMetricsCalculator.calculate_var(returns, 0.95)
-    var_99 = RiskMetricsCalculator.calculate_var(returns, 0.99)
-    cvar_95 = RiskMetricsCalculator.calculate_cvar(returns, 0.95)
-    cvar_99 = RiskMetricsCalculator.calculate_cvar(returns, 0.99)
-    
-    # Trade metrics (placeholder - would need trade data)
-    trade_metrics = {
-        'win_rate': 0.0, 'profit_factor': 0.0, 'avg_win': 0.0,
-        'avg_loss': 0.0, 'largest_win': 0.0, 'largest_loss': 0.0,
-        'total_trades': 0
-    }
-    
-    # Information ratio (relative to benchmark)
-    information_ratio = 0.0
-    if benchmark_returns is not None and len(benchmark_returns) == len(returns):
-        excess_returns = returns - benchmark_returns
-        if excess_returns.std() > 0:
-            information_ratio = np.sqrt(252) * excess_returns.mean() / excess_returns.std()
-    
-    # Alpha and beta (relative to benchmark)
-    beta = 0.0
-    alpha = 0.0
-    tracking_error = 0.0
-    if benchmark_returns is not None and len(benchmark_returns) == len(returns):
-        if benchmark_returns.std() > 0:
-            covariance = np.cov(returns, benchmark_returns)[0, 1]
-            beta = covariance / (benchmark_returns.var() + 1e-8)
-            alpha = annualized_return - (risk_free_rate + beta * (benchmark_returns.mean() * 252 - risk_free_rate))
-            tracking_error = returns.std() * np.sqrt(252)
-    
-    return PerformanceMetrics(
-        total_return=total_return,
-        annualized_return=annualized_return,
-        volatility=volatility,
-        sharpe_ratio=sharpe_ratio,
-        sortino_ratio=sortino_ratio,
-        max_drawdown=max_drawdown,
-        calmar_ratio=calmar_ratio,
-        var_95=var_95,
-        var_99=var_99,
-        cvar_95=cvar_95,
-        cvar_99=cvar_99,
-        win_rate=trade_metrics['win_rate'],
-        profit_factor=trade_metrics['profit_factor'],
-        avg_win=trade_metrics['avg_win'],
-        avg_loss=trade_metrics['avg_loss'],
-        largest_win=trade_metrics['largest_win'],
-        largest_loss=trade_metrics['largest_loss'],
-        total_trades=trade_metrics['total_trades'],
-        information_ratio=information_ratio,
-        beta=beta,
-        alpha=alpha,
-        tracking_error=tracking_error
-    )
-
-
-def calculate_risk_metrics(returns: pd.Series, portfolio_value: float = 100000.0) -> Dict[str, float]:
-    """
-    Calculate comprehensive risk metrics for portfolio management.
-    
-    Args:
-        returns: Series of portfolio returns
-        portfolio_value: Current portfolio value
+    if returns.std() != 0:
+        excess_returns = returns - risk_free_rate / periods_per_year
+        metrics['sharpe_ratio'] = float(excess_returns.mean() / returns.std() * np.sqrt(periods_per_year))
         
-    Returns:
-        Dictionary of risk metrics
-    """
-    if len(returns) == 0:
-        return {
-            'var_95': 0.0,
-            'var_99': 0.0,
-            'cvar_95': 0.0,
-            'cvar_99': 0.0,
-            'volatility': 0.0,
-            'max_drawdown': 0.0,
-            'calmar_ratio': 0.0,
-            'sharpe_ratio': 0.0,
-            'sortino_ratio': 0.0,
-            'beta': 0.0,
-            'alpha': 0.0,
-            'tracking_error': 0.0,
-            'information_ratio': 0.0
-        }
-    
-    # Basic risk metrics
-    var_95 = RiskMetricsCalculator.calculate_var(returns, 0.95)
-    var_99 = RiskMetricsCalculator.calculate_var(returns, 0.99)
-    cvar_95 = RiskMetricsCalculator.calculate_cvar(returns, 0.95)
-    cvar_99 = RiskMetricsCalculator.calculate_cvar(returns, 0.99)
-    volatility = returns.std() * np.sqrt(252)
-    
-    # Drawdown analysis
-    equity_curve = portfolio_value * (1 + returns.cumsum())
-    drawdown_analyzer = DrawdownAnalyzer()
-    for equity in equity_curve:
-        drawdown_analyzer.update(equity)
-    max_drawdown = drawdown_analyzer.max_drawdown
-    
-    # Risk-adjusted ratios
-    sharpe_ratio = RiskMetricsCalculator.calculate_sharpe_ratio(returns)
-    sortino_ratio = RiskMetricsCalculator.calculate_sortino_ratio(returns)
-    calmar_ratio = RiskMetricsCalculator.calculate_calmar_ratio(returns, max_drawdown)
-    
-    # Additional metrics (relative to S&P 500 as benchmark)
-    benchmark_returns = returns * 0.8  # Simplified benchmark
-    if len(returns) == len(benchmark_returns):
-        excess_returns = returns - benchmark_returns
-        if excess_returns.std() > 0:
-            information_ratio = np.sqrt(252) * excess_returns.mean() / excess_returns.std()
+        downside_returns = returns[returns < 0]
+        if len(downside_returns) > 0 and downside_returns.std() != 0:
+            metrics['sortino_ratio'] = float(excess_returns.mean() / downside_returns.std() * np.sqrt(periods_per_year))
         else:
-            information_ratio = 0.0
-        
-        if benchmark_returns.std() > 0:
-            covariance = np.cov(returns, benchmark_returns)[0, 1]
-            beta = covariance / (benchmark_returns.var() + 1e-8)
-            alpha = returns.mean() * 252 - (0.02 + beta * (benchmark_returns.mean() * 252 - 0.02))
-            tracking_error = returns.std() * np.sqrt(252)
-        else:
-            beta = 0.0
-            alpha = 0.0
-            tracking_error = 0.0
+            metrics['sortino_ratio'] = 0.0
     else:
-        information_ratio = 0.0
-        beta = 0.0
-        alpha = 0.0
-        tracking_error = 0.0
+        metrics['sharpe_ratio'] = 0.0
+        metrics['sortino_ratio'] = 0.0
     
-    return {
-        'var_95': var_95,
-        'var_99': var_99,
-        'cvar_95': cvar_95,
-        'cvar_99': cvar_99,
-        'volatility': volatility,
-        'max_drawdown': max_drawdown,
-        'calmar_ratio': calmar_ratio,
-        'sharpe_ratio': sharpe_ratio,
-        'sortino_ratio': sortino_ratio,
-        'beta': beta,
-        'alpha': alpha,
-        'tracking_error': tracking_error,
-        'information_ratio': information_ratio
-    }
+    # Drawdown metrics
+    cumulative_returns = (1 + returns).cumprod()
+    metrics['max_drawdown'] = calculate_max_drawdown(cumulative_returns)
+    if metrics['max_drawdown'] != 0:
+        metrics['calmar_ratio'] = float(metrics['annual_return'] / abs(metrics['max_drawdown']))
+    else:
+        metrics['calmar_ratio'] = 0.0
+    
+    # Relative metrics if benchmark provided
+    if benchmark_returns is not None:
+        if isinstance(benchmark_returns, np.ndarray):
+            benchmark_returns = pd.Series(benchmark_returns)
+        
+        if len(returns) == len(benchmark_returns):
+            metrics['beta'] = calculate_beta(returns, benchmark_returns)
+            metrics['alpha'] = calculate_alpha(returns, benchmark_returns, risk_free_rate, periods_per_year)
+            metrics['information_ratio'] = calculate_information_ratio(returns, benchmark_returns)
+            metrics['tracking_error'] = calculate_tracking_error(returns, benchmark_returns)
+            metrics['upside_capture'] = calculate_upside_capture(returns, benchmark_returns)
+            metrics['downside_capture'] = calculate_downside_capture(returns, benchmark_returns)
+    
+    return metrics
+
+
+def calculate_risk_metrics(returns: Union[pd.Series, np.ndarray]) -> Dict[str, float]:
+    """Calculate comprehensive risk metrics."""
+    if isinstance(returns, np.ndarray):
+        returns = pd.Series(returns)
+    
+    if len(returns) == 0:
+        raise ValueError("Returns array cannot be empty")
+    
+    metrics = {}
+    
+    # Value at Risk metrics
+    metrics['var_95'] = calculate_var(returns, 0.05)
+    metrics['var_99'] = calculate_var(returns, 0.01)
+    metrics['cvar_95'] = calculate_cvar(returns, 0.05)
+    metrics['cvar_99'] = calculate_cvar(returns, 0.01)
+    
+    # Distribution metrics
+    metrics['skewness'] = float(returns.skew())
+    metrics['kurtosis'] = float(returns.kurtosis())
+    
+    # Drawdown metrics
+    cumulative_returns = (1 + returns).cumprod()
+    metrics['max_drawdown'] = calculate_max_drawdown(cumulative_returns)
+    
+    return metrics
+

@@ -109,7 +109,7 @@ class IBKRClient:
         self.running = False
         
         logger.info("IBKR client initialized")
-    
+
     def _load_config(self) -> IBKRConfig:
         """
         Load IBKR configuration from settings.
@@ -124,430 +124,330 @@ class IBKRClient:
         config.port = self.settings.get("ibkr", "port", default=7497)
         config.client_id = self.settings.get("ibkr", "client_id", default=1)
         config.timeout = self.settings.get("ibkr", "timeout", default=30)
-        config.retry_delay = self.settings.get("ibkr", "retry_delay", default=5)
-        config.max_retries = self.settings.get("ibkr", "max_retries", default=3)
-        config.paper_trading = self.settings.get("ibkr", "paper_trading", default=True)
+        
+        # Trading settings
         config.account = self.settings.get("ibkr", "account", default="")
-        
-        # Contract details
-        config.contract_details = self.settings.get("ibkr", "contracts", default={})
-        
-        # Order parameters
-        config.order_params = self.settings.get("ibkr", "orders", default={})
+        config.currency = self.settings.get("ibkr", "currency", default="USD")
+        config.order_type = self.settings.get("ibkr", "order_type", default="MKT")
+        config.time_in_force = self.settings.get("ibkr", "time_in_force", default="DAY")
         
         return config
-    
-    async def connect(self) -> bool:
+
+    def connect(self) -> bool:
         """
-        Connect to IBKR.
+        Connect to IBKR TWS/Gateway.
         
         Returns:
-            True if connected successfully
+            True if connection successful
         """
-        logger.info(f"Connecting to IBKR at {self.config.host}:{self.config.port}...")
-        
         try:
-            # Create IB instance
-            self.ib = IB()
-            
-            # Connect
-            if self.config.paper_trading:
-                self.ib.connect(self.config.host, self.config.port, clientId=self.config.client_id, readonly=False)
-            else:
-                self.ib.connect(self.config.host, self.config.port, clientId=self.config.client_id, readonly=False)
+            self.ib.connect(
+                host=self.config.host,
+                port=self.config.port,
+                clientId=self.config.client_id,
+                timeout=self.config.timeout
+            )
             
             # Wait for connection
-            await self.ib.async_run()
+            max_wait = 30
+            waited = 0
+            while not self.ib.isConnected() and waited < max_wait:
+                time.sleep(1)
+                waited += 1
             
-            self.connected = True
-            logger.info("Successfully connected to IBKR")
-            
-            # Set up event handlers
-            self._setup_event_handlers()
-            
-            return True
-            
+            if self.ib.isConnected():
+                logger.info(f"Connected to IBKR at {self.config.host}:{self.config.port}")
+                self._setup_event_handlers()
+                return True
+            else:
+                logger.error("Failed to connect to IBKR")
+                return False
+                
         except Exception as e:
-            logger.error(f"Failed to connect to IBKR: {e}")
+            logger.error(f"Error connecting to IBKR: {e}")
             return False
-    
-    def _setup_event_handlers(self):
-        """Set up IBKR event handlers."""
-        if not self.ib:
-            return
+
+    def disconnect(self) -> None:
+        """Disconnect from IBKR."""
+        if self.ib.isConnected():
+            self.ib.disconnect()
+            logger.info("Disconnected from IBKR")
+
+    def _setup_event_handlers(self) -> None:
+        """Set up event handlers for IBKR events."""
+        # Account updates
+        self.ib.accountValueEvent += self._on_account_value
         
-        # Order status updates
+        # Order updates
         self.ib.orderStatusEvent += self._on_order_status
-        
-        # Trade executions
         self.ib.execDetailsEvent += self._on_execution
         
-        # Account updates
-        self.ib.updateAccountValueEvent += self._on_account_update
+        # Position updates
+        self.ib.positionEvent += self._on_position
         
-        # Portfolio updates
-        self.ib.updatePortfolioEvent += self._on_portfolio_update
-    
-    def _on_order_status(self, trade: Trade):
+        # Error handling
+        self.ib.errorEvent += self._on_error
+
+    def _on_account_value(self, account_value):
+        """Handle account value updates."""
+        self.account_value = float(account_value.value)
+        logger.debug(f"Account value updated: ${self.account_value:,.2f}")
+
+    def _on_order_status(self, trade):
         """Handle order status updates."""
-        order_id = trade.orderId
+        order_id = trade.order.orderId
         status = trade.orderStatus.status
         
         logger.info(f"Order {order_id} status: {status}")
         
         if status == "Filled":
             self.filled_orders[order_id] = trade
-        elif status == "Submitted":
-            self.open_orders[order_id] = trade
-        elif status == "Cancelled":
-            if order_id in self.open_orders:
-                del self.open_orders[order_id]
-    
-    def _on_execution(self, trade: Trade, fill: Fill):
-        """Handle trade executions."""
-        logger.info(f"Execution: {fill.contract.symbol} {fill.execution.side} {fill.execution.shares} @ {fill.execution.price}")
-    
-    def _on_account_update(self, account: str, key: str, value: str, currency: str):
-        """Handle account updates."""
-        logger.debug(f"Account update: {account} {key} = {value} {currency}")
-    
-    def _on_portfolio_update(self, position: Position):
-        """Handle portfolio updates."""
-        logger.debug(f"Portfolio update: {position.contract.symbol} {position.position}")
-    
-    async def disconnect(self):
-        """Disconnect from IBKR."""
-        if self.ib and self.connected:
-            logger.info("Disconnecting from IBKR...")
-            self.ib.disconnect()
-            self.connected = False
-            logger.info("Disconnected from IBKR")
-    
-    async def get_contract(self, symbol: str, exchange: str = "CME", currency: str = "USD", **kwargs) -> Optional[Contract]:
-        """
-        Get contract for a symbol.
+            self._update_position(trade)
+        elif status in ["Cancelled", "Rejected"]:
+            if order_id in self.pending_orders:
+                del self.pending_orders[order_id]
+
+    def _on_execution(self, trade, fill):
+        """Handle execution updates."""
+        logger.info(f"Execution: {fill.execution.side} {fill.execution.shares} @ ${fill.execution.price}")
+
+    def _on_position(self, position):
+        """Handle position updates."""
+        symbol = position.contract.symbol
+        self.positions[symbol] = position.position
+        logger.info(f"Position update: {symbol} = {position.position}")
+
+    def _on_error(self, req_id, error_code, error_string, contract):
+        """Handle errors."""
+        logger.error(f"IBKR Error {error_code}: {error_string}")
         
-        Args:
-            symbol: Symbol (e.g., "MES")
-            exchange: Exchange (e.g., "CME")
-            currency: Currency (e.g., "USD")
-            **kwargs: Additional contract parameters
-            
-        Returns:
-            IBKR contract or None
-        """
-        contract_key = f"{symbol}_{exchange}"
-        
-        if contract_key in self.contracts:
-            return self.contracts[contract_key]
-        
-        try:
-            # Create contract
-            if symbol.startswith(("MES", "ES", "NQ", "YM")):
-                # Futures contract
-                contract = Future(symbol=symbol, exchange=exchange, currency=currency, **kwargs)
-            elif symbol.startswith(("SPY", "QQQ", "IWM", "DIA")):
-                # Stock contract
-                contract = Stock(symbol=symbol, exchange="SMART", currency=currency, **kwargs)
-            else:
-                # Default to futures
-                contract = Future(symbol=symbol, exchange=exchange, currency=currency, **kwargs)
-            
-            # Qualify contract
-            qualified_contract = await self.ib.qualifyContractsAsync(contract)
-            
-            if qualified_contract:
-                self.contracts[contract_key] = qualified_contract[0]
-                logger.info(f"Contract qualified: {symbol}")
-                return qualified_contract[0]
-            else:
-                logger.error(f"Failed to qualify contract: {symbol}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error getting contract {symbol}: {e}")
-            return None
-    
-    async def request_market_data(self, contract: Contract, data_type: str = "TRADES") -> bool:
-        """
-        Request market data.
-        
-        Args:
-            contract: IBKR contract
-            data_type: Data type (e.g., "TRADES", "MIDPOINT", "BID_ASK")
-            
-        Returns:
-            True if data request successful
-        """
-        try:
-            # Cancel existing market data
-            if contract in self.market_data:
-                await self.ib.cancelMktDataAsync(contract)
-            
-            # Request market data
-            ticker = await self.ib.reqMktDataAsync(contract, genericTickList=data_type, snapshot=False)
-            
-            self.market_data[contract] = ticker
-            logger.info(f"Market data requested for {contract.symbol}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error requesting market data: {e}")
-            return False
-    
-    async def request_historical_data(self, 
-                                    contract: Contract, 
-                                    duration: str = "1 D", 
-                                    bar_size: str = "1 min",
-                                    end_date: Optional[str] = None) -> Optional[List[BarData]]:
-        """
-        Request historical data.
-        
-        Args:
-            contract: IBKR contract
-            duration: Duration (e.g., "1 D", "1 W", "1 M")
-            bar_size: Bar size (e.g., "1 min", "5 mins", "1 hour")
-            end_date: End date (default: now)
-            
-        Returns:
-            Historical data or None
-        """
-        try:
-            # Request historical data
-            bars = await self.ib.reqHistoricalDataAsync(
-                contract,
-                endDateTime=end_date,
-                durationStr=duration,
-                barSizeSetting=bar_size,
-                whatToShow="TRADES",
-                useRTH=True,
-                formatDate=1
-            )
-            
-            if bars:
-                self.historical_data[contract] = bars
-                logger.info(f"Historical data received for {contract.symbol}: {len(bars)} bars")
-                return bars
-            else:
-                logger.warning(f"No historical data received for {contract.symbol}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error requesting historical data: {e}")
-            return None
-    
-    def get_historical_dataframe(self, contract: Contract) -> Optional[pd.DataFrame]:
-        """
-        Get historical data as DataFrame.
-        
-        Args:
-            contract: IBKR contract
-            
-        Returns:
-            Historical data DataFrame or None
-        """
-        if contract not in self.historical_data:
-            return None
-        
-        bars = self.historical_data[contract]
-        
-        if not bars:
-            return None
-        
-        # Convert to DataFrame
-        data = []
-        for bar in bars:
-            data.append({
-                'date': bar.date,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume,
-                'average': bar.average,
-                'barCount': bar.barCount
-            })
-        
-        df = pd.DataFrame(data)
-        df.set_index('date', inplace=True)
-        
-        return df
-    
-    async def place_order(self, 
-                         contract: Contract, 
-                         action: str, 
-                         quantity: int, 
-                         order_type: str = "MKT",
-                         price: Optional[float] = None,
-                         **kwargs) -> Optional[int]:
-        """
-        Place an order.
-        
-        Args:
-            contract: IBKR contract
-            action: Action ("BUY" or "SELL")
-            quantity: Quantity
-            order_type: Order type ("MKT", "LMT", "STP", etc.)
-            price: Price for limit/stop orders
-            **kwargs: Additional order parameters
-            
-        Returns:
-            Order ID or None
-        """
-        try:
-            # Create order
-            order = Order()
-            order.action = action
-            order.totalQuantity = quantity
-            order.orderType = order_type
-            
-            if price is not None:
-                order.lmtPrice = price
-            
-            # Set additional parameters
-            for key, value in kwargs.items():
-                setattr(order, key, value)
-            
-            # Place order
-            trade = await self.ib.placeOrderAsync(contract, order)
-            
-            if trade:
-                order_id = trade.orderId
-                self.orders[order_id] = trade
-                logger.info(f"Order placed: {action} {quantity} {contract.symbol} @ {price or 'MKT'} (ID: {order_id})")
-                return order_id
-            else:
-                logger.error("Failed to place order")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            return None
-    
-    async def cancel_order(self, order_id: int) -> bool:
-        """
-        Cancel an order.
-        
-        Args:
-            order_id: Order ID
-            
-        Returns:
-            True if cancelled successfully
-        """
-        try:
-            if order_id in self.orders:
-                await self.ib.cancelOrderAsync(self.orders[order_id])
-                logger.info(f"Order cancelled: {order_id}")
-                return True
-            else:
-                logger.error(f"Order not found: {order_id}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error cancelling order: {e}")
-            return False
-    
-    async def get_account_summary(self) -> Dict[str, Any]:
+        # Handle specific error codes
+        if error_code == 200:  # No security definition found
+            logger.error(f"Contract not found: {contract}")
+        elif error_code == 201:  # Order rejected
+            logger.error(f"Order rejected: {error_string}")
+        elif error_code == 202:  # Order cancelled
+            logger.warning(f"Order cancelled: {error_string}")
+
+    def get_account_summary(self) -> Dict[str, float]:
         """
         Get account summary.
         
         Returns:
-            Account summary dictionary
+            Dictionary with account information
         """
-        try:
-            account_summary = await self.ib.accountSummaryAsync()
-            
-            summary = {}
-            for item in account_summary:
-                summary[item.tag] = item.value
-            
-            logger.info("Account summary retrieved")
-            return summary
-            
-        except Exception as e:
-            logger.error(f"Error getting account summary: {e}")
+        if not self.ib.isConnected():
             return {}
-    
-    async def get_portfolio(self) -> List[Dict[str, Any]]:
+        
+        account_values = self.ib.accountValues()
+        
+        summary = {}
+        for av in account_values:
+            if av.tag in ["NetLiquidation", "TotalCashValue", "GrossPositionValue", "AvailableFunds"]:
+                summary[av.tag] = float(av.value)
+        
+        return summary
+
+    def get_positions(self) -> Dict[str, int]:
         """
-        Get portfolio positions.
+        Get current positions.
         
         Returns:
-            List of portfolio positions
+            Dictionary of positions by symbol
         """
-        try:
-            portfolio = await self.ib.portfolioAsync()
-            
-            positions = []
-            for position in portfolio:
-                positions.append({
-                    'symbol': position.contract.symbol,
-                    'position': position.position,
-                    'market_price': position.marketPrice,
-                    'market_value': position.marketValue,
-                    'average_cost': position.averageCost,
-                    'unrealized_pnl': position.unrealizedPNL,
-                    'realized_pnl': position.realizedPNL
-                })
-            
-            logger.info("Portfolio retrieved")
-            return positions
-            
-        except Exception as e:
-            logger.error(f"Error getting portfolio: {e}")
+        if not self.ib.isConnected():
+            return {}
+        
+        positions = {}
+        for position in self.ib.positions():
+            symbol = position.contract.symbol
+            positions[symbol] = int(position.position)
+        
+        return positions
+
+    def get_portfolio(self) -> List[Dict]:
+        """
+        Get portfolio information.
+        
+        Returns:
+            List of portfolio items
+        """
+        if not self.ib.isConnected():
             return []
-    
-    async def start_data_stream(self, contract: Contract, callback=None):
+        
+        portfolio = []
+        for position in self.ib.positions():
+            portfolio.append({
+                'symbol': position.contract.symbol,
+                'position': int(position.position),
+                'market_value': float(position.marketValue),
+                'average_cost': float(position.averageCost),
+                'unrealized_pnl': float(position.unrealizedPNL),
+                'realized_pnl': float(position.realizedPNL)
+            })
+        
+        return portfolio
+
+    def place_market_order(self, symbol: str, action: str, quantity: int) -> Optional[int]:
         """
-        Start real-time data stream.
+        Place a market order.
         
         Args:
-            contract: IBKR contract
-            callback: Callback function for data updates
-        """
-        try:
-            # Request market data
-            await self.request_market_data(contract)
-            
-            # Set up data handler
-            if callback:
-                self.ib.updateEvent += callback
-            
-            logger.info(f"Data stream started for {contract.symbol}")
-            
-        except Exception as e:
-            logger.error(f"Error starting data stream: {e}")
-    
-    async def stop_data_stream(self, contract: Contract):
-        """
-        Stop real-time data stream.
-        
-        Args:
-            contract: IBKR contract
-        """
-        try:
-            if contract in self.market_data:
-                await self.ib.cancelMktDataAsync(contract)
-                del self.market_data[contract]
-                logger.info(f"Data stream stopped for {contract.symbol}")
-                
-        except Exception as e:
-            logger.error(f"Error stopping data stream: {e}")
-    
-    def get_market_data(self, contract: Contract) -> Optional[Ticker]:
-        """
-        Get current market data.
-        
-        Args:
-            contract: IBKR contract
+            symbol: Trading symbol
+            action: "BUY" or "SELL"
+            quantity: Number of shares/contracts
             
         Returns:
-            Market data ticker or None
+            Order ID if successful, None otherwise
         """
-        return self.market_data.get(contract)
-    
-    def get_order_status(self, order_id: int) -> Optional[Trade]:
+        if not self.ib.isConnected():
+            logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            # Create contract
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "STK"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            
+            # Create order
+            order = Order()
+            order.action = action
+            order.totalQuantity = quantity
+            order.orderType = "MKT"
+            order.tif = "DAY"
+            
+            # Place order
+            trade = self.ib.placeOrder(contract, order)
+            order_id = trade.order.orderId
+            
+            self.pending_orders[order_id] = trade
+            logger.info(f"Placed {action} order for {quantity} {symbol}, order ID: {order_id}")
+            
+            return order_id
+            
+        except Exception as e:
+            logger.error(f"Error placing market order: {e}")
+            return None
+
+    def place_limit_order(self, symbol: str, action: str, quantity: int, limit_price: float) -> Optional[int]:
+        """
+        Place a limit order.
+        
+        Args:
+            symbol: Trading symbol
+            action: "BUY" or "SELL"
+            quantity: Number of shares/contracts
+            limit_price: Limit price
+            
+        Returns:
+            Order ID if successful, None otherwise
+        """
+        if not self.ib.isConnected():
+            logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            # Create contract
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "STK"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            
+            # Create order
+            order = Order()
+            order.action = action
+            order.totalQuantity = quantity
+            order.orderType = "LMT"
+            order.lmtPrice = limit_price
+            order.tif = "DAY"
+            
+            # Place order
+            trade = self.ib.placeOrder(contract, order)
+            order_id = trade.order.orderId
+            
+            self.pending_orders[order_id] = trade
+            logger.info(f"Placed {action} limit order for {quantity} {symbol} @ ${limit_price}, order ID: {order_id}")
+            
+            return order_id
+            
+        except Exception as e:
+            logger.error(f"Error placing limit order: {e}")
+            return None
+
+    def place_stop_order(self, symbol: str, action: str, quantity: int, stop_price: float) -> Optional[int]:
+        """
+        Place a stop order.
+        
+        Args:
+            symbol: Trading symbol
+            action: "BUY" or "SELL"
+            quantity: Number of shares/contracts
+            stop_price: Stop price
+            
+        Returns:
+            Order ID if successful, None otherwise
+        """
+        if not self.ib.isConnected():
+            logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            # Create contract
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "STK"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            
+            # Create order
+            order = Order()
+            order.action = action
+            order.totalQuantity = quantity
+            order.orderType = "STP"
+            order.auxPrice = stop_price
+            order.tif = "DAY"
+            
+            # Place order
+            trade = self.ib.placeOrder(contract, order)
+            order_id = trade.order.orderId
+            
+            self.pending_orders[order_id] = trade
+            logger.info(f"Placed {action} stop order for {quantity} {symbol} @ ${stop_price}, order ID: {order_id}")
+            
+            return order_id
+            
+        except Exception as e:
+            logger.error(f"Error placing stop order: {e}")
+            return None
+
+    def cancel_order(self, order_id: int) -> bool:
+        """
+        Cancel an order.
+        
+        Args:
+            order_id: Order ID to cancel
+            
+        Returns:
+            True if successful
+        """
+        if not self.ib.isConnected():
+            logger.error("Not connected to IBKR")
+            return False
+        
+        try:
+            self.ib.cancelOrder(order_id)
+            logger.info(f"Cancelled order {order_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error cancelling order: {e}")
+            return False
+
+    def get_order_status(self, order_id: int) -> Optional[str]:
         """
         Get order status.
         
@@ -555,28 +455,203 @@ class IBKRClient:
             order_id: Order ID
             
         Returns:
-            Trade object or None
+            Order status if found, None otherwise
         """
-        return self.orders.get(order_id)
-    
-    def get_open_orders(self) -> Dict[int, Trade]:
+        if order_id in self.pending_orders:
+            trade = self.pending_orders[order_id]
+            return trade.orderStatus.status
+        
+        if order_id in self.filled_orders:
+            return "Filled"
+        
+        return None
+
+    def get_market_data(self, symbol: str, duration: str = "1 D", bar_size: str = "1 min") -> pd.DataFrame:
         """
-        Get open orders.
+        Get historical market data.
+        
+        Args:
+            symbol: Trading symbol
+            duration: Data duration (e.g., "1 D", "1 W", "1 M")
+            bar_size: Bar size (e.g., "1 min", "5 mins", "1 hour")
+            
+        Returns:
+            DataFrame with market data
+        """
+        if not self.ib.isConnected():
+            logger.error("Not connected to IBKR")
+            return pd.DataFrame()
+        
+        try:
+            # Create contract
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "STK"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            
+            # Request historical data
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime='',
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow='TRADES',
+                useRTH=True,
+                formatDate=1
+            )
+            
+            # Convert to DataFrame
+            if bars:
+                df = pd.DataFrame(bars)
+                df.set_index('date', inplace=True)
+                return df
+            
+            return pd.DataFrame()
+            
+        except Exception as e:
+            logger.error(f"Error getting market data: {e}")
+            return pd.DataFrame()
+
+    def get_real_time_bars(self, symbol: str, bar_size: int = 5) -> Optional[pd.DataFrame]:
+        """
+        Get real-time bars.
+        
+        Args:
+            symbol: Trading symbol
+            bar_size: Bar size in seconds
+            
+        Returns:
+            DataFrame with real-time bars
+        """
+        if not self.ib.isConnected():
+            logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            # Create contract
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "STK"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            
+            # Request real-time bars
+            bars = self.ib.reqRealTimeBars(
+                contract,
+                barSize=bar_size,
+                whatToShow='TRADES',
+                useRTH=True
+            )
+            
+            # Convert to DataFrame
+            if bars:
+                df = pd.DataFrame(bars)
+                return df
+            
+            return pd.DataFrame()
+            
+        except Exception as e:
+            logger.error(f"Error getting real-time bars: {e}")
+            return None
+
+    def _update_position(self, trade):
+        """Update position after trade execution."""
+        symbol = trade.contract.symbol
+        action = trade.order.action
+        quantity = trade.order.totalQuantity
+        
+        # Update position
+        if symbol not in self.positions:
+            self.positions[symbol] = 0
+        
+        if action == "BUY":
+            self.positions[symbol] += quantity
+        else:
+            self.positions[symbol] -= quantity
+        
+        logger.info(f"Updated position: {symbol} = {self.positions[symbol]}")
+
+    def start_data_stream(self, symbols: List[str]) -> None:
+        """
+        Start real-time data stream.
+        
+        Args:
+            symbols: List of symbols to stream
+        """
+        if not self.ib.isConnected():
+            logger.error("Not connected to IBKR")
+            return
+        
+        for symbol in symbols:
+            try:
+                # Create contract
+                contract = Contract()
+                contract.symbol = symbol
+                contract.secType = "STK"
+                contract.exchange = "SMART"
+                contract.currency = "USD"
+                
+                # Request market data
+                ticker = self.ib.reqMktData(contract, '', False, False)
+                self.tickers[symbol] = ticker
+                
+                logger.info(f"Started data stream for {symbol}")
+                
+            except Exception as e:
+                logger.error(f"Error starting data stream for {symbol}: {e}")
+
+    def stop_data_stream(self, symbols: List[str] = None) -> None:
+        """
+        Stop real-time data stream.
+        
+        Args:
+            symbols: List of symbols to stop streaming (None for all)
+        """
+        if symbols is None:
+            symbols = list(self.tickers.keys())
+        
+        for symbol in symbols:
+            if symbol in self.tickers:
+                try:
+                    self.ib.cancelMktData(self.tickers[symbol])
+                    del self.tickers[symbol]
+                    logger.info(f"Stopped data stream for {symbol}")
+                except Exception as e:
+                    logger.error(f"Error stopping data stream for {symbol}: {e}")
+
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """
+        Get current market price.
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            Current price if available
+        """
+        if symbol in self.tickers:
+            ticker = self.tickers[symbol]
+            if ticker.last:
+                return float(ticker.last)
+        
+        # Fallback to market data request
+        market_data = self.get_market_data(symbol, duration="1 D", bar_size="1 min")
+        if not market_data.empty:
+            return float(market_data['close'].iloc[-1])
+        
+        return None
+
+    def get_account_balance(self) -> float:
+        """
+        Get current account balance.
         
         Returns:
-            Dictionary of open orders
+            Account balance
         """
-        return self.open_orders
-    
-    def get_filled_orders(self) -> Dict[int, Trade]:
-        """
-        Get filled orders.
-        
-        Returns:
-            Dictionary of filled orders
-        """
-        return self.filled_orders
-    
+        summary = self.get_account_summary()
+        return summary.get('NetLiquidation', 0.0)
+
     def is_connected(self) -> bool:
         """
         Check if connected to IBKR.
@@ -584,22 +659,98 @@ class IBKRClient:
         Returns:
             True if connected
         """
-        return self.connected and self.ib is not None
-    
-    def get_connection_status(self) -> str:
+        return self.ib.isConnected()
+
+    def wait_for_fill(self, order_id: int, timeout: int = 60) -> bool:
         """
-        Get connection status.
+        Wait for order to fill.
+        
+        Args:
+            order_id: Order ID
+            timeout: Timeout in seconds
+            
+        Returns:
+            True if filled
+        """
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            status = self.get_order_status(order_id)
+            if status == "Filled":
+                return True
+            elif status in ["Cancelled", "Rejected"]:
+                return False
+            time.sleep(1)
+        
+        return False
+
+    def get_risk_metrics(self) -> Dict[str, float]:
+        """
+        Get current risk metrics.
         
         Returns:
-            Connection status string
+            Dictionary with risk metrics
         """
-        if not self.ib:
-            return "Not initialized"
-        elif self.connected:
-            return "Connected"
+        positions = self.get_positions()
+        portfolio = self.get_portfolio()
+        
+        total_value = sum(pos['market_value'] for pos in portfolio)
+        account_balance = self.get_account_balance()
+        
+        # Calculate leverage
+        leverage = total_value / account_balance if account_balance > 0 else 0
+        
+        # Calculate position concentration
+        if portfolio:
+            max_position = max(abs(pos['position'] * pos['average_cost']) for pos in portfolio)
+            concentration = max_position / total_value if total_value > 0 else 0
         else:
-            return "Disconnected"
+            concentration = 0
+        
+        return {
+            'account_balance': account_balance,
+            'total_position_value': total_value,
+            'leverage': leverage,
+            'position_concentration': concentration,
+            'num_positions': len(positions)
+        }
 
+    def close_all_positions(self) -> List[int]:
+        """
+        Close all open positions.
+        
+        Returns:
+            List of order IDs
+        """
+        positions = self.get_positions()
+        order_ids = []
+        
+        for symbol, position in positions.items():
+            if position != 0:
+                action = "SELL" if position > 0 else "BUY"
+                quantity = abs(position)
+                
+                order_id = self.place_market_order(symbol, action, quantity)
+                if order_id:
+                    order_ids.append(order_id)
+        
+        return order_ids
+
+    def shutdown(self) -> None:
+        """Shutdown the client."""
+        self.running = False
+        
+        # Stop data streams
+        self.stop_data_stream()
+        
+        # Cancel all pending orders
+        for order_id in list(self.pending_orders.keys()):
+            self.cancel_order(order_id)
+        
+        # Disconnect
+        self.disconnect()
+        
+        logger.info("IBKR client shutdown complete")
 
 class PaperTradingInterface:
     """
@@ -871,3 +1022,6 @@ class PaperTradingInterface:
         self.pending_orders = {}
         self.trade_history = []
         logger.info("Trading state reset")
+    
+# Alias for compatibility
+IBKRTradingClient = IBKRClient

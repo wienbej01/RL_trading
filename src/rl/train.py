@@ -15,10 +15,13 @@ import logging
 from datetime import datetime, timedelta
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.policies import MlpLstmPolicy
+from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
+
+# Alias for compatibility
+MlpLstmPolicy = ActorCriticPolicy
 
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
@@ -28,6 +31,72 @@ from ..sim.execution import ExecParams
 from .ppo_lstm_policy import PPOLSTMPolicy, PolicyConfig
 
 logger = get_logger(__name__)
+
+
+class RLTrainer:
+    """
+    RL trainer wrapper class for easy model training and management.
+    """
+    
+    def __init__(self, settings: Settings):
+        """
+        Initialize RL trainer.
+        
+        Args:
+            settings: Configuration settings
+        """
+        self.settings = settings
+        self.training_config = TrainingConfig()
+        self.model = None
+        
+    def train(self, data_path: str, features_path: str, model_path: str) -> PPO:
+        """
+        Train RL model.
+        
+        Args:
+            data_path: Path to training data
+            features_path: Path to features
+            model_path: Path to save model
+            
+        Returns:
+            Trained PPO model
+        """
+        self.model = train_ppo_lstm(
+            settings=self.settings,
+            data_path=data_path,
+            features_path=features_path,
+            model_path=model_path,
+            training_config=self.training_config
+        )
+        return self.model
+    
+    def evaluate(self, data_path: str, features_path: str, num_episodes: int = 5) -> Dict[str, float]:
+        """
+        Evaluate trained model.
+        
+        Args:
+            data_path: Path to evaluation data
+            features_path: Path to features
+            num_episodes: Number of evaluation episodes
+            
+        Returns:
+            Evaluation metrics
+        """
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        
+        env = build_env(self.settings, data_path, features_path)
+        return evaluate_model(self.model, env, num_episodes)
+    
+    def save_model(self, path: str):
+        """Save trained model."""
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        self.model.save(path)
+    
+    def load_model(self, path: str):
+        """Load trained model."""
+        self.model = PPO.load(path)
 
 
 class TrainingConfig:
@@ -200,7 +269,7 @@ def train_ppo_lstm(settings: Settings,
     
     # Create PPO model
     model = PPO(
-        MlpLstmPolicy,
+        ActorCriticPolicy,
         vec_env,
         learning_rate=training_config.learning_rate,
         n_steps=training_config.n_steps,

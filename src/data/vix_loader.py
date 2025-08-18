@@ -20,13 +20,6 @@ logger = get_logger(__name__)
 
 
 class VIXDataLoader:
-    """
-    VIX data loader for volatility measures and market sentiment.
-    
-    This class handles retrieval of VIX data and related volatility
-    measures from various sources.
-    """
-    
     def __init__(self, settings: Settings):
         """
         Initialize VIX data loader.
@@ -411,3 +404,7 @@ class VIXDataLoader:
             'total_size_mb': total_size / (1024 * 1024),
             'files': [f.name for f in cache_files]
         }
+
+
+# Alias for compatibility
+VIXLoader = VIXDataLoader

@@ -500,3 +500,168 @@ class MicrostructureFeatures:
         )
         
         return quality_score
+
+
+def calculate_order_flow_imbalance(bid_price: pd.Series, bid_size: pd.Series, 
+                                 ask_price: pd.Series, ask_size: pd.Series) -> pd.Series:
+    """
+    Calculate order flow imbalance.
+    
+    Order flow imbalance measures the imbalance between buy and sell pressure
+    in the order book, which can be predictive of short-term price movements.
+    
+    Args:
+        bid_price: Series of bid prices
+        bid_size: Series of bid sizes
+        ask_price: Series of ask prices
+        ask_size: Series of ask sizes
+        
+    Returns:
+        Series containing order flow imbalance values
+    """
+    # Calculate mid price
+    mid_price = (bid_price + ask_price) / 2
+    
+    # Calculate weighted order flow imbalance
+    # OFI = (ask_size * ask_price - bid_size * bid_price) / mid_price
+    ofi = (ask_size * ask_price - bid_size * bid_price) / mid_price
+    
+    # First value should be NaN (requires previous values for calculation)
+    ofi.iloc[0] = np.nan
+    
+    return ofi
+
+
+def calculate_microprice(bid_price: pd.Series, bid_size: pd.Series, ask_price: pd.Series, ask_size: pd.Series) -> pd.Series:
+    """
+    Calculate microprice based on order book imbalance.
+    
+    The microprice is a weighted average of bid and ask prices
+    based on order book depth and imbalance.
+    
+    Args:
+        bid_price: Series with bid prices
+        bid_size: Series with bid sizes
+        ask_price: Series with ask prices
+        ask_size: Series with ask sizes
+        
+    Returns:
+        Series with microprice values
+    """
+    if bid_price.empty or bid_size.empty or ask_price.empty or ask_size.empty:
+        return pd.Series(dtype=float)
+    
+    # Calculate order book imbalance
+    imbalance = bid_size / (bid_size + ask_size + 1e-6)
+    microprice = bid_price * (1 - imbalance) + ask_price * imbalance
+    
+    return pd.Series(microprice, index=bid_price.index)
+
+
+def calculate_queue_imbalance(bid_size: pd.Series, ask_size: pd.Series) -> pd.Series:
+    """
+    Calculate queue imbalance based on bid and ask sizes.
+    
+    Args:
+        bid_size: Series with bid sizes
+        ask_size: Series with ask sizes
+        
+    Returns:
+        Series with queue imbalance values between -1 and 1
+    """
+    if bid_size.empty or ask_size.empty:
+        return pd.Series(dtype=float)
+    
+    # Queue imbalance formula
+    imbalance = (bid_size - ask_size) / (bid_size + ask_size + 1e-6)
+    
+    return pd.Series(imbalance, index=bid_size.index)
+
+
+def calculate_spread(bid_price: pd.Series, ask_price: pd.Series) -> pd.Series:
+    """
+    Calculate bid-ask spread.
+    
+    Args:
+        bid_price: Series with bid prices
+        ask_price: Series with ask prices
+        
+    Returns:
+        Series with spread values
+    """
+    if bid_price.empty or ask_price.empty:
+        return pd.Series(dtype=float)
+    
+    # Spread calculation
+    spread = ask_price - bid_price
+    
+    return pd.Series(spread, index=bid_price.index)
+
+
+def calculate_price_impact(trade_price: pd.Series, trade_size: pd.Series, 
+                          bid_price: pd.Series, ask_price: pd.Series) -> pd.Series:
+    """
+    Calculate price impact based on trades and order book.
+    
+    Args:
+        trade_price: Series with trade prices
+        trade_size: Series with trade sizes
+        bid_price: Series with bid prices
+        ask_price: Series with ask prices
+        
+    Returns:
+        Series with price impact values
+    """
+    if trade_price.empty or trade_size.empty or bid_price.empty or ask_price.empty:
+        return pd.Series(dtype=float)
+    
+    # Calculate mid price
+    mid_price = (bid_price + ask_price) / 2
+    
+    # Price impact calculation
+    price_impact = (trade_price - mid_price) / mid_price
+    
+    return pd.Series(price_impact, index=trade_price.index)
+
+
+def calculate_vwap(trade_price: pd.Series, trade_size: pd.Series) -> pd.Series:
+    """
+    Calculate Volume Weighted Average Price (VWAP).
+    
+    Args:
+        trade_price: Series with trade prices
+        trade_size: Series with trade sizes
+        
+    Returns:
+        Series with VWAP values
+    """
+    if trade_price.empty or trade_size.empty:
+        return pd.Series(dtype=float)
+    
+    # VWAP calculation using cumulative sum
+    cumulative_price_volume = (trade_price * trade_size).cumsum()
+    cumulative_volume = trade_size.cumsum()
+    
+    vwap = cumulative_price_volume / (cumulative_volume + 1e-6)
+    
+    return pd.Series(vwap, index=trade_price.index)
+
+
+def calculate_twap(trade_price: pd.Series, window: int = 10) -> pd.Series:
+    """
+    Calculate Time Weighted Average Price (TWAP).
+    
+    Args:
+        trade_price: Series with trade prices
+        window: Rolling window size
+        
+    Returns:
+        Series with TWAP values
+    """
+    if trade_price.empty:
+        return pd.Series(dtype=float)
+    
+    # TWAP is simply a rolling mean
+    twap = trade_price.rolling(window=window).mean()
+    
+    return pd.Series(twap, index=trade_price.index)

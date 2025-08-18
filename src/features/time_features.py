@@ -515,3 +515,186 @@ class TimeFeatures:
         )
         
         return regime
+
+
+def extract_time_of_day_features(timestamps: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Extract time of day features from a DatetimeIndex.
+    
+    Args:
+        timestamps: The DatetimeIndex to extract features from
+        
+    Returns:
+        DataFrame with time of day features
+    """
+    # Initialize result DataFrame
+    result = pd.DataFrame(index=timestamps)
+    
+    # Basic time features
+    result['hour'] = timestamps.hour
+    result['minute'] = timestamps.minute
+    
+    # Cyclical encoding for hour
+    result['hour_sin'] = np.sin(2 * np.pi * result['hour'] / 24)
+    result['hour_cos'] = np.cos(2 * np.pi * result['hour'] / 24)
+    
+    # Cyclical encoding for minute
+    result['minute_sin'] = np.sin(2 * np.pi * result['minute'] / 60)
+    result['minute_cos'] = np.cos(2 * np.pi * result['minute'] / 60)
+    
+    return result
+
+
+def extract_day_of_week_features(timestamps: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Extract day of week features from a DatetimeIndex.
+    
+    Args:
+        timestamps: The DatetimeIndex to extract features from
+        
+    Returns:
+        DataFrame with day of week features
+    """
+    # Initialize result DataFrame
+    result = pd.DataFrame(index=timestamps)
+    
+    # Day of week (0=Monday, 6=Sunday)
+    result['day_of_week'] = timestamps.dayofweek
+    
+    # Cyclical encoding
+    result['day_of_week_sin'] = np.sin(2 * np.pi * result['day_of_week'] / 7)
+    result['day_of_week_cos'] = np.cos(2 * np.pi * result['day_of_week'] / 7)
+    
+    return result
+
+
+def extract_session_features(timestamps: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Extract trading session features.
+    
+    Args:
+        timestamps: DatetimeIndex of timestamps
+        
+    Returns:
+        DataFrame containing session features
+    """
+    features = pd.DataFrame(index=timestamps)
+    
+    # Ensure timestamps are timezone-naive for consistent calculations
+    if timestamps.tz is not None:
+        timestamps = timestamps.tz_convert('UTC').tz_localize(None)
+    
+    # Market hours (9:30 AM - 4:00 PM EST)
+    market_open = time(9, 30)
+    market_close = time(16, 0)
+    
+    # Initialize features
+    features['is_market_open'] = False
+    features['time_from_open'] = np.nan
+    features['time_to_close'] = np.nan
+    features['session_progress'] = np.nan
+    
+    for i, ts in enumerate(timestamps):
+        ts_time = ts.time()
+        ts_date = ts.date()
+        
+        # Create timezone-naive datetime objects for comparison
+        open_datetime = datetime.combine(ts_date, market_open)
+        close_datetime = datetime.combine(ts_date, market_close)
+        
+        # Check if current time is within market hours
+        if open_datetime.time() <= ts_time <= close_datetime.time():
+            features.iloc[i, features.columns.get_loc('is_market_open')] = True
+            features.iloc[i, features.columns.get_loc('time_from_open')] = (ts - open_datetime).total_seconds() / 60
+            features.iloc[i, features.columns.get_loc('time_to_close')] = (close_datetime - ts).total_seconds() / 60
+            
+            # Calculate session progress (0 to 1)
+            total_session_minutes = (close_datetime - open_datetime).total_seconds() / 60
+            if total_session_minutes > 0:
+                progress = (ts - open_datetime).total_seconds() / 60 / total_session_minutes
+                features.iloc[i, features.columns.get_loc('session_progress')] = progress
+    
+    return features
+
+
+def is_market_hours(timestamp: pd.Timestamp, session_start: str = "09:30", session_end: str = "16:00") -> bool:
+    """
+    Check if the given timestamp is within market hours.
+    
+    Args:
+        timestamp: The timestamp to check
+        session_start: Market session start time in HH:MM format
+        session_end: Market session end time in HH:MM format
+        
+    Returns:
+        True if within market hours, False otherwise
+    """
+    from datetime import time
+    
+    session_start_time = time.fromisoformat(session_start)
+    session_end_time = time.fromisoformat(session_end)
+    
+    # Check if it's a weekday
+    if timestamp.dayofweek >= 5:  # Weekend
+        return False
+    
+    # Check if it's within market hours
+    return session_start_time <= timestamp.time() <= session_end_time
+
+
+def get_time_to_close(timestamp: pd.Timestamp, session_end: str = "16:00") -> float:
+    """
+    Calculate time to market close in minutes.
+    
+    Args:
+        timestamp: The timestamp to calculate from
+        session_end: Market session end time in HH:MM format
+        
+    Returns:
+        Time to market close in minutes, or None if outside market hours
+    """
+    from datetime import time
+    
+    session_end_time = time.fromisoformat(session_end)
+    
+    # Check if it's a weekday
+    if timestamp.dayofweek >= 5:  # Weekend
+        return None
+    
+    # Check if it's within market hours
+    session_start_time = time(9, 30)  # Assuming market opens at 9:30
+    if not (session_start_time <= timestamp.time() <= session_end_time):
+        return None
+    
+    # Calculate time to close
+    market_close = timestamp.replace(hour=session_end_time.hour, minute=session_end_time.minute, second=0, microsecond=0)
+    return (market_close - timestamp).total_seconds() / 60
+
+
+def get_time_from_open(timestamp: pd.Timestamp, session_start: str = "09:30") -> float:
+    """
+    Calculate time from market open in minutes.
+    
+    Args:
+        timestamp: The timestamp to calculate from
+        session_start: Market session start time in HH:MM format
+        
+    Returns:
+        Time from market open in minutes, or None if outside market hours
+    """
+    from datetime import time
+    
+    session_start_time = time.fromisoformat(session_start)
+    
+    # Check if it's a weekday
+    if timestamp.dayofweek >= 5:  # Weekend
+        return None
+    
+    # Check if it's within market hours
+    session_end_time = time(16, 0)  # Assuming market closes at 16:00
+    if not (session_start_time <= timestamp.time() <= session_end_time):
+        return None
+    
+    # Calculate time from open
+    market_open = timestamp.replace(hour=session_start_time.hour, minute=session_start_time.minute, second=0, microsecond=0)
+    return (timestamp - market_open).total_seconds() / 60
