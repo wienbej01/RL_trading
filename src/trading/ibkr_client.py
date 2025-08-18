@@ -854,7 +854,7 @@ class PaperTradingInterface:
         except Exception as e:
             logger.error(f"Error executing trade: {e}")
             return None
-    
+
     def _check_risk_limits(self, action: str, quantity: int) -> bool:
         """
         Check if trade complies with risk limits.
@@ -888,16 +888,99 @@ class PaperTradingInterface:
         
         return True
     
-    def _calculate_daily_pnl(self) -> float:
+    def calculate_daily_pnl(self) -> float:
         """
-        Calculate daily P&L.
+        Calculate the realised PnL for the current trading day from recorded fills.
+        
+        This implementation pairs buys and sells using FIFO per symbol. It supports
+        dict-like trade entries (as appended in monitor_orders) and object-like entries.
         
         Returns:
-            Daily P&L
+            float: Realised PnL for today's completed round trips.
         """
-        # This would be implemented based on actual trade executions
-        # For now, return 0
-        return 0.0
+        from datetime import datetime
+        from collections import defaultdict, deque
+        today = datetime.now().date()
+        pnl_total: float = 0.0
+        # Maintain separate FIFO queues for open buy/sell lots per symbol
+        open_lots = defaultdict(lambda: {"buy": deque(), "sell": deque()})
+        for tr in getattr(self, "trade_history", []):
+            # Extract fields from dict or object
+            ts = tr.get("timestamp") if isinstance(tr, dict) else getattr(tr, "timestamp", None)
+            if ts is None:
+                continue
+            try:
+                tr_date = ts.date()
+            except Exception:
+                # Fallback for string timestamps
+                try:
+                    tr_date = pd.Timestamp(ts).date()  # type: ignore
+                except Exception:
+                    continue
+            if tr_date != today:
+                continue
+            symbol = (tr.get("symbol") if isinstance(tr, dict) else getattr(tr, "symbol", None)) or "DEFAULT"
+            action = tr.get("action") if isinstance(tr, dict) else getattr(tr, "action", None)
+            qty = int(tr.get("quantity", 0) if isinstance(tr, dict) else getattr(tr, "quantity", 0))
+            price_val = tr.get("price") if isinstance(tr, dict) else getattr(tr, "price", None)
+            # Also support entry/exit fields if present
+            entry_price = tr.get("entry_price") if isinstance(tr, dict) else getattr(tr, "entry_price", None)
+            exit_price = tr.get("exit_price") if isinstance(tr, dict) else getattr(tr, "exit_price", None)
+            price: Optional[float] = None
+            if price_val is not None:
+                try:
+                    price = float(price_val)
+                except Exception:
+                    price = None
+            if price is None and entry_price is not None and exit_price is not None:
+                # If the record represents a completed trade, add full PnL and skip lot pairing
+                contract_size = int(tr.get("contract_size", 1) if isinstance(tr, dict) else getattr(tr, "contract_size", 1))
+                pnl_total += float(qty) * (float(exit_price) - float(entry_price)) * float(contract_size)
+                continue
+            if price is None or qty == 0 or action not in ("BUY", "SELL"):
+                continue
+            contract_size = int(tr.get("contract_size", 1) if isinstance(tr, dict) else getattr(tr, "contract_size", 1))
+            # Match against opposite-side open lots first (FIFO)
+            if action == "SELL":
+                remaining = qty
+                # Close existing buy lots
+                while remaining > 0 and open_lots[symbol]["buy"]:
+                    lot_qty, lot_price = open_lots[symbol]["buy"][0]
+                    match_qty = min(remaining, lot_qty)
+                    pnl_total += match_qty * (price - lot_price) * contract_size
+                    lot_qty -= match_qty
+                    remaining -= match_qty
+                    if lot_qty == 0:
+                        open_lots[symbol]["buy"].popleft()
+                    else:
+                        open_lots[symbol]["buy"][0] = (lot_qty, lot_price)
+                # Any remainder opens/extends a short
+                if remaining > 0:
+                    open_lots[symbol]["sell"].append((remaining, price))
+            else:  # action == "BUY"
+                remaining = qty
+                # Close existing sell (short) lots
+                while remaining > 0 and open_lots[symbol]["sell"]:
+                    lot_qty, lot_price = open_lots[symbol]["sell"][0]
+                    match_qty = min(remaining, lot_qty)
+                    # Short PnL: sold at lot_price, bought back at price
+                    pnl_total += match_qty * (lot_price - price) * contract_size
+                    lot_qty -= match_qty
+                    remaining -= match_qty
+                    if lot_qty == 0:
+                        open_lots[symbol]["sell"].popleft()
+                    else:
+                        open_lots[symbol]["sell"][0] = (lot_qty, lot_price)
+                # Any remainder opens/extends a long
+                if remaining > 0:
+                    open_lots[symbol]["buy"].append((remaining, price))
+        return float(pnl_total)
+    
+    def _calculate_daily_pnl(self) -> float:
+        """
+        Backward-compatible alias used by risk checks.
+        """
+        return self.calculate_daily_pnl()
     
     async def get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """

@@ -15,7 +15,7 @@ from gymnasium.spaces import Box, Discrete
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
 from ..utils.metrics import DifferentialSharpe
-from .execution import ExecutionSimulator, estimate_tc, ExecParams
+from .execution import ExecutionEngine, ExecutionSimulator, estimate_tc, ExecParams
 from .risk import RiskManager, RiskConfig
 
 logger = get_logger(__name__)
@@ -219,12 +219,15 @@ class IntradayRLEnv(Env):
         row = self.df.iloc[self.i]
         price = float(row["close"])
         atr_val = float(self.X.loc[ts].get("atr", 0.5))  # fallback small ATR
-        
-        # Execute action at bar close -> new position for next bar
-        desired_dir = {-1: -1, 0: 0, 1: 1}[action - 1] if action in (0,1,2) else 0
+
+        # Track equity prior to this step to compute realized pnl delta
+        prev_equity = float(getattr(self, "equity", self.cash))
+
+        # Execute action mapping used by this environment (internal actions 0,1,2 map to -1,0,1 dir)
+        desired_dir = {-1: -1, 0: 0, 1: 1}[action - 1] if action in (0, 1, 2) else 0
         reward = 0.0
-        info = {}
-        
+        info: Dict[str, Any] = {}
+
         # Flatten at EOD regardless of action
         if self._eod(ts):
             if self.pos != 0:
@@ -235,94 +238,112 @@ class IntradayRLEnv(Env):
                 self.entry_price = None
                 self.stop_price = None
                 self.tp_price = None
-            # EOD penalty for holding inventory (should be zero)
-            reward -= self.exec_sim.exec_params.tick_value * self.pos * 0 + 0.0  # already flattened
-            done = True
-            obs = self._obs(ts, price)
-            self.equity = self.cash
-            self.equity_curve.append(self.equity)
-            return obs, reward, done, False, info
-        
-        # Update unrealized -> realized between bars
-        if self.i > 0:
-            prev_price = float(self.df["close"].iloc[self.i-1])
-            bar_pnl = self._bar_pnl(prev_price, price, self.pos)
-            self.cash += bar_pnl
+            # EOD: finalize equity for the day
             self.equity = self.cash
             self.max_equity = max(self.max_equity, self.equity)
             self.min_equity = min(self.min_equity, self.equity)
             self.equity_curve.append(self.equity)
-        
-        # Check barriers (if in a trade)
+            obs = self._obs(ts, price)
+            return obs, float(0.0), True, False, info
+
+        # Update realized PnL between bars
+        if self.i > 0:
+            prev_price = float(self.df["close"].iloc[self.i - 1])
+            bar_pnl = self._bar_pnl(prev_price, price, self.pos)
+            self.cash += bar_pnl
+
+        # Check triple-barrier exits (if in a trade)
         hit_exit = False
-        if self.pos != 0 and self.entry_price is not None:
-            if (self.pos > 0 and (row["low"] <= self.stop_price or row["high"] >= self.tp_price)) \
-               or (self.pos < 0 and (row["high"] >= self.stop_price or row["low"] <= self.tp_price)):
+        if self.pos != 0 and self.entry_price is not None and self.stop_price is not None and self.tp_price is not None:
+            if (self.pos > 0 and (row["low"] <= self.stop_price or row["high"] >= self.tp_price)) or \
+               (self.pos < 0 and (row["high"] >= self.stop_price or row["low"] <= self.tp_price)):
                 # Exit at barrier (assume touch -> fill)
                 exit_price = self.tp_price if (
                     (self.pos > 0 and row["high"] >= self.tp_price) or
                     (self.pos < 0 and row["low"] <= self.tp_price)
                 ) else self.stop_price
-                pnl = (exit_price - self.entry_price) * self.pos * self.point_value
-                tc = estimate_tc(self.pos, exit_price, self.exec_sim)
-                self.cash += pnl - tc
+                pnl_exit = (exit_price - self.entry_price) * self.pos * self.point_value
+                tc_exit = estimate_tc(self.pos, float(exit_price), self.exec_sim)
+                self.cash += pnl_exit - tc_exit
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
                 self.tp_price = None
                 hit_exit = True
-        
+
         # Apply desired action if flat (or change direction after exit)
-        if desired_dir == 0:
-            pass
+        if desired_dir != 0 and self.pos == 0 and not hit_exit:
+            contracts = self._risk_sized_contracts(price, atr_val)
+            if contracts > 0:
+                # open position
+                self.pos = contracts * int(np.sign(desired_dir))
+                self.entry_price = price
+                self._set_barrier_prices(self.pos, price, atr_val)
+                # pay entry cost
+                self.cash -= estimate_tc(self.pos, price, self.exec_sim)
+
+        # Update equity and equity curve
+        self.equity = self.cash
+        self.max_equity = max(self.max_equity, self.equity)
+        self.min_equity = min(self.min_equity, self.equity)
+        self.equity_curve.append(self.equity)
+
+        # Compute pnl for reward as realized delta in equity this step
+        pnl = float(self.equity - prev_equity)
+
+        # Compute risk penalties per modified_step logic
+        # Drawdown as fraction from peak equity
+        if self.max_equity > 0:
+            current_dd = (self.max_equity - self.equity) / max(self.max_equity, 1e-6)
         else:
-            if self.pos == 0 and not hit_exit:
-                contracts = self._risk_sized_contracts(price, atr_val)
-                if contracts > 0:
-                    # open position
-                    self.pos = contracts * int(np.sign(desired_dir))
-                    self.entry_price = price
-                    self._set_barrier_prices(self.pos, price, atr_val)
-                    # pay entry cost
-                    self.cash -= estimate_tc(self.pos, price, self.exec_sim)
-        
-        # Reward: DSR of per-bar return minus penalties
-        # per-bar "strategy return" as pct of equity
-        if len(self.equity_curve) >= 2:
-            ret = (self.equity_curve[-1] - self.equity_curve[-2]) / max(self.equity_curve[-2], 1e-6)
-        else:
-            ret = 0.0
-        
-        reward += self.dsr.update(ret)
-        # Drawdown penalty
-        dd = 0.0 if not self.equity_curve else (self.max_equity - self.equity) / max(self.max_equity, 1e-6)
-        reward -= self.exec_sim.exec_params.tick_value * 0.0  # placeholder
-        reward -= self.risk_manager.risk_config.max_daily_loss_r * 0.0  # placeholder
-        reward -= self.risk_manager.risk_config.stop_r_multiple * 0.0   # placeholder
-        reward -= dd *  self.risk_manager.risk_config.stop_r_multiple * 0 + 0.0
-        reward -= 0.0
-        
-        # Daily kill-switch on realized R
-        realized_drawdown = (self.day_start_equity - self.equity) / max(self.day_start_equity, 1e-6)
-        if realized_drawdown < -self.risk_manager.risk_config.max_daily_loss_r * 0.01:  # crude mapping
-            # force flat and end episode
+            current_dd = 0.0
+
+        # Track/update max_drawdown ratio attribute for scaling
+        if not hasattr(self, "max_drawdown"):
+            self.max_drawdown = 0.0
+        self.max_drawdown = max(float(self.max_drawdown), float(current_dd))
+
+        # Drawdown penalty scales with ratio of current drawdown to max drawdown
+        drawdown_penalty = (current_dd / self.max_drawdown) if self.max_drawdown > 0 else 0.0
+
+        # Realized daily loss relative to start-of-day equity
+        self.realized_drawdown = (self.day_start_equity - self.equity) / max(self.day_start_equity, 1e-6)
+        max_daily_pct = float(self.risk_manager.risk_config.max_daily_loss_r) * 0.01
+        realised_fraction = (self.realized_drawdown / max_daily_pct) if max_daily_pct > 0 else 0.0
+        risk_penalty = max(0.0, float(realised_fraction))  # penalize only when drawdown is present
+
+        # Reward equals realized pnl minus penalties
+        reward = float(pnl) - float(drawdown_penalty) - float(risk_penalty)
+
+        # Daily kill-switch: terminate when realized drawdown exceeds threshold
+        done = False
+        if self.realized_drawdown > max_daily_pct:
+            # Force flat and charge closing costs
             if self.pos != 0:
                 self.cash -= estimate_tc(self.pos, price, self.exec_sim)
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
                 self.tp_price = None
+            self.equity = self.cash
             done = True
-        else:
-            done = False
-        
+
+        # Advance index/end-of-data check
         self.i += 1
         if self.i >= len(self.df):
             done = True
-        
-        next_ts = self.df.index[min(self.i, len(self.df)-1)]
-        obs = self._obs(next_ts, float(self.df["close"].iloc[min(self.i, len(self.df)-1)]))
-        return obs, float(reward), done, False, {}
+
+        next_ts = self.df.index[min(self.i, len(self.df) - 1)]
+        obs = self._obs(next_ts, float(self.df["close"].iloc[min(self.i, len(self.df) - 1)]))
+
+        # Diagnostic info
+        info = {
+            "pnl": float(pnl),
+            "drawdown_penalty": float(drawdown_penalty),
+            "risk_penalty": float(risk_penalty),
+            "realized_drawdown": float(self.realized_drawdown),
+        }
+        return obs, float(reward), bool(done), False, info
     
     def _obs(self, ts, price):
         """Construct observation vector."""

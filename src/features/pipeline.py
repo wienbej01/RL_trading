@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Union, Any
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.feature_selection import SelectKBest, f_regression
 import logging
+import os
 
 # Import technical indicator functions
 from .technical_indicators import (

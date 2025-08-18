@@ -433,11 +433,13 @@ def estimate_tc(position: int, price: float, exec_sim: ExecutionEngine) -> float
     """
     if position == 0:
         return 0.0
-    
-    # Estimate costs
-    costs = exec_sim.calculate_transaction_cost(position * price)
-    
-    return costs
+
+    side = 'buy' if position > 0 else 'sell'
+    costs: Dict[str, float] = exec_sim.estimate_transaction_costs(abs(position), price, side)
+    commission = float(costs.get('commission', 0.0))
+    slippage = float(costs.get('slippage', 0.0))
+    impact = float(costs.get('impact', 0.0))
+    return commission + slippage + impact
 
 
 @dataclass
