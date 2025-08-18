@@ -40,7 +40,7 @@ class TechnicalIndicators:
             settings: Configuration settings
         """
         self.settings = settings
-        self.indicator_configs = settings.get('indicators', {})
+        self.indicator_configs = settings.get('indicators', default={})
         
     def calculate_all_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
         """
@@ -551,8 +551,17 @@ class TechnicalIndicators:
     def detect_hammer(self, data: pd.DataFrame, threshold: float = 0.6) -> pd.Series:
         """Detect Hammer candlestick pattern."""
         body_size = abs(data['close'] - data['open'])
-        lower_shadow = data['open'] - data['low'] if data['close'] > data['open'] else data['close'] - data['low']
-        upper_shadow = data['high'] - data['open'] if data['close'] > data['open'] else data['high'] - data['close']
+        range_size = data['high'] - data['low']
+        
+        # Use vectorized operations instead of conditional statements
+        is_bullish = data['close'] > data['open']
+        lower_shadow_bullish = data['open'] - data['low']
+        lower_shadow_bearish = data['close'] - data['low']
+        lower_shadow = np.where(is_bullish, lower_shadow_bullish, lower_shadow_bearish)
+        
+        upper_shadow_bullish = data['high'] - data['open']
+        upper_shadow_bearish = data['high'] - data['close']
+        upper_shadow = np.where(is_bullish, upper_shadow_bullish, upper_shadow_bearish)
         
         is_hammer = (lower_shadow > threshold * body_size) & (upper_shadow < 0.2 * body_size)
         return is_hammer
@@ -560,8 +569,16 @@ class TechnicalIndicators:
     def detect_shooting_star(self, data: pd.DataFrame, threshold: float = 0.6) -> pd.Series:
         """Detect Shooting Star candlestick pattern."""
         body_size = abs(data['close'] - data['open'])
-        upper_shadow = data['high'] - data['open'] if data['close'] > data['open'] else data['high'] - data['close']
-        lower_shadow = data['open'] - data['low'] if data['close'] > data['open'] else data['close'] - data['low']
+        
+        # Use vectorized operations instead of conditional statements
+        is_bullish = data['close'] > data['open']
+        upper_shadow_bullish = data['high'] - data['open']
+        upper_shadow_bearish = data['high'] - data['close']
+        upper_shadow = np.where(is_bullish, upper_shadow_bullish, upper_shadow_bearish)
+        
+        lower_shadow_bullish = data['open'] - data['low']
+        lower_shadow_bearish = data['close'] - data['low']
+        lower_shadow = np.where(is_bullish, lower_shadow_bullish, lower_shadow_bearish)
         
         is_shooting_star = (upper_shadow > threshold * body_size) & (lower_shadow < 0.2 * body_size)
         return is_shooting_star
