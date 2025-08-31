@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -19,11 +20,14 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
-from ..src.data.data_loader import UnifiedDataLoader
-from ..src.features.pipeline import FeaturePipeline
-from ..src.sim.env_intraday_rl import IntradayRLEnv
-from ..src.utils.config_loader import Settings
-from ..src.utils.logging import get_logger
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.data.data_loader import UnifiedDataLoader
+from src.features.pipeline import FeaturePipeline
+from src.sim.env_intraday_rl import IntradayRLEnv
+from src.utils.config_loader import Settings
+from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -47,8 +51,8 @@ def load_and_validate_data(data_dir: Path, symbols: List[str]) -> Dict[str, Any]
         'symbol_details': {}
     }
 
-    # Initialize data loader
-    settings = Settings()
+    # Initialize data loader with config
+    settings = Settings.from_paths('configs/settings.yaml')
     loader = UnifiedDataLoader(settings, data_source='polygon')
 
     for symbol in tqdm(symbols, desc="Validating symbols"):
@@ -118,7 +122,7 @@ def check_price_anomalies(df: pd.DataFrame) -> int:
 
     if 'close' in df.columns:
         # Check for extreme price changes (>50% in a minute)
-        returns = df['close'].pct_change()
+        returns = df['close'].pct_change(fill_method=None)
         anomalies += (returns.abs() > 0.5).sum()
 
         # Check for OHLC consistency
@@ -153,8 +157,8 @@ def test_rl_environment(data_dir: Path, symbol: str) -> Dict[str, Any]:
     }
 
     try:
-        # Initialize data loader
-        settings = Settings()
+        # Initialize data loader with config
+        settings = Settings.from_paths('configs/settings.yaml')
         loader = UnifiedDataLoader(settings, data_source='polygon')
 
         # Load data

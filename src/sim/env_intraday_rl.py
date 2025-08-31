@@ -89,7 +89,7 @@ class IntradayRLEnv(Env):
 
         # Initialize components
         logger.debug("Initializing ExecutionSimulator with empty Settings()")
-        self.exec_sim = ExecutionSimulator(Settings())
+        self.exec_sim = ExecutionSimulator(Settings.from_paths('configs/settings.yaml'))
         if exec_params:
             logger.debug(f"Mapping exec_params: {exec_params}")
             # Map parameter names from test format to ExecParams format
@@ -107,7 +107,7 @@ class IntradayRLEnv(Env):
 
         # Create a proper Settings object from the config
         logger.debug("Creating Settings object for configuration")
-        settings = Settings()
+        settings = Settings.from_paths('configs/settings.yaml')
         logger.debug(f"Checking for config attribute: hasattr(self, 'config') = {hasattr(self, 'config')}")
 
         if hasattr(self, 'config') and self.config:
@@ -223,6 +223,28 @@ class IntradayRLEnv(Env):
         ts = self.df.index[self.i]
         row = self.df.iloc[self.i]
         price = float(row["close"])
+        # Handle NaN price values
+        if np.isnan(price) or np.isinf(price):
+            logger.warning(f"Invalid price detected: {price}, skipping step")
+            # Increment index to move to next step
+            self.i += 1
+            # Check if we've reached the end
+            if self.i >= len(self.df):
+                # Return final observation and end episode
+                next_ts = self.df.index[min(self.i - 1, len(self.df) - 1)]
+                obs = self._obs(next_ts, 0.0)
+                return obs, float(0.0), True, False, {}
+            else:
+                # Update equity curve for skipped step (maintain previous equity)
+                # Ensure equity is not NaN before appending
+                if np.isnan(self.equity) or np.isinf(self.equity):
+                    self.equity = self.cash  # Reset to cash if equity became invalid
+                self.equity_curve.append(float(self.equity))
+                # Return safe observation with zero reward and continue
+                next_ts = self.df.index[self.i]
+                obs = self._obs(next_ts, 0.0)
+                return obs, float(0.0), False, False, {}
+
         atr_val = float(self.X.loc[ts].get("atr", 0.5))  # fallback small ATR
 
         # Track equity prior to this step to compute realized pnl delta
@@ -339,7 +361,13 @@ class IntradayRLEnv(Env):
             done = True
 
         next_ts = self.df.index[min(self.i, len(self.df) - 1)]
-        obs = self._obs(next_ts, float(self.df["close"].iloc[min(self.i, len(self.df) - 1)]))
+        next_price = float(self.df["close"].iloc[min(self.i, len(self.df) - 1)])
+
+        # Handle NaN price values for observation
+        if np.isnan(next_price) or np.isinf(next_price):
+            next_price = 0.0
+
+        obs = self._obs(next_ts, next_price)
 
         # Diagnostic info
         info = {
@@ -358,7 +386,10 @@ class IntradayRLEnv(Env):
         else:
             # Fallback to last available features
             feats = self.X.iloc[-1].values.astype(np.float32)
-        
+
+        # Handle NaN values in features
+        feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Position and unrealized P&L
         unreal = 0.0
         if self.entry_price is not None:
@@ -374,11 +405,24 @@ class IntradayRLEnv(Env):
     
     def _risk_sized_contracts(self, price, atr):
         """Calculate position size based on risk management."""
-        return self.risk_manager.calculate_position_size(
-            self.equity, price, 
+        contracts = self.risk_manager.calculate_position_size(
+            self.equity, price,
             price - atr * self.risk_manager.risk_config.stop_r_multiple,
             atr
         )
+
+        # Handle NaN values - comprehensive check
+        if np.isnan(contracts) or np.isinf(contracts) or contracts is None:
+            contracts = 0.0
+
+        # Ensure contracts is a valid number before int conversion
+        try:
+            contracts_int = int(max(0, contracts))
+        except (ValueError, OverflowError):
+            logger.warning(f"Invalid contracts value: {contracts}, defaulting to 0")
+            contracts_int = 0
+
+        return contracts_int
     
     def _set_barrier_prices(self, pos, price, atr):
         """Set stop loss and take profit prices."""

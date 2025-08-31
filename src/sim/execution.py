@@ -242,7 +242,11 @@ class ExecutionEngine:
         if abs(quantity) <= available_liquidity:
             fill_quantity = quantity
         else:
-            fill_quantity = int(np.sign(quantity) * available_liquidity)
+            # Handle NaN values in quantity
+            if np.isnan(quantity) or np.isinf(quantity):
+                fill_quantity = 0
+            else:
+                fill_quantity = int(np.sign(quantity) * available_liquidity)
         
         # Simulate execution
         result = self.simulate_execution(fill_quantity, price, side)
@@ -276,7 +280,11 @@ class ExecutionEngine:
         while remaining_quantity != 0:
             # Determine current fill size
             current_fill = min(abs(remaining_quantity), display_size)
-            current_fill = int(np.sign(remaining_quantity) * current_fill)
+            # Handle NaN values in remaining_quantity
+            if np.isnan(remaining_quantity) or np.isinf(remaining_quantity):
+                current_fill = 0
+            else:
+                current_fill = int(np.sign(remaining_quantity) * current_fill)
             
             # Simulate execution
             execution = self.simulate_execution(current_fill, price, side)

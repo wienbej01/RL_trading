@@ -12,11 +12,15 @@ Usage:
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.data_loader import UnifiedDataLoader
 from src.features.pipeline import FeaturePipeline
@@ -41,7 +45,7 @@ def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFra
     """
     logger.info(f"Loading Polygon data for {symbol} from {start_date} to {end_date}")
 
-    settings = Settings()
+    settings = Settings.from_paths('configs/settings.yaml')
     loader = UnifiedDataLoader(settings, data_source='polygon')
 
     df = loader.load_data(
@@ -148,10 +152,17 @@ def run_backtest_simulation(env: IntradayRLEnv, num_episodes: int = 5) -> dict:
             episode_steps += 1
             total_steps += 1
 
-        # Calculate episode return
+        # Calculate episode return with NaN handling
         equity_curve = env.get_equity_curve()
         if len(equity_curve) >= 2:
-            episode_return = (equity_curve.iloc[-1] - equity_curve.iloc[0]) / equity_curve.iloc[0]
+            start_equity = equity_curve.iloc[0]
+            end_equity = equity_curve.iloc[-1]
+            
+            # Handle NaN values
+            if np.isnan(start_equity) or np.isnan(end_equity) or start_equity == 0:
+                episode_return = 0.0
+            else:
+                episode_return = (end_equity - start_equity) / start_equity
         else:
             episode_return = 0.0
 
@@ -165,7 +176,7 @@ def run_backtest_simulation(env: IntradayRLEnv, num_episodes: int = 5) -> dict:
             'reward': episode_reward,
             'steps': episode_steps,
             'return': episode_return,
-            'final_equity': equity_curve.iloc[-1] if len(equity_curve) > 0 else env.cash
+            'final_equity': equity_curve.iloc[-1] if len(equity_curve) > 0 and not np.isnan(equity_curve.iloc[-1]) else env.cash
         })
 
         logger.info(f"Episode {episode + 1}: Reward={episode_reward:.2f}, "
@@ -218,15 +229,15 @@ def plot_results(results: dict, symbol: str):
 
         # Summary statistics
         ax4.axis('off')
-        summary_text = ".2f"".1%"".1%"".1f"f"""
-        SUMMARY STATISTICS
+        summary_text = f"""
+SUMMARY STATISTICS
 
-        Total Episodes: {len(results['episodes'])}
-        Average Reward: {results['avg_reward']:.4f}
-        Win Rate: {results['win_rate']:.1%}
-        Average Return: {results['total_return']:.2%}
-        Total Steps: {results['total_steps']}
-        """
+Total Episodes: {len(results['episodes'])}
+Average Reward: {results['avg_reward']:.4f}
+Win Rate: {results['win_rate']:.1%}
+Average Return: {results['total_return']:.2%}
+Total Steps: {results['total_steps']}
+"""
         ax4.text(0.1, 0.8, summary_text, fontsize=12, verticalalignment='top',
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
 
@@ -308,11 +319,7 @@ def main():
         # Detailed episode results
         print("Episode Details:")
         for ep in results['episodes']:
-            print("2d"
-                  "8.2f"
-                  "6d"
-                  "7.2f"
-                  "9.0f")
+            print(f"Episode {ep['episode']:2d}: Reward={ep['reward']:8.2f}, Steps={ep['steps']:6d}, Return={ep['return']:7.2%}, Final Equity=${ep['final_equity']:9.0f}")
 
         # Generate plots if requested
         if args.plot:

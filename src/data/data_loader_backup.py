@@ -82,24 +82,23 @@ class UnifiedDataLoader:
         self.data_source = data_source
         self.data_dir = Path("data")
 
-        # Cache settings - FIXED: Use safer pattern to avoid dict as key
-        data_config = settings._config.get('data', {})
-        self.cache_enabled = data_config.get('cache_enabled', True) if isinstance(data_config, dict) else True
-        self.cache_dir = Path(data_config.get('cache_dir', 'data/cache') if isinstance(data_config, dict) else 'data/cache')
+        # Cache settings
+        self.cache_enabled = settings.get('data', {}).get('cache_enabled', True)
+        self.cache_dir = Path(settings.get('data', {}).get('cache_dir', 'data/cache'))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Performance settings
-        self.max_workers = data_config.get('max_workers', 4) if isinstance(data_config, dict) else 4
-        self.chunk_size = data_config.get('chunk_size', 100000) if isinstance(data_config, dict) else 100000
+        self.max_workers = settings.get('data', {}).get('max_workers', 4)
+        self.chunk_size = settings.get('data', {}).get('chunk_size', 100000)
 
         # Validation settings
-        self.validation_enabled = data_config.get('validation_enabled', True) if isinstance(data_config, dict) else True
-        self.quality_checks_enabled = data_config.get('quality_checks_enabled', True) if isinstance(data_config, dict) else True
+        self.validation_enabled = settings.get('data', {}).get('validation_enabled', True)
+        self.quality_checks_enabled = settings.get('data', {}).get('quality_checks_enabled', True)
 
         # Data quality thresholds
-        self.max_gap_minutes = data_config.get('max_gap_minutes', 60) if isinstance(data_config, dict) else 60
-        self.max_price_change_pct = data_config.get('max_price_change_pct', 0.20) if isinstance(data_config, dict) else 0.20
-        self.min_volume_threshold = data_config.get('min_volume_threshold', 0) if isinstance(data_config, dict) else 0
+        self.max_gap_minutes = settings.get('data', {}).get('max_gap_minutes', 60)
+        self.max_price_change_pct = settings.get('data', {}).get('max_price_change_pct', 0.20)
+        self.min_volume_threshold = settings.get('data', {}).get('min_volume_threshold', 0)
 
         logger.info(f"Initialized UnifiedDataLoader for {data_source} data")
 
@@ -445,22 +444,6 @@ class UnifiedDataLoader:
 
         # Remove rows with all NaN values
         data = data.dropna(how='all')
-
-        # Fill NaN values in OHLC columns with forward fill, then backward fill
-        if data_type == 'ohlcv':
-            ohlc_cols = ['open', 'high', 'low', 'close']
-            for col in ohlc_cols:
-                if col in data.columns:
-                    # Forward fill, then backward fill for any remaining NaNs
-                    data[col] = data[col].fillna(method='ffill').fillna(method='bfill')
-                    # If still NaN (e.g., all values are NaN), fill with last known value or 0
-                    if data[col].isna().any():
-                        last_valid = data[col].dropna().iloc[-1] if not data[col].dropna().empty else 0.0
-                        data[col] = data[col].fillna(last_valid)
-
-        # Fill NaN values in volume column
-        if 'volume' in data.columns:
-            data['volume'] = data['volume'].fillna(0)
 
         cleaned_len = len(data)
         if cleaned_len < original_len:

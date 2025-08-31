@@ -637,7 +637,7 @@ def calculate_returns(series: pd.Series, periods: int = 1) -> pd.Series:
     Returns:
         Returns series
     """
-    return series.pct_change(periods)
+    return series.pct_change(periods, fill_method=None)
 
 
 def calculate_log_returns(series: pd.Series, periods: int = 1) -> pd.Series:
