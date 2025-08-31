@@ -108,10 +108,10 @@ class UnifiedDataLoader:
         if df.empty:
             self.logger.warning("No data found for %s between %s and %s", symbol, s, e)
             return df
-# (Optional) normalize/clean minimal columns here if needed
-df = self._postprocess_df(df)
+        # (Optional) normalize/clean minimal columns here if needed
+        df = self._postprocess_df(df)
 
-# Save cache
+        # Save cache
         if self.cache_enabled:
             try:
                 df.to_parquet(cache_path, index=False)
