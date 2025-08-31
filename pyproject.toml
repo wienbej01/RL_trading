@@ -34,6 +34,9 @@ dependencies = [
     "scipy>=1.11.0",
     "ib-insync>=0.9.86",
     "databento>=0.36.0",
+    "httpx>=0.25.0",
+    "pydantic>=2.0.0",
+    "polygon-api-client>=1.0.0",
     "pyyaml>=6.0.2",
     "tqdm>=4.66.4",
     "python-dateutil>=2.9.0",
@@ -62,6 +65,10 @@ monitoring = [
     "grafana-api>=1.0.3",
 ]
 ta = ["ta-lib>=0.4.28"]
+polygon = [
+    "aiofiles>=0.23.0",
+    "backoff>=2.2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/example/rl-intraday"

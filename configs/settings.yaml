@@ -14,6 +14,29 @@ data:
   lookback_bars: 120            # ~2 hours context for LSTM
   resample: "1min"
   drop_na_policy: "forward_fill"
+  provider: auto  # Primary data provider: 'polygon', 'databento', or 'auto'
+  fallback_provider: databento  # Fallback data provider for reliability
+  polygon_timeout: 30  # Request timeout in seconds
+  polygon:
+    api_key: ${POLYGON_API_KEY}
+    base_url: https://api.polygon.io
+    api_version: v2
+    rate_limit:
+      calls_per_minute: 5
+      burst_limit: 10
+    retry:
+      attempts: 3
+      backoff_factor: 2.0
+    cache:
+      directory: data/cache/polygon
+      format: parquet
+      partition_format: "year=%Y/month=%m/day=%d"
+    validation:
+      enabled: true
+      fill_gaps: forward_fill
+      outlier_detection: true
+  databento:
+    api_key: ${DATABENTO_API_KEY}
 
 features:
   returns_horizons: [1, 5, 15]
@@ -91,43 +114,3 @@ monitoring:
   prometheus_port: 8000
   metrics_interval: 60  # seconds
   alert_file: alerts/alerts.yaml
-
-"""
-Sample configuration illustrating additions for cross‑asset features and risk management.
-
-This YAML file extends the original ``configs/settings.yaml`` with new keys for
-external data files and returns horizons.  You can merge these entries into
-your existing configuration.  Replace paths (``data/vix.csv``, etc.) with the
-actual locations of your downloaded datasets.
-"""
-
-data:
-  # Path to historical minute/tick data provided by Databento
-  databento_api_key: db-PyiEQuyM4SxeyVyLMVJBfPfnsqgcN
-  instruments:
-    - MES
-  # Cross‑asset data files
-  vix_file: data/vix.csv        # CSV with columns: date, vix
-  cvol_file: data/cvol.csv      # CSV with columns: date, cvol_equity, cvol_bond, ...
-  macro_flags_file: data/macro_flags.csv  # CSV with columns: date, nfp_flag, cpi_flag, fomc_flag, ...
-
-features:
-  returns_horizons: [1, 5, 15]  # compute 1‑minute, 5‑minute and 15‑minute percentage returns
-  # other feature settings (SMA, ATR, RSI etc.) remain unchanged
-
-regime:
-  vix: true          # enable VIX feature
-  cvol: true         # enable CVOL feature
-  macro_flags: true  # enable macro event flags
-
-risk:
-  risk_per_trade_frac: 0.02   # 2% of account risk per trade
-  stop_r_multiple: 1.0        # stop loss at 1R
-  tp_r_multiple: 1.5          # take profit at 1.5R (triple‑barrier exit ratio)
-  max_daily_loss_r: 3.0       # daily kill‑switch triggers at 3R drawdown
-
-train:
-  # RL algorithm settings (PPO‑LSTM as baseline).  Replace with distributional DQN if implemented.
-  algorithm: ppo_lstm
-  n_envs: 1
-  total_timesteps: 500000

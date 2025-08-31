@@ -15,6 +15,9 @@ scipy>=1.11.0
 # Data access
 ib-insync==0.9.86
 databento>=0.36.0
+httpx>=0.25.0
+pydantic>=2.0.0
+polygon-api-client>=1.0.0
 
 # Configuration and utilities
 pyyaml==6.0.2
@@ -41,3 +44,7 @@ grafana-api==1.0.3
 
 # For enhanced data processing
 ta-lib==0.4.28
+
+# For Polygon API integration
+aiofiles>=0.23.0
+backoff>=2.2.0

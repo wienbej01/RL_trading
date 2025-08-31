@@ -3,6 +3,7 @@ Feature engineering pipeline for the RL trading system.
 
 This module provides a comprehensive feature engineering pipeline
 that combines technical indicators, microstructure features, and time-based features.
+Supports both Polygon and Databento data formats with automatic column mapping.
 """
 import numpy as np
 import pandas as pd
@@ -35,16 +36,67 @@ from ..utils.logging import get_logger
 class FeaturePipeline:
     """
     Feature engineering pipeline for the RL trading system.
-    
+
     This class provides a unified interface for extracting and transforming
     features from market data, including technical indicators, microstructure
-    features, and time-based features.
+    features, and time-based features. Supports both Polygon and Databento data formats.
     """
-    
+
+    # Column mapping for different data sources
+    COLUMN_MAPPINGS = {
+        'polygon_ohlcv': {
+            'timestamp': 'timestamp',
+            'open': 'open',
+            'high': 'high',
+            'low': 'low',
+            'close': 'close',
+            'volume': 'volume',
+            'vwap': 'vwap',
+            'transactions': 'transactions'
+        },
+        'polygon_quotes': {
+            'timestamp': 'timestamp',
+            'bid_price': 'bid_price',
+            'bid_size': 'bid_size',
+            'ask_price': 'ask_price',
+            'ask_size': 'ask_size',
+            'bid_exchange': 'bid_exchange',
+            'ask_exchange': 'ask_exchange'
+        },
+        'polygon_trades': {
+            'timestamp': 'timestamp',
+            'price': 'price',
+            'size': 'size',
+            'exchange': 'exchange',
+            'conditions': 'conditions',
+            'trade_id': 'trade_id'
+        },
+        'databento_ohlcv': {
+            'timestamp': 'timestamp',
+            'open': 'open',
+            'high': 'high',
+            'low': 'low',
+            'close': 'close',
+            'volume': 'volume'
+        },
+        'databento_quotes': {
+            'timestamp': 'timestamp',
+            'bid_price': 'bid',
+            'bid_size': 'bid_size',
+            'ask_price': 'ask',
+            'ask_size': 'ask_size'
+        },
+        'databento_trades': {
+            'timestamp': 'timestamp',
+            'price': 'price',
+            'size': 'size'
+        }
+    }
+
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize the feature pipeline.
-        
+
         Args:
             config: Configuration dictionary specifying which features to extract
         """
@@ -54,15 +106,90 @@ class FeaturePipeline:
         self.time_config = config.get('time', {})
         self.normalization_config = config.get('normalization', {})
         self.feature_selection_config = config.get('feature_selection', {})
-        
+
+        # Data source detection and column mapping
+        self.data_source = config.get('data_source', 'auto')
+        self.column_mapping = {}
+
         self.is_fitted = False
         self.scaler = None
         self.feature_selector: Optional[SelectKBest] = None
         self.selected_features = None
-        
+
         # Get logger
         self.logger = get_logger(__name__)
-    
+
+    def _detect_data_source(self, data: pd.DataFrame) -> str:
+        """
+        Detect the data source based on column names and data characteristics.
+
+        Args:
+            data: Input DataFrame
+
+        Returns:
+            Data source identifier ('polygon' or 'databento')
+        """
+        if self.data_source != 'auto':
+            return self.data_source
+
+        # Check for Polygon-specific columns
+        polygon_indicators = ['vwap', 'transactions', 'bid_exchange', 'ask_exchange', 'conditions', 'trade_id']
+
+        # Check for Databento-specific column patterns
+        databento_indicators = ['bid', 'ask']  # Databento uses 'bid'/'ask' instead of 'bid_price'/'ask_price'
+
+        polygon_score = sum(1 for col in polygon_indicators if col in data.columns)
+        databento_score = sum(1 for col in databento_indicators if col in data.columns)
+
+        if polygon_score > databento_score:
+            return 'polygon'
+        elif databento_score > polygon_score:
+            return 'databento'
+        else:
+            # Default to polygon if unclear
+            self.logger.info("Data source unclear, defaulting to polygon")
+            return 'polygon'
+
+    def _map_columns(self, data: pd.DataFrame, data_type: str) -> pd.DataFrame:
+        """
+        Map columns to standard format based on detected data source.
+
+        Args:
+            data: Input DataFrame
+            data_type: Type of data ('ohlcv', 'quotes', 'trades')
+
+        Returns:
+            DataFrame with standardized column names
+        """
+        data_source = self._detect_data_source(data)
+        mapping_key = f"{data_source}_{data_type}"
+
+        if mapping_key not in self.COLUMN_MAPPINGS:
+            self.logger.warning(f"No column mapping found for {mapping_key}, using data as-is")
+            return data
+
+        mapping = self.COLUMN_MAPPINGS[mapping_key]
+        self.column_mapping = mapping
+
+        # Create a copy to avoid modifying original data
+        mapped_data = data.copy()
+
+        # Apply column mapping
+        for standard_col, source_col in mapping.items():
+            if source_col in mapped_data.columns and standard_col != source_col:
+                mapped_data[standard_col] = mapped_data[source_col]
+                self.logger.debug(f"Mapped {source_col} to {standard_col}")
+
+        # Ensure timestamp is the index if it's a column
+        if 'timestamp' in mapped_data.columns:
+            if not isinstance(mapped_data.index, pd.DatetimeIndex):
+                # Convert timestamp to datetime index
+                mapped_data['timestamp'] = pd.to_datetime(mapped_data['timestamp'], unit='ms' if data_source == 'polygon' else 'ns')
+                mapped_data.set_index('timestamp', inplace=True)
+                self.logger.debug("Set timestamp as DatetimeIndex")
+
+        return mapped_data
+
     def fit(self, data: pd.DataFrame) -> 'FeaturePipeline':
         """
         Fit the feature pipeline on data.
