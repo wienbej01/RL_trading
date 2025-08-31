@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rl-intraday"
+name = "rl_intraday"
 version = "0.1.0"
 description = "Production-ready reinforcement learning trading system for intraday futures and options"
 readme = "README.md"

@@ -23,6 +23,7 @@ import asyncio
 import argparse
 import json
 import logging
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Any
@@ -35,8 +36,11 @@ from tqdm import tqdm
 import aiohttp
 import backoff
 
-from ..src.utils.logging import get_logger
-from ..src.utils.config_loader import Settings
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.utils.logging import get_logger
+from src.utils.config_loader import Settings
 
 logger = get_logger(__name__)
 
