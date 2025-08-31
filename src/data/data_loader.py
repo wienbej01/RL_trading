@@ -95,7 +95,9 @@ class UnifiedDataLoader:
         cache_path = self._cache_path(symbol, s, e, tf)
         if self.cache_enabled and cache_path.exists():
             self.logger.info("Loading cached data for %s: %s", symbol, cache_path)
-            return self._read_parquet_safe(cache_path)
+            df = self._read_parquet_safe(cache_path)
+            df = self._postprocess_df(df)
+            return df
 
         # Build from RAW
         if self.data_source == "polygon":
@@ -106,10 +108,10 @@ class UnifiedDataLoader:
         if df.empty:
             self.logger.warning("No data found for %s between %s and %s", symbol, s, e)
             return df
+# (Optional) normalize/clean minimal columns here if needed
+df = self._postprocess_df(df)
 
-        # (Optional) normalize/clean minimal columns here if needed
-
-        # Save cache
+# Save cache
         if self.cache_enabled:
             try:
                 df.to_parquet(cache_path, index=False)
@@ -119,6 +121,12 @@ class UnifiedDataLoader:
 
         return df
 
+    def _postprocess_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        ts_col = _detect_ts_col(df)
+        if ts_col:
+            df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+            df = df.set_index(ts_col).sort_index()
+        return df
     # -------------------- Polygon helpers --------------------
 
     def _iter_polygon_files(self, symbol: str, start: datetime, end: datetime) -> Iterable[Path]:
