@@ -2,7 +2,8 @@
 Reinforcement Learning environment for intraday trading.
 
 This module provides a comprehensive RL environment with triple-barrier exits,
-risk management, and end-of-day flatten functionality.
+risk management, and end-of-day flatten functionality. Supports both Polygon
+and Databento data formats with automatic detection and handling.
 """
 import numpy as np
 import pandas as pd
@@ -43,7 +44,7 @@ class IntradayRLEnv(Env):
     - Multiple asset support
     """
     
-    def __init__(self, 
+    def __init__(self,
                  ohlcv: pd.DataFrame,
                  features: pd.DataFrame,
                  cash: float = 100000.0,
@@ -54,7 +55,7 @@ class IntradayRLEnv(Env):
                  config: Optional[Dict] = None):
         """
         Initialize RL environment.
-        
+
         Args:
             ohlcv: DataFrame with OHLCV data
             features: DataFrame with features
@@ -66,22 +67,26 @@ class IntradayRLEnv(Env):
             config: Configuration dictionary (for compatibility)
         """
         super().__init__()
-        
+
+        # Detect data source and validate data format
+        self._detect_data_source(ohlcv, features)
+        self._validate_data_format(ohlcv, features)
+
         # Configuration
         self.cash = cash
         self.point_value = point_value
         self.env_config = env_config or EnvConfig(cash=cash)
         self.config = config  # Store config for compatibility
-        
+
         # Data
-        self.ohlcv = ohlcv[['open', 'high', 'low', 'close', 'volume']]
-        self.features = features.reindex(ohlcv.index, method='ffill')
-        self.df = ohlcv  # For compatibility
-        self.X = features  # For compatibility
-        
+        self.ohlcv = ohlcv[['open', 'high', 'low', 'close', 'volume']].copy()
+        self.features = features.reindex(ohlcv.index, method='ffill').copy()
+        self.df = ohlcv.copy()  # For compatibility
+        self.X = features.copy()  # For compatibility
+
         # Ensure alignment
         self.ohlcv = self.ohlcv.loc[self.features.index]
-        
+
         # Initialize components
         logger.debug("Initializing ExecutionSimulator with empty Settings()")
         self.exec_sim = ExecutionSimulator(Settings())
@@ -99,12 +104,12 @@ class IntradayRLEnv(Env):
             }
             logger.debug(f"Mapped exec_params: {exec_params_mapped}")
             self.exec_sim.exec_params = ExecParams(**exec_params_mapped)
-        
+
         # Create a proper Settings object from the config
         logger.debug("Creating Settings object for configuration")
         settings = Settings()
         logger.debug(f"Checking for config attribute: hasattr(self, 'config') = {hasattr(self, 'config')}")
-        
+
         if hasattr(self, 'config') and self.config:
             logger.debug(f"Found config attribute with content: {self.config}")
             # Ensure config keys are strings and update proper Settings format
@@ -113,7 +118,7 @@ class IntradayRLEnv(Env):
                 for key, value in self.config.items()
             }
             logger.debug(f"Converted config_dict: {config_dict}")
-            
+
             # Set defaults for required keys
             settings._config.update({
                 'risk': {
@@ -131,7 +136,7 @@ class IntradayRLEnv(Env):
             logger.debug(f"Updated settings._config: {settings._config}")
         else:
             logger.warning("No config attribute found or config is empty - using default settings")
-        
+
         logger.debug(f"Final settings object: {settings._config}")
         self.settings = settings
         logger.debug("Initializing RiskManager with settings")
@@ -139,25 +144,25 @@ class IntradayRLEnv(Env):
         if risk_cfg:
             logger.debug(f"Updating RiskManager with risk_cfg: {risk_cfg}")
             self.risk_manager.risk_config = risk_cfg
-        
+
         # State tracking
         self.reset_state()
-        
+
         # Action space: -1 (short), 0 (flat), 1 (long)
         self.action_space = Discrete(3)
-        
+
         # Observation space: features + position + unrealized P&L
         feature_dim = self.features.shape[1]
         self.observation_space = Box(
-            low=-np.inf, high=np.inf, 
-            shape=(feature_dim + 2,), 
+            low=-np.inf, high=np.inf,
+            shape=(feature_dim + 2,),
             dtype=np.float32
         )
-        
+
         # Reward tracking
         self.dsr = DifferentialSharpe()
-        
-        logger.info(f"Environment initialized with {len(self.ohlcv)} bars, {feature_dim} features")
+
+        logger.info(f"Environment initialized with {len(self.ohlcv)} bars, {feature_dim} features from {getattr(self, 'data_source', 'unknown')} data")
     
     def reset_state(self):
         """Reset environment state."""
@@ -388,12 +393,90 @@ class IntradayRLEnv(Env):
     def _eod(self, ts):
         """Check if timestamp is end of day."""
         return ts.time() >= pd.Timestamp('16:00').time()
-    
+
+    def _detect_data_source(self, ohlcv: pd.DataFrame, features: pd.DataFrame):
+        """
+        Detect the data source (Polygon or Databento) based on data characteristics.
+
+        Args:
+            ohlcv: OHLCV DataFrame
+            features: Features DataFrame
+        """
+        # Check for Polygon-specific indicators
+        polygon_indicators = ['vwap', 'transactions']
+        databento_indicators = ['bid', 'ask']  # Databento uses 'bid'/'ask' instead of 'bid_price'/'ask_price'
+
+        polygon_score = sum(1 for col in polygon_indicators if col in ohlcv.columns)
+        databento_score = sum(1 for col in databento_indicators if col in ohlcv.columns)
+
+        if polygon_score > databento_score:
+            self.data_source = 'polygon'
+        elif databento_score > polygon_score:
+            self.data_source = 'databento'
+        else:
+            self.data_source = 'unknown'
+
+        logger.info(f"Detected data source: {self.data_source}")
+
+    def _validate_data_format(self, ohlcv: pd.DataFrame, features: pd.DataFrame):
+        """
+        Validate that the data format is compatible with the environment.
+
+        Args:
+            ohlcv: OHLCV DataFrame
+            features: Features DataFrame
+
+        Raises:
+            ValueError: If data format is invalid
+        """
+        # Check required OHLCV columns
+        required_ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+        missing_ohlcv = [col for col in required_ohlcv_cols if col not in ohlcv.columns]
+        if missing_ohlcv:
+            raise ValueError(f"Missing required OHLCV columns: {missing_ohlcv}")
+
+        # Check for DatetimeIndex
+        if not isinstance(ohlcv.index, pd.DatetimeIndex):
+            raise ValueError("OHLCV data must have DatetimeIndex")
+
+        if not isinstance(features.index, pd.DatetimeIndex):
+            raise ValueError("Features data must have DatetimeIndex")
+
+        # Check data alignment
+        if len(ohlcv) != len(features):
+            logger.warning(f"OHLCV ({len(ohlcv)}) and features ({len(features)}) have different lengths")
+
+        # Check for NaN values in critical columns
+        critical_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in critical_cols:
+            if col in ohlcv.columns:
+                nan_count = ohlcv[col].isna().sum()
+                if nan_count > 0:
+                    logger.warning(f"Found {nan_count} NaN values in {col} column")
+
+        # Polygon-specific validations
+        if getattr(self, 'data_source', None) == 'polygon':
+            # Check timestamp precision (Polygon uses milliseconds)
+            if len(ohlcv) > 0:
+                first_ts = ohlcv.index[0]
+                if hasattr(first_ts, 'nanosecond'):
+                    # If nanoseconds are present, likely from Polygon millisecond conversion
+                    if first_ts.nanosecond > 0:
+                        logger.debug("Detected millisecond-precision timestamps (Polygon format)")
+
+            # Log Polygon-specific fields if present
+            polygon_fields = ['vwap', 'transactions']
+            present_fields = [field for field in polygon_fields if field in ohlcv.columns]
+            if present_fields:
+                logger.info(f"Polygon-specific fields detected: {present_fields}")
+
+        logger.info("Data format validation completed successfully")
+
     def render(self, mode='human'):
         """Render environment state."""
         if mode == 'human':
             print(f"Step: {self.i}, Equity: ${self.equity:,.2f}, Position: {self.pos}")
-    
+
     def close(self):
         """Close environment."""
         pass
@@ -591,7 +674,23 @@ class IntradayRLEnvironment(IntradayRLEnv):
         self.entry_time = None
         
         logger.debug("IntradayRLEnvironment initialization completed")
-    
+
+    def _detect_data_source_from_market_data(self, market_data: pd.DataFrame) -> str:
+        """Detect data source from market data characteristics."""
+        # Check for Polygon-specific columns
+        polygon_indicators = ['vwap', 'transactions', 'bid_exchange', 'ask_exchange']
+        databento_indicators = ['bid', 'ask']
+
+        polygon_score = sum(1 for col in polygon_indicators if col in market_data.columns)
+        databento_score = sum(1 for col in databento_indicators if col in market_data.columns)
+
+        if polygon_score > databento_score:
+            return 'polygon'
+        elif databento_score > polygon_score:
+            return 'databento'
+        else:
+            return 'unknown'
+
     def reset(self):
         """Reset environment with test-compatible interface."""
         # Call parent reset

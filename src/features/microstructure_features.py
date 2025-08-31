@@ -624,26 +624,31 @@ def calculate_price_impact(trade_price: pd.Series, trade_size: pd.Series,
     return pd.Series(price_impact, index=trade_price.index)
 
 
-def calculate_vwap(trade_price: pd.Series, trade_size: pd.Series) -> pd.Series:
+def calculate_vwap(trade_price: pd.Series, trade_size: pd.Series, polygon_vwap: Optional[pd.Series] = None) -> pd.Series:
     """
     Calculate Volume Weighted Average Price (VWAP).
-    
+
     Args:
         trade_price: Series with trade prices
         trade_size: Series with trade sizes
-        
+        polygon_vwap: Optional pre-calculated VWAP from Polygon (for OHLCV data)
+
     Returns:
         Series with VWAP values
     """
+    # If Polygon VWAP is available, use it directly
+    if polygon_vwap is not None and not polygon_vwap.empty:
+        return polygon_vwap
+
     if trade_price.empty or trade_size.empty:
         return pd.Series(dtype=float)
-    
+
     # VWAP calculation using cumulative sum
     cumulative_price_volume = (trade_price * trade_size).cumsum()
     cumulative_volume = trade_size.cumsum()
-    
+
     vwap = cumulative_price_volume / (cumulative_volume + 1e-6)
-    
+
     return pd.Series(vwap, index=trade_price.index)
 
 

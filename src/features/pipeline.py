@@ -111,6 +111,11 @@ class FeaturePipeline:
         self.data_source = config.get('data_source', 'auto')
         self.column_mapping = {}
 
+        # Polygon-specific configuration
+        self.polygon_config = config.get('polygon', {})
+        self.use_polygon_vwap = self.polygon_config.get('features', {}).get('use_vwap_column', True)
+        self.polygon_quality_checks = self.polygon_config.get('quality_checks', {}).get('enabled', True)
+
         self.is_fitted = False
         self.scaler = None
         self.feature_selector: Optional[SelectKBest] = None
@@ -190,36 +195,106 @@ class FeaturePipeline:
 
         return mapped_data
 
+    def _validate_polygon_data_quality(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Perform Polygon-specific data quality checks and cleaning.
+
+        Args:
+            data: Input DataFrame with Polygon data
+
+        Returns:
+            Cleaned DataFrame
+        """
+        original_len = len(data)
+        issues_found = []
+
+        # Check for Polygon-specific data quality issues
+        if 'vwap' in data.columns:
+            # VWAP should be reasonable relative to OHLC prices
+            vwap_anomalies = (
+                (data['vwap'] < data['low'] * 0.95) |  # VWAP too low
+                (data['vwap'] > data['high'] * 1.05)   # VWAP too high
+            )
+            if vwap_anomalies.any():
+                issues_found.append(f"Found {vwap_anomalies.sum()} VWAP anomalies")
+                # Flag but don't remove - VWAP can be outside OHLC range in some cases
+
+        if 'transactions' in data.columns:
+            # Transactions should be non-negative
+            invalid_transactions = data['transactions'] < 0
+            if invalid_transactions.any():
+                issues_found.append(f"Found {invalid_transactions.sum()} negative transaction counts")
+                data = data[~invalid_transactions]
+
+        if 'bid_exchange' in data.columns and 'ask_exchange' in data.columns:
+            # Check for cross-market quotes (same exchange on both sides)
+            cross_market = data['bid_exchange'] == data['ask_exchange']
+            if cross_market.any():
+                issues_found.append(f"Found {cross_market.sum()} potential cross-market quotes")
+
+        # Check for timestamp consistency
+        if isinstance(data.index, pd.DatetimeIndex):
+            # Check for duplicate timestamps
+            duplicates = data.index.duplicated()
+            if duplicates.any():
+                issues_found.append(f"Found {duplicates.sum()} duplicate timestamps")
+                # Keep first occurrence
+                data = data[~duplicates]
+
+            # Check for gaps in millisecond data (for high-frequency data)
+            if len(data) > 1:
+                time_diffs = data.index.to_series().diff().dt.total_seconds() * 1000
+                large_gaps = time_diffs > 60000  # 1 minute gap
+                if large_gaps.sum() > 0:
+                    issues_found.append(f"Found {large_gaps.sum()} gaps > 1 minute")
+
+        cleaned_len = len(data)
+        if cleaned_len < original_len:
+            issues_found.append(f"Removed {original_len - cleaned_len} rows during cleaning")
+
+        if issues_found:
+            self.logger.info(f"Data quality issues found: {', '.join(issues_found)}")
+
+        return data
+
     def fit(self, data: pd.DataFrame) -> 'FeaturePipeline':
         """
         Fit the feature pipeline on data.
-        
+
         Args:
             data: Data to fit on
-            
+
         Returns:
             Self
         """
+        # Map columns to standard format
+        data = self._map_columns(data, 'ohlcv')  # Assume OHLCV for fitting
+
+        # Apply data quality checks for Polygon data
+        data_source = self._detect_data_source(data)
+        if data_source == 'polygon' and self.polygon_quality_checks:
+            data = self._validate_polygon_data_quality(data)
+
         features = self._extract_features(data)
-        
+
         # Apply normalization if configured
         if self.normalization_config:
             features = self._normalize_features(features)
-        
+
         # Apply feature selection if configured
         if self.feature_selection_config:
             features = self._select_features(features)
-        
+
         self.is_fitted = True
         return self
     
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Transform data using fitted pipeline.
-        
+
         Args:
             data: Data to transform
-            
+
         Returns:
             Transformed features
         """
@@ -227,17 +302,25 @@ class FeaturePipeline:
         if not self.is_fitted:
             self.logger.warning("Pipeline not fitted, fitting on transform data")
             self.fit(data)
-        
+
+        # Map columns to standard format
+        data = self._map_columns(data, 'ohlcv')  # Assume OHLCV for transformation
+
+        # Apply data quality checks for Polygon data
+        data_source = self._detect_data_source(data)
+        if data_source == 'polygon' and self.polygon_quality_checks:
+            data = self._validate_polygon_data_quality(data)
+
         features = self._extract_features(data)
-        
+
         # Apply normalization if configured
         if self.normalization_config:
             features = self._normalize_features(features)
-        
+
         # Apply feature selection if configured
         if self.feature_selection_config:
             features = self._select_features(features)
-        
+
         return features
     
     def fit_transform(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -380,7 +463,11 @@ class FeaturePipeline:
             
             # Calculate VWAP
             if 'calculate_vwap' in micro_config and micro_config['calculate_vwap']:
-                features['vwap'] = calculate_vwap(data['close'], data['volume'])
+                # Use Polygon VWAP if available and configured to do so
+                polygon_vwap = None
+                if self.use_polygon_vwap and 'vwap' in data.columns:
+                    polygon_vwap = data['vwap']
+                features['vwap'] = calculate_vwap(data['close'], data['volume'], polygon_vwap)
             
             # Calculate TWAP
             if 'calculate_twap' in micro_config and micro_config['calculate_twap']:
@@ -390,9 +477,14 @@ class FeaturePipeline:
             # Calculate price impact
             if 'calculate_price_impact' in micro_config and micro_config['calculate_price_impact']:
                 if 'volume' in data.columns:
-                    features['price_impact'] = calculate_price_impact(
-                        data['close'], data['volume']
-                    )
+                    # Check if we have bid/ask data for proper price impact calculation
+                    if 'bid_price' in data.columns and 'ask_price' in data.columns:
+                        features['price_impact'] = calculate_price_impact(
+                            data['close'], data['volume'], data['bid_price'], data['ask_price']
+                        )
+                    else:
+                        # Fallback: simple price impact approximation using close vs open
+                        features['price_impact'] = (data['close'] - data['open']) / data['open']
         
         # Extract time features
         if 'time' in self.config:

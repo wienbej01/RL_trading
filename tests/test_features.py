@@ -695,3 +695,244 @@ class TestFeaturePipeline:
                 if len(valid_values) > 1:
                     assert abs(valid_values.mean()) < 0.1  # Close to zero
                     assert abs(valid_values.std() - 1) < 0.1  # Close to one
+
+
+class TestPolygonCompatibility:
+    """Test feature pipeline compatibility with Polygon data format."""
+
+    def setup_method(self):
+        """Set up test fixtures with Polygon-style data."""
+        np.random.seed(42)
+
+        # Create sample Polygon OHLCV data
+        dates = pd.date_range('2023-01-01', periods=100, freq='1min')
+        base_price = 4500
+        returns = np.random.normal(0, 0.001, 100)
+        prices = base_price + np.cumsum(returns * base_price)
+
+        self.polygon_ohlcv = pd.DataFrame({
+            'timestamp': dates,  # Polygon uses timestamp column
+            'open': prices + np.random.normal(0, 0.5, 100),
+            'high': prices + np.abs(np.random.normal(0, 1.0, 100)),
+            'low': prices - np.abs(np.random.normal(0, 1.0, 100)),
+            'close': prices,
+            'volume': np.random.randint(100, 1000, 100),
+            'vwap': prices + np.random.normal(0, 0.1, 100),  # Polygon VWAP
+            'transactions': np.random.randint(10, 100, 100)  # Polygon transactions
+        })
+
+        # Create sample Polygon quote data
+        self.polygon_quotes = pd.DataFrame({
+            'timestamp': dates,
+            'bid_price': prices - 0.125,
+            'bid_size': np.random.randint(100, 1000, 100),
+            'ask_price': prices + 0.125,
+            'ask_size': np.random.randint(100, 1000, 100),
+            'bid_exchange': np.random.randint(1, 20, 100),
+            'ask_exchange': np.random.randint(1, 20, 100)
+        })
+
+        # Create sample Polygon trade data
+        self.polygon_trades = pd.DataFrame({
+            'timestamp': dates,
+            'price': prices + np.random.normal(0, 0.2, 100),
+            'size': np.random.randint(1, 100, 100),
+            'exchange': np.random.randint(1, 20, 100),
+            'conditions': [None] * 100,
+            'trade_id': [f'trade_{i}' for i in range(100)]
+        })
+
+    def test_polygon_data_detection(self):
+        """Test automatic detection of Polygon data format."""
+        config = {'data_source': 'auto'}
+        pipeline = FeaturePipeline(config)
+
+        # Test OHLCV detection
+        data_source = pipeline._detect_data_source(self.polygon_ohlcv)
+        assert data_source == 'polygon'
+
+        # Test quote detection
+        data_source = pipeline._detect_data_source(self.polygon_quotes)
+        assert data_source == 'polygon'
+
+        # Test trade detection
+        data_source = pipeline._detect_data_source(self.polygon_trades)
+        assert data_source == 'polygon'
+
+    def test_polygon_column_mapping(self):
+        """Test column mapping for Polygon data."""
+        config = {'data_source': 'auto'}
+        pipeline = FeaturePipeline(config)
+
+        # Test OHLCV mapping
+        mapped_data = pipeline._map_columns(self.polygon_ohlcv, 'ohlcv')
+        assert 'close' in mapped_data.columns
+        assert 'volume' in mapped_data.columns
+        assert 'vwap' in mapped_data.columns
+        assert isinstance(mapped_data.index, pd.DatetimeIndex)
+
+        # Test quote mapping
+        mapped_quotes = pipeline._map_columns(self.polygon_quotes, 'quotes')
+        assert 'bid_price' in mapped_quotes.columns
+        assert 'ask_price' in mapped_quotes.columns
+        assert 'bid_size' in mapped_quotes.columns
+        assert 'ask_size' in mapped_quotes.columns
+
+    def test_polygon_vwap_usage(self):
+        """Test that Polygon VWAP is used when available."""
+        config = {
+            'data_source': 'auto',
+            'microstructure': {
+                'calculate_vwap': True
+            },
+            'polygon': {
+                'features': {
+                    'use_vwap_column': True
+                }
+            }
+        }
+        pipeline = FeaturePipeline(config)
+
+        # Transform data
+        features = pipeline.transform(self.polygon_ohlcv)
+
+        # VWAP feature should be present
+        assert 'vwap' in features.columns
+
+        # Check that VWAP values match the input VWAP (since we're using it directly)
+        original_vwap = self.polygon_ohlcv['vwap']
+        feature_vwap = features['vwap']
+
+        # They should be very close (allowing for any processing)
+        diff = abs(original_vwap - feature_vwap).dropna()
+        assert diff.max() < 1e-10
+
+    def test_polygon_quality_checks(self):
+        """Test Polygon-specific data quality checks."""
+        config = {
+            'data_source': 'auto',
+            'polygon': {
+                'quality_checks': {
+                    'enabled': True
+                }
+            }
+        }
+        pipeline = FeaturePipeline(config)
+
+        # Test with clean data
+        features = pipeline.transform(self.polygon_ohlcv)
+        assert isinstance(features, pd.DataFrame)
+
+        # Test with problematic VWAP data
+        bad_data = self.polygon_ohlcv.copy()
+        bad_data.loc[10, 'vwap'] = bad_data.loc[10, 'low'] - 1  # VWAP below low
+
+        # Should still process but log warnings
+        features = pipeline.transform(bad_data)
+        assert isinstance(features, pd.DataFrame)
+
+    def test_polygon_timestamp_handling(self):
+        """Test timestamp handling for Polygon data."""
+        config = {'data_source': 'auto'}
+        pipeline = FeaturePipeline(config)
+
+        # Test millisecond timestamps (Polygon aggregates)
+        ms_timestamps = pd.DataFrame({
+            'timestamp': [1640995200000, 1640995260000, 1640995320000],  # milliseconds
+            'close': [4500, 4501, 4502],
+            'volume': [100, 101, 102]
+        })
+
+        mapped_data = pipeline._map_columns(ms_timestamps, 'ohlcv')
+        assert isinstance(mapped_data.index, pd.DatetimeIndex)
+
+        # Test nanosecond timestamps (Polygon quotes/trades)
+        ns_timestamps = pd.DataFrame({
+            'timestamp': [1640995200000000000, 1640995260000000000, 1640995320000000000],  # nanoseconds
+            'bid_price': [4499, 4500, 4501],
+            'ask_price': [4501, 4502, 4503],
+            'bid_size': [100, 101, 102],
+            'ask_size': [100, 101, 102]
+        })
+
+        mapped_quotes = pipeline._map_columns(ns_timestamps, 'quotes')
+        assert isinstance(mapped_quotes.index, pd.DatetimeIndex)
+
+    def test_backward_compatibility_databento(self):
+        """Test backward compatibility with Databento data format."""
+        # Create Databento-style data
+        dates = pd.date_range('2023-01-01', periods=50, freq='1min')
+        base_price = 4500
+
+        databento_data = pd.DataFrame({
+            'timestamp': dates,
+            'open': base_price + np.random.normal(0, 1, 50),
+            'high': base_price + np.abs(np.random.normal(0, 2, 50)),
+            'low': base_price - np.abs(np.random.normal(0, 2, 50)),
+            'close': base_price + np.random.normal(0, 1, 50),
+            'volume': np.random.randint(100, 1000, 50),
+            'bid': base_price - 0.125 + np.random.normal(0, 0.1, 50),  # Databento uses 'bid'/'ask'
+            'ask': base_price + 0.125 + np.random.normal(0, 0.1, 50),
+            'bid_size': np.random.randint(100, 1000, 50),
+            'ask_size': np.random.randint(100, 1000, 50)
+        })
+
+        config = {'data_source': 'auto'}
+        pipeline = FeaturePipeline(config)
+
+        # Should detect as Databento
+        data_source = pipeline._detect_data_source(databento_data)
+        assert data_source == 'databento'
+
+        # Should still work
+        features = pipeline.transform(databento_data)
+        assert isinstance(features, pd.DataFrame)
+        assert len(features) == len(databento_data)
+
+    def test_polygon_feature_extraction(self):
+        """Test complete feature extraction pipeline with Polygon data."""
+        config = {
+            'data_source': 'auto',
+            'technical': {
+                'sma_windows': [10, 20],
+                'rsi_window': 14,
+                'calculate_atr': True
+            },
+            'microstructure': {
+                'calculate_spread': True,
+                'calculate_vwap': True,
+                'calculate_queue_imbalance': True
+            },
+            'time': {
+                'extract_time_of_day': True,
+                'extract_session_features': True
+            },
+            'polygon': {
+                'features': {
+                    'use_vwap_column': True
+                },
+                'quality_checks': {
+                    'enabled': True
+                }
+            }
+        }
+
+        pipeline = FeaturePipeline(config)
+        features = pipeline.transform(self.polygon_ohlcv)
+
+        # Check technical features
+        assert 'sma_10' in features.columns
+        assert 'sma_20' in features.columns
+        assert 'rsi_14' in features.columns
+        assert 'atr' in features.columns
+
+        # Check microstructure features
+        assert 'spread' in features.columns
+        assert 'vwap' in features.columns
+
+        # Check time features
+        assert 'hour' in features.columns
+        assert 'is_market_open' in features.columns
+
+        # Should have reasonable number of features
+        assert features.shape[1] > 10

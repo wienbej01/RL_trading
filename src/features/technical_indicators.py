@@ -736,77 +736,90 @@ def calculate_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
     return rsi
 
 
-def calculate_macd(prices: pd.Series, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def calculate_macd(prices: pd.Series, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> Dict[str, pd.Series]:
     """
     Calculate MACD (Moving Average Convergence Divergence).
-    
+
     Args:
         prices: Price series
         fast_period: Fast EMA period
         slow_period: Slow EMA period
         signal_period: Signal line EMA period
-        
+
     Returns:
-        Tuple with MACD line, signal line, and histogram
+        Dictionary with MACD line, signal line, and histogram
     """
     # Calculate EMAs
     ema_fast = prices.ewm(span=fast_period).mean()
     ema_slow = prices.ewm(span=slow_period).mean()
-    
+
     # Calculate MACD line
     macd_line = ema_fast - ema_slow
-    
+
     # Calculate signal line
     signal_line = macd_line.ewm(span=signal_period).mean()
-    
+
     # Calculate histogram
     histogram = macd_line - signal_line
-    
-    return macd_line, signal_line, histogram
+
+    return {
+        'macd': macd_line,
+        'signal': signal_line,
+        'histogram': histogram
+    }
 
 
-def calculate_bollinger_bands(prices: pd.Series, window: int = 20, num_std: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def calculate_bollinger_bands(prices: pd.Series, window: int = 20, num_std: float = 2.0) -> Dict[str, pd.Series]:
     """
     Calculate Bollinger Bands.
-    
+
     Args:
         prices: Price series
         window: Lookback window
         num_std: Number of standard deviations
-        
+
     Returns:
-        Tuple with upper band, middle band, and lower band
+        Dictionary with upper band, middle band, lower band, and width
     """
     rolling_mean = prices.rolling(window=window).mean()
     rolling_std = prices.rolling(window=window).std()
-    
+
     upper_band = rolling_mean + (rolling_std * num_std)
     lower_band = rolling_mean - (rolling_std * num_std)
-    
-    return upper_band, rolling_mean, lower_band
+    bb_width = (upper_band - lower_band) / rolling_mean
+
+    return {
+        'upper': upper_band,
+        'middle': rolling_mean,
+        'lower': lower_band,
+        'width': bb_width
+    }
 
 
-def calculate_stochastic_oscillator(high: pd.Series, low: pd.Series, close: pd.Series, 
-                                  k_window: int = 14, d_window: int = 3) -> Tuple[pd.Series, pd.Series]:
+def calculate_stochastic_oscillator(high: pd.Series, low: pd.Series, close: pd.Series,
+                                  k_period: int = 14, d_period: int = 3) -> Dict[str, pd.Series]:
     """
     Calculate Stochastic Oscillator.
-    
+
     Args:
         high: High price series
         low: Low price series
         close: Close price series
-        k_window: Period for %K calculation
-        d_window: Period for %D calculation
-        
+        k_period: Period for %K calculation
+        d_period: Period for %D calculation
+
     Returns:
-        Tuple with %K and %D series
+        Dictionary with %K and %D series
     """
-    low_min = low.rolling(window=k_window).min()
-    high_max = high.rolling(window=k_window).max()
+    low_min = low.rolling(window=k_period).min()
+    high_max = high.rolling(window=k_period).max()
     k_percent = 100 * ((close - low_min) / (high_max - low_min))
-    d_percent = k_percent.rolling(window=d_window).mean()
-    
-    return k_percent, d_percent
+    d_percent = k_percent.rolling(window=d_period).mean()
+
+    return {
+        'k': k_percent,
+        'd': d_percent
+    }
 
 
 def calculate_williams_r(high: pd.Series, low: pd.Series, close: pd.Series, 
