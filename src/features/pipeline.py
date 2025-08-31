@@ -514,6 +514,11 @@ class FeaturePipeline:
                 features = pd.concat([features, session_features], axis=1)
         
         self.logger.info("Extracted %d features", len(features.columns))
+
+        # Drop warmup bars for rolling indicators
+        max_lb = 120
+        features = features.iloc[max_lb:].copy()
+
         return features
 
     def _normalize_features(self, features: pd.DataFrame) -> pd.DataFrame:

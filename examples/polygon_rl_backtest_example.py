@@ -45,15 +45,14 @@ def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFra
     """
     logger.info(f"Loading Polygon data for {symbol} from {start_date} to {end_date}")
 
-    settings = Settings.from_paths('configs/settings.yaml')
-    loader = UnifiedDataLoader(settings, data_source='polygon')
+    config_path = Path(__file__).parent.parent / 'configs' / 'settings.yaml'
+    loader = UnifiedDataLoader(data_source='polygon', config_path=str(config_path))
 
-    df = loader.load_data(
+    df = loader.load(
         symbol=symbol,
-        start_date=start_date,
-        end_date=end_date,
-        data_type='ohlcv',
-        freq='1min'
+        start=start_date,
+        end=end_date,
+        timeframe='1min'
     )
 
     logger.info(f"Loaded {len(df)} records for {symbol}")
