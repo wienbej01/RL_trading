@@ -53,7 +53,7 @@ def load_and_validate_data(data_dir: Path, symbols: List[str]) -> Dict[str, Any]
 
     # Initialize data loader with config
     settings = Settings.from_paths('configs/settings.yaml')
-    loader = UnifiedDataLoader(settings, data_source='polygon')
+    loader = UnifiedDataLoader(data_source='polygon', config_path='configs/settings.yaml')
 
     for symbol in tqdm(symbols, desc="Validating symbols"):
         symbol_results = {
@@ -159,7 +159,7 @@ def test_rl_environment(data_dir: Path, symbol: str) -> Dict[str, Any]:
     try:
         # Initialize data loader with config
         settings = Settings.from_paths('configs/settings.yaml')
-        loader = UnifiedDataLoader(settings, data_source='polygon')
+        loader = UnifiedDataLoader(data_source='polygon', config_path='configs/settings.yaml')
 
         # Load data
         df = loader.load_data(

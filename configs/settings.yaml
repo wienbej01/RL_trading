@@ -2,8 +2,8 @@ project: rl-intraday
 seed: 42
 
 data:
-  instrument: MES
-  minute_file: data/raw/mes_1min.parquet        # Databento/IBKR backfill
+  instrument: SPY
+  minute_file: data/raw/spy_1min.parquet        # Polygon data for SPY
   vix_file: data/external/vix.csv
   cvol_file: data/external/cvol.csv
   macro_flags_file: data/external/macro_flags.csv
@@ -75,11 +75,11 @@ regime:
   macro_flags: true
 
 execution:
-  tick_value: 1.25            # MES tick $1.25 (0.25 index pt * $5)
-  point_value: 5.0            # $ per index point for MES
+  tick_value: 0.01            # SPY tick $0.01 (1 cent per share)
+  point_value: 1.0            # $ per point for SPY ETF
   spread_ticks: 1             # baseline spread consumption
   impact_bps: 0.5             # temporary impact per 1% ADV (toy)
-  commission_per_contract: 0.6
+  commission_per_contract: 0.0035  # Typical ETF commission per share
 
 risk:
   risk_per_trade_frac: 0.02   # 2%

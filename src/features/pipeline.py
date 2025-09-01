@@ -515,9 +515,10 @@ class FeaturePipeline:
         
         self.logger.info("Extracted %d features", len(features.columns))
 
-        # Drop warmup bars for rolling indicators
-        max_lb = 120
-        features = features.iloc[max_lb:].copy()
+        # Note: Warmup bars are kept to maintain alignment with OHLCV data
+        # The training process will handle any necessary warmup period
+        # max_lb = 120
+        # features = features.iloc[max_lb:].copy()
 
         return features
 

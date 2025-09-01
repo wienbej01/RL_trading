@@ -1,55 +1,13 @@
 {
-  "total_symbols": 8,
-  "successful_symbols": 8,
-  "total_ohlcv_records": 40000,
+  "total_symbols": 1,
+  "successful_symbols": 1,
+  "total_ohlcv_records": 90000,
   "total_quotes_records": 0,
   "total_errors": 0,
   "symbol_results": [
     {
       "symbol": "SPY",
-      "ohlcv_records": 5000,
-      "quotes_records": 0,
-      "errors": []
-    },
-    {
-      "symbol": "QQQ",
-      "ohlcv_records": 5000,
-      "quotes_records": 0,
-      "errors": []
-    },
-    {
-      "symbol": "AAPL",
-      "ohlcv_records": 5000,
-      "quotes_records": 0,
-      "errors": []
-    },
-    {
-      "symbol": "MSFT",
-      "ohlcv_records": 5000,
-      "quotes_records": 0,
-      "errors": []
-    },
-    {
-      "symbol": "TSLA",
-      "ohlcv_records": 5000,
-      "quotes_records": 0,
-      "errors": []
-    },
-    {
-      "symbol": "NVDA",
-      "ohlcv_records": 5000,
-      "quotes_records": 0,
-      "errors": []
-    },
-    {
-      "symbol": "AMD",
-      "ohlcv_records": 5000,
-      "quotes_records": 0,
-      "errors": []
-    },
-    {
-      "symbol": "GOOGL",
-      "ohlcv_records": 5000,
+      "ohlcv_records": 90000,
       "quotes_records": 0,
       "errors": []
     }

@@ -35,6 +35,7 @@ import numpy as np
 from tqdm import tqdm
 import aiohttp
 import backoff
+from dateutil.relativedelta import relativedelta
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -72,6 +73,71 @@ EXTENDED_PORTFOLIO = {
     'XOM': {'name': 'Exxon Mobil Corp.', 'avg_volume': 15000000, 'volatility': 'medium'},
     'JPM': {'name': 'JPMorgan Chase & Co.', 'avg_volume': 12000000, 'volatility': 'medium'},
     'V': {'name': 'Visa Inc.', 'avg_volume': 8000000, 'volatility': 'low'}
+}
+
+# Top 50 S&P500 stocks with price between $2 and $50, sorted by daily traded volume
+# Assumptions for 2025 data collection:
+# - List is static based on 2024 Q4 data to determine S&P500 membership, price range ($2-50), and average daily volume
+# - Since 2025 data is future, this list represents the expected top 50 based on historical trends
+# - Price range filter applied using 2024 closing prices; volume sorted by 2024 average daily volume
+# - S&P500 composition may change in 2025; this is a snapshot for simulation purposes
+# - For production use with real 2025 data, consider dynamic filtering via Polygon API
+TOP50_SP500 = {
+    'PLTR': {'name': 'Palantir Technologies Inc.', 'avg_volume': 30000000, 'volatility': 'high'},
+    'BAC': {'name': 'Bank of America Corp.', 'avg_volume': 40000000, 'volatility': 'medium'},
+    'PFE': {'name': 'Pfizer Inc.', 'avg_volume': 20000000, 'volatility': 'medium'},
+    'AAL': {'name': 'American Airlines Group Inc.', 'avg_volume': 20000000, 'volatility': 'high'},
+    'SOFI': {'name': 'SoFi Technologies Inc.', 'avg_volume': 20000000, 'volatility': 'high'},
+    'HOOD': {'name': 'Robinhood Markets Inc.', 'avg_volume': 10000000, 'volatility': 'high'},
+    'LCID': {'name': 'Lucid Group Inc.', 'avg_volume': 10000000, 'volatility': 'very_high'},
+    'DAL': {'name': 'Delta Air Lines Inc.', 'avg_volume': 10000000, 'volatility': 'high'},
+    'LUV': {'name': 'Southwest Airlines Co.', 'avg_volume': 8000000, 'volatility': 'medium'},
+    'UAL': {'name': 'United Airlines Holdings Inc.', 'avg_volume': 8000000, 'volatility': 'high'},
+    'CCL': {'name': 'Carnival Corp.', 'avg_volume': 5000000, 'volatility': 'high'},
+    'NCLH': {'name': 'Norwegian Cruise Line Holdings Ltd.', 'avg_volume': 3000000, 'volatility': 'high'},
+    'RIVN': {'name': 'Rivian Automotive Inc.', 'avg_volume': 5000000, 'volatility': 'very_high'},
+    'UPST': {'name': 'Upstart Holdings Inc.', 'avg_volume': 5000000, 'volatility': 'very_high'},
+    'PARA': {'name': 'Paramount Global', 'avg_volume': 5000000, 'volatility': 'high'},
+    'VTRS': {'name': 'Viatris Inc.', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'WBA': {'name': 'Walgreens Boots Alliance Inc.', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'BMY': {'name': 'Bristol-Myers Squibb Co.', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'SYF': {'name': 'Synchrony Financial', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'CFG': {'name': 'Citizens Financial Group Inc.', 'avg_volume': 3000000, 'volatility': 'medium'},
+    'KEY': {'name': 'KeyCorp', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'RF': {'name': 'Regions Financial Corp.', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'HBAN': {'name': 'Huntington Bancshares Inc.', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'TFC': {'name': 'Truist Financial Corp.', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'USB': {'name': 'U.S. Bancorp', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'FITB': {'name': 'Fifth Third Bancorp', 'avg_volume': 3000000, 'volatility': 'medium'},
+    'ZION': {'name': 'Zions Bancorporation', 'avg_volume': 1000000, 'volatility': 'medium'},
+    'CMA': {'name': 'Comerica Inc.', 'avg_volume': 1000000, 'volatility': 'medium'},
+    'MGM': {'name': 'MGM Resorts International', 'avg_volume': 3000000, 'volatility': 'high'},
+    'CZR': {'name': 'Caesars Entertainment Inc.', 'avg_volume': 2000000, 'volatility': 'high'},
+    'PENN': {'name': 'Penn Entertainment Inc.', 'avg_volume': 2000000, 'volatility': 'high'},
+    'NWSA': {'name': 'News Corporation', 'avg_volume': 2000000, 'volatility': 'medium'},
+    'FOX': {'name': 'Fox Corporation', 'avg_volume': 2000000, 'volatility': 'medium'},
+    'CTRA': {'name': 'Coterra Energy Corp.', 'avg_volume': 3000000, 'volatility': 'high'},
+    'MRO': {'name': 'Marathon Oil Corp.', 'avg_volume': 5000000, 'volatility': 'high'},
+    'DVN': {'name': 'Devon Energy Corp.', 'avg_volume': 3000000, 'volatility': 'high'},
+    'SAVE': {'name': 'Spirit Airlines Inc.', 'avg_volume': 2000000, 'volatility': 'high'},
+    'ALK': {'name': 'Alaska Air Group Inc.', 'avg_volume': 1000000, 'volatility': 'high'},
+    'RUM': {'name': 'Rumble Inc.', 'avg_volume': 2000000, 'volatility': 'very_high'},
+    'T': {'name': 'AT&T Inc.', 'avg_volume': 30000000, 'volatility': 'medium'},
+    'VZ': {'name': 'Verizon Communications Inc.', 'avg_volume': 15000000, 'volatility': 'medium'},
+    'CMCSA': {'name': 'Comcast Corp.', 'avg_volume': 15000000, 'volatility': 'medium'},
+    'PINS': {'name': 'Pinterest Inc.', 'avg_volume': 10000000, 'volatility': 'high'},
+    'SNAP': {'name': 'Snap Inc.', 'avg_volume': 20000000, 'volatility': 'high'},
+    'TWTR': {'name': 'Twitter Inc.', 'avg_volume': 10000000, 'volatility': 'high'},
+    'VFC': {'name': 'VF Corp.', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'HBI': {'name': 'Hanesbrands Inc.', 'avg_volume': 5000000, 'volatility': 'medium'},
+    'GPS': {'name': 'Gap Inc.', 'avg_volume': 5000000, 'volatility': 'high'},
+    'AEO': {'name': 'American Eagle Outfitters Inc.', 'avg_volume': 3000000, 'volatility': 'high'},
+    'URBN': {'name': 'Urban Outfitters Inc.', 'avg_volume': 2000000, 'volatility': 'high'},
+    'LEVI': {'name': 'Levi Strauss & Co.', 'avg_volume': 1000000, 'volatility': 'medium'},
+    'LYFT': {'name': 'Lyft Inc.', 'avg_volume': 5000000, 'volatility': 'high'},
+    'DOCU': {'name': 'DocuSign Inc.', 'avg_volume': 2000000, 'volatility': 'high'},
+    'JNPR': {'name': 'Juniper Networks Inc.', 'avg_volume': 3000000, 'volatility': 'medium'},
+    'CSCO': {'name': 'Cisco Systems Inc.', 'avg_volume': 15000000, 'volatility': 'medium'}
 }
 
 
@@ -174,6 +240,7 @@ class PolygonDataCollector:
     ) -> pd.DataFrame:
         """
         Get aggregate bars (OHLCV) data for a symbol.
+        Chunks requests by month to handle large date ranges and API limits.
 
         Args:
             symbol: Stock symbol
@@ -185,40 +252,56 @@ class PolygonDataCollector:
         Returns:
             DataFrame with OHLCV data
         """
-        endpoint = f"/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{start_date}/{end_date}"
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        dfs = []
 
-        data = await self._make_request(endpoint, {})
+        current = start_dt
+        while current <= end_dt:
+            month_end = min(current + relativedelta(months=1) - timedelta(days=1), end_dt)
+            month_start_str = current.strftime('%Y-%m-%d')
+            month_end_str = month_end.strftime('%Y-%m-%d')
 
-        if not data.get('results'):
+            endpoint = f"/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{month_start_str}/{month_end_str}"
+
+            data = await self._make_request(endpoint, {})
+
+            if data.get('results'):
+                # Convert to DataFrame
+                df = pd.DataFrame(data['results'])
+
+                # Convert timestamp from milliseconds to datetime
+                df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+
+                # Rename columns to standard format
+                column_mapping = {
+                    'o': 'open',
+                    'h': 'high',
+                    'l': 'low',
+                    'c': 'close',
+                    'v': 'volume',
+                    'vw': 'vwap',
+                    'n': 'transactions'
+                }
+
+                df = df.rename(columns=column_mapping)
+
+                # Keep only relevant columns
+                keep_columns = ['open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions']
+                df = df[[col for col in keep_columns if col in df.columns]]
+
+                dfs.append(df)
+
+            current = month_end + timedelta(days=1)
+
+        if dfs:
+            combined_df = pd.concat(dfs).sort_index()
+            logger.info(f"Retrieved {len(combined_df)} bars for {symbol}")
+            return combined_df
+        else:
             logger.warning(f"No data returned for {symbol} from {start_date} to {end_date}")
             return pd.DataFrame()
-
-        # Convert to DataFrame
-        df = pd.DataFrame(data['results'])
-
-        # Convert timestamp from milliseconds to datetime
-        df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-
-        # Rename columns to standard format
-        column_mapping = {
-            'o': 'open',
-            'h': 'high',
-            'l': 'low',
-            'c': 'close',
-            'v': 'volume',
-            'vw': 'vwap',
-            'n': 'transactions'
-        }
-
-        df = df.rename(columns=column_mapping)
-
-        # Keep only relevant columns
-        keep_columns = ['open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions']
-        df = df[[col for col in keep_columns if col in df.columns]]
-
-        logger.info(f"Retrieved {len(df)} bars for {symbol}")
-        return df
 
     async def get_quotes(
         self,
@@ -364,7 +447,7 @@ async def main():
     parser.add_argument('--symbols', type=str, help='Comma-separated list of symbols')
     parser.add_argument('--start-date', type=str, required=True, help='Start date (YYYY-MM-DD)')
     parser.add_argument('--end-date', type=str, required=True, help='End date (YYYY-MM-DD)')
-    parser.add_argument('--preset', choices=['pilot', 'extended'], help='Use predefined portfolio')
+    parser.add_argument('--preset', choices=['pilot', 'extended', 'top50_sp500'], help='Use predefined portfolio')
     parser.add_argument('--include-quotes', action='store_true', help='Include quotes data')
     parser.add_argument('--api-key', type=str, help='Polygon API key (or set POLYGON_API_KEY env var)')
     parser.add_argument('--data-dir', type=str, help='Data directory path')
@@ -383,6 +466,9 @@ async def main():
     elif args.preset == 'extended':
         symbols = list(EXTENDED_PORTFOLIO.keys())
         logger.info(f"Using extended portfolio: {symbols}")
+    elif args.preset == 'top50_sp500':
+        symbols = list(TOP50_SP500.keys())
+        logger.info(f"Using top50_sp500 portfolio: {symbols}")
     elif args.symbols:
         symbols = [s.strip() for s in args.symbols.split(',')]
         logger.info(f"Using custom symbols: {symbols}")

@@ -1,0 +1,90 @@
+RL Backtest Example - SPY
+==================================================
+Date Range: 2024-01-01 to 2024-02-01
+Episodes: 5
+
+Loading data...
+2025-09-01 09:21:23,512 - __main__ - INFO - Loading Polygon data for SPY from 2024-01-01 to 2024-02-01
+2025-09-01 09:21:23,512 - __main__ - INFO - Loading Polygon data for SPY from 2024-01-01 to 2024-02-01
+2025-09-01 09:21:23,523 - src.utils.config_loader - INFO - Loaded configuration from /home/jacobw/RL_trading/rl-intraday/configs/settings.yaml
+2025-09-01 09:21:23,523 - src.utils.config_loader - INFO - Resolved paths: {'data_root': '/home/jacobw/RL_trading/rl-intraday/data', 'cache_dir': '/home/jacobw/RL_trading/rl-intraday/data/cache', 'polygon_raw_dir': '/home/jacobw/RL_trading/rl-intraday/data/polygon/historical'}
+2025-09-01 09:21:23,523 - src.data.data_loader - INFO - Data root: /home/jacobw/RL_trading/rl-intraday/data | Cache: /home/jacobw/RL_trading/rl-intraday/data/cache | Raw (polygon): /home/jacobw/RL_trading/rl-intraday/data/polygon/historical
+2025-09-01 09:21:23,523 - src.data.data_loader - INFO - Data directories: [PosixPath('/home/jacobw/RL_trading/rl-intraday/data/polygon/historical')]
+2025-09-01 09:21:23,526 - src.data.data_loader - INFO - Loading cached data for SPY: /home/jacobw/RL_trading/rl-intraday/data/cache/SPY_20240101_20240202_ohlcv_1min.parquet
+2025-09-01 09:21:23,586 - __main__ - INFO - Loaded 5000 records for SPY
+2025-09-01 09:21:23,586 - __main__ - INFO - Loaded 5000 records for SPY
+Loaded 5000 records
+Date range: 2024-01-02 04:00:00-05:00 to 2024-01-10 09:22:00-05:00
+
+Creating features...
+2025-09-01 09:21:23,590 - src.features.pipeline - INFO - Data quality issues found: Found 527 gaps > 1 minute
+2025-09-01 09:21:23,590 - src.features.pipeline - INFO - Data quality issues found: Found 527 gaps > 1 minute
+2025-09-01 09:21:24,863 - src.features.pipeline - INFO - Extracted 39 features
+2025-09-01 09:21:24,863 - src.features.pipeline - INFO - Extracted 39 features
+2025-09-01 09:21:24,867 - src.features.pipeline - INFO - Data quality issues found: Found 527 gaps > 1 minute
+2025-09-01 09:21:24,867 - src.features.pipeline - INFO - Data quality issues found: Found 527 gaps > 1 minute
+2025-09-01 09:21:26,877 - src.features.pipeline - INFO - Extracted 39 features
+2025-09-01 09:21:26,877 - src.features.pipeline - INFO - Extracted 39 features
+Created 39 features
+
+Initializing RL environment...
+2025-09-01 09:21:26,882 - src.sim.env_intraday_rl - INFO - Detected data source: polygon
+2025-09-01 09:21:26,882 - src.sim.env_intraday_rl - INFO - Detected data source: polygon
+2025-09-01 09:21:26,882 - src.sim.env_intraday_rl - WARNING - OHLCV (5000) and features (4880) have different lengths
+2025-09-01 09:21:26,882 - src.sim.env_intraday_rl - WARNING - OHLCV (5000) and features (4880) have different lengths
+2025-09-01 09:21:26,885 - src.sim.env_intraday_rl - INFO - Polygon-specific fields detected: ['vwap', 'transactions']
+2025-09-01 09:21:26,885 - src.sim.env_intraday_rl - INFO - Polygon-specific fields detected: ['vwap', 'transactions']
+2025-09-01 09:21:26,886 - src.sim.env_intraday_rl - INFO - Data format validation completed successfully
+2025-09-01 09:21:26,886 - src.sim.env_intraday_rl - INFO - Data format validation completed successfully
+2025-09-01 09:21:26,911 - src.utils.config_loader - INFO - Loaded configuration from /home/jacobw/RL_trading/rl-intraday/configs/settings.yaml
+2025-09-01 09:21:26,911 - src.utils.config_loader - INFO - Resolved paths: {'data_root': '/home/jacobw/RL_trading/rl-intraday/data', 'cache_dir': '/home/jacobw/RL_trading/rl-intraday/data/cache', 'polygon_raw_dir': '/home/jacobw/RL_trading/rl-intraday/data/polygon/historical'}
+2025-09-01 09:21:26,929 - src.utils.config_loader - INFO - Loaded configuration from /home/jacobw/RL_trading/rl-intraday/configs/settings.yaml
+2025-09-01 09:21:26,929 - src.utils.config_loader - INFO - Resolved paths: {'data_root': '/home/jacobw/RL_trading/rl-intraday/data', 'cache_dir': '/home/jacobw/RL_trading/rl-intraday/data/cache', 'polygon_raw_dir': '/home/jacobw/RL_trading/rl-intraday/data/polygon/historical'}
+2025-09-01 09:21:26,929 - src.sim.env_intraday_rl - WARNING - No config attribute found or config is empty - using default settings
+2025-09-01 09:21:26,929 - src.sim.env_intraday_rl - WARNING - No config attribute found or config is empty - using default settings
+2025-09-01 09:21:26,930 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:26,930 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:26,930 - src.sim.env_intraday_rl - INFO - Environment initialized with 5000 bars, 39 features from polygon data
+2025-09-01 09:21:26,930 - src.sim.env_intraday_rl - INFO - Environment initialized with 5000 bars, 39 features from polygon data
+Environment initialized successfully
+
+Running backtest simulation...
+2025-09-01 09:21:26,930 - __main__ - INFO - Running backtest simulation with 5 episodes
+2025-09-01 09:21:26,930 - __main__ - INFO - Running backtest simulation with 5 episodes
+2025-09-01 09:21:26,930 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:26,930 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:26,966 - __main__ - INFO - Episode 1: Reward=-3066.45, Steps=10, Return=-3.0508%
+2025-09-01 09:21:26,966 - __main__ - INFO - Episode 1: Reward=-3066.45, Steps=10, Return=-3.0508%
+2025-09-01 09:21:26,966 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:26,966 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:27,069 - __main__ - INFO - Episode 2: Reward=-3079.88, Steps=72, Return=-3.0064%
+2025-09-01 09:21:27,069 - __main__ - INFO - Episode 2: Reward=-3079.88, Steps=72, Return=-3.0064%
+2025-09-01 09:21:27,069 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:27,069 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:27,106 - __main__ - INFO - Episode 3: Reward=-3193.08, Steps=20, Return=-3.1703%
+2025-09-01 09:21:27,106 - __main__ - INFO - Episode 3: Reward=-3193.08, Steps=20, Return=-3.1703%
+2025-09-01 09:21:27,106 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:27,106 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:27,132 - __main__ - INFO - Episode 4: Reward=-3537.33, Steps=19, Return=-3.5098%
+2025-09-01 09:21:27,132 - __main__ - INFO - Episode 4: Reward=-3537.33, Steps=19, Return=-3.5098%
+2025-09-01 09:21:27,132 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:27,132 - src.sim.risk - INFO - Daily risk metrics reset
+2025-09-01 09:21:27,168 - __main__ - INFO - Episode 5: Reward=-3069.19, Steps=29, Return=-3.0390%
+2025-09-01 09:21:27,168 - __main__ - INFO - Episode 5: Reward=-3069.19, Steps=29, Return=-3.0390%
+
+BACKTEST RESULTS
+==================================================
+Episodes: 5
+Average Reward: -106.3061
+Win Rate: 0.0%
+Average Return: -3.16%
+Total Steps: 150
+
+Episode Details:
+Episode  1: Reward=-3066.45, Steps=    10, Return= -3.05%, Final Equity=$    96949
+Episode  2: Reward=-3079.88, Steps=    72, Return= -3.01%, Final Equity=$    96994
+Episode  3: Reward=-3193.08, Steps=    20, Return= -3.17%, Final Equity=$    96830
+Episode  4: Reward=-3537.33, Steps=    19, Return= -3.51%, Final Equity=$    96490
+Episode  5: Reward=-3069.19, Steps=    29, Return= -3.04%, Final Equity=$    96961
+
+Backtest completed successfully!

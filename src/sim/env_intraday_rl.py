@@ -91,19 +91,28 @@ class IntradayRLEnv(Env):
         logger.debug("Initializing ExecutionSimulator with empty Settings()")
         self.exec_sim = ExecutionSimulator(Settings.from_paths('configs/settings.yaml'))
         if exec_params:
-            logger.debug(f"Mapping exec_params: {exec_params}")
-            # Map parameter names from test format to ExecParams format
-            exec_params_mapped = {
-                'commission_per_contract': exec_params.get('transaction_cost', 2.5),
-                'slippage_bps': exec_params.get('slippage', 0.01) * 100,  # Convert to bps
-                'tick_value': exec_params.get('tick_value', 1.25),
-                'spread_ticks': exec_params.get('spread_ticks', 1),
-                'impact_bps': exec_params.get('impact_bps', 0.5),
-                'min_commission': exec_params.get('min_commission', 1.0),
-                'liquidity_threshold': exec_params.get('liquidity_threshold', 1000)
-            }
-            logger.debug(f"Mapped exec_params: {exec_params_mapped}")
-            self.exec_sim.exec_params = ExecParams(**exec_params_mapped)
+            logger.debug(f"Processing exec_params: {exec_params}")
+            # Handle both dictionary and dataclass ExecParams objects
+            if isinstance(exec_params, ExecParams):
+                # If it's already an ExecParams dataclass, use it directly
+                logger.debug("Using ExecParams dataclass directly")
+                self.exec_sim.exec_params = exec_params
+            elif isinstance(exec_params, dict):
+                # Map parameter names from test format to ExecParams format
+                exec_params_mapped = {
+                    'commission_per_contract': exec_params.get('transaction_cost', 2.5),
+                    'slippage_bps': exec_params.get('slippage', 0.01) * 100,  # Convert to bps
+                    'tick_value': exec_params.get('tick_value', 1.25),
+                    'spread_ticks': exec_params.get('spread_ticks', 1),
+                    'impact_bps': exec_params.get('impact_bps', 0.5),
+                    'min_commission': exec_params.get('min_commission', 1.0),
+                    'liquidity_threshold': exec_params.get('liquidity_threshold', 1000)
+                }
+                logger.debug(f"Mapped exec_params: {exec_params_mapped}")
+                self.exec_sim.exec_params = ExecParams(**exec_params_mapped)
+            else:
+                logger.warning(f"Unsupported exec_params type: {type(exec_params)}, using defaults")
+                self.exec_sim.exec_params = ExecParams()
 
         # Create a proper Settings object from the config
         logger.debug("Creating Settings object for configuration")

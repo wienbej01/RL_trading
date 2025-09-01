@@ -4,7 +4,7 @@ Tests for simulation modules (environment, execution, risk management).
 import pytest
 import numpy as np
 import pandas as pd
-import gym
+import gymnasium as gym
 from datetime import datetime, timedelta
 from unittest.mock import patch, Mock, MagicMock
 
@@ -85,6 +85,8 @@ class TestIntradayRLEnvironment:
         # Check observation space shape
         expected_obs_dim = len(self.config['features']['technical']) + \
                           len(self.config['features']['microstructure']) + \
+                          len(self.config['features']['time']) + \
+                          2  # position + unrealized P&L
                           len(self.config['features']['time'])
         assert self.env.observation_space.shape[0] == expected_obs_dim
     
