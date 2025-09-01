@@ -219,6 +219,19 @@ class Settings:
         merged.update({k: v for k, v in kwargs.items() if v is not None})
         return cls(paths_override=merged, use_cache=False)
 
+    def get(self, *keys, default=None):
+        """
+        Get nested configuration value.
+        Usage: settings.get('section', 'key') or settings.get('section', 'subsection', 'key')
+        """
+        current = self._cfg
+        for key in keys:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return default
+        return current
+
     def to_dict(self) -> Dict[str, Any]:
         return dict(self._cfg)
 

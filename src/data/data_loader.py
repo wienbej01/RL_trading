@@ -27,8 +27,8 @@ def _normalize_range(start, end) -> Tuple[datetime, datetime]:
         e = e + timedelta(days=1)
     return s, e
 
-def _detect_ts_col(df: pd.DataFrame) -> str | None:
-    for c in ("timestamp", "datetime", "time", "dt"):
+def _detect_ts_col(df):
+    for c in ("timestamp", "datetime", "time", "dt", "ts"):
         if c in df.columns:
             return c
     return None
@@ -114,7 +114,9 @@ class UnifiedDataLoader:
         # Save cache
         if self.cache_enabled:
             try:
-                df.to_parquet(cache_path, index=False)
+                # Reset index to save timestamp as column
+                df_to_save = df.reset_index()
+                df_to_save.to_parquet(cache_path, index=False)
                 self.logger.info("Wrote cache: %s", cache_path)
             except Exception as ex:
                 self.logger.warning("Could not write cache %s: %s", cache_path, ex)
@@ -122,10 +124,38 @@ class UnifiedDataLoader:
         return df
 
     def _postprocess_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+
         ts_col = _detect_ts_col(df)
-        if ts_col:
-            df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-            df = df.set_index(ts_col).sort_index()
+        if ts_col is None:
+            # If the parquet stores epoch in 't' or similar, map it here if needed
+            raise ValueError("No timestamp/datetime column found in DataFrame")
+
+        # Ensure tz-aware UTC
+        ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+        df = df.loc[ts.notna()].copy()
+        df[ts_col] = ts
+
+        # Set index and convert to America/New_York (feature code often assumes local market time)
+        df = df.sort_values(ts_col)
+        df = df.set_index(ts_col)
+        try:
+            df.index = df.index.tz_convert("America/New_York")
+        except Exception:
+            # already localized to US/Eastern or tz-naive; best effort:
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+
+        # De-dup just in case
+        df = df[~df.index.duplicated(keep="first")]
+
+        # (Optional) tag source for downstream logs
+        try:
+            df.attrs["source"] = self.data_source
+        except Exception:
+            pass
+
         return df
     # -------------------- Polygon helpers --------------------
 
@@ -172,7 +202,11 @@ class UnifiedDataLoader:
         if not dfs:
             return pd.DataFrame()
 
-        df = pd.concat(dfs, ignore_index=True)
+        df = pd.concat(dfs)
+
+        # Reset index if it's DatetimeIndex with timestamp name
+        if isinstance(df.index, pd.DatetimeIndex) and df.index.name in ("timestamp", "datetime", "time", "dt", "ts"):
+            df.reset_index(inplace=True)
 
         # Normalize common columns if present
         ts_col = None
