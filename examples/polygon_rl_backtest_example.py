@@ -109,7 +109,7 @@ def create_feature_pipeline():
     return FeaturePipeline(config)
 
 
-def run_backtest_simulation(env: IntradayRLEnv, num_episodes: int = 5) -> dict:
+def run_backtest_simulation(env: IntradayRLEnv, model, num_episodes: int = 5) -> dict:
     """
     Run backtest simulation with random actions.
 
@@ -143,7 +143,7 @@ def run_backtest_simulation(env: IntradayRLEnv, num_episodes: int = 5) -> dict:
         done = False
         while not done:
             # Random action for demonstration
-            action = np.random.randint(0, 3)
+            action, _ = model.predict(obs, deterministic=True)
 
             obs, reward, done, truncated, info = env.step(action)
 
@@ -260,6 +260,7 @@ def main():
     parser.add_argument('--end-date', type=str, default='2024-03-31', help='End date (YYYY-MM-DD)')
     parser.add_argument('--episodes', type=int, default=5, help='Number of episodes to run')
     parser.add_argument('--plot', action='store_true', help='Generate result plots')
+    parser.add_argument('--model-path', type=str, help='Path to the trained model')
 
     args = parser.parse_args()
 
@@ -300,9 +301,16 @@ def main():
         print("Environment initialized successfully")
         print()
 
+        # Load model if path is provided
+        model = None
+        if args.model_path:
+            from stable_baselines3 import PPO
+            print(f"Loading model from {args.model_path}")
+            model = PPO.load(args.model_path)
+
         # Run backtest
         print("Running backtest simulation...")
-        results = run_backtest_simulation(env, args.episodes)
+        results = run_backtest_simulation(env, model, args.episodes)
         print()
 
         # Print results

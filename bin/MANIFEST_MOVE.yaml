@@ -1,0 +1,90 @@
+timestamp: 2025-09-01T12:27:00Z
+moved_items:
+  - source: /home/jacobw/RL_trading/rl-intraday/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 144
+    last_modified: Sep  1 10:41
+  - source: /home/jacobw/RL_trading/rl-intraday/__pycache__/minimal_test.cpython-313-pytest-8.4.1.pyc
+    reason: Python clutter
+    size: 9029
+    last_modified: Aug 17 20:39
+  - source: /home/jacobw/RL_trading/rl-intraday/__pycache__/test_end_to_end_system.cpython-313-pytest-8.4.1.pyc
+    reason: Python clutter
+    size: 32157
+    last_modified: Aug 18 15:35
+  - source: /home/jacobw/RL_trading/rl-intraday/scripts/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 152
+    last_modified: Aug 31 16:08
+  - source: /home/jacobw/RL_trading/rl-intraday/scripts/__pycache__/collect_polygon_data.cpython-313.pyc
+    reason: Python clutter
+    size: 20903
+    last_modified: Aug 31 16:08
+  - source: /home/jacobw/RL_trading/rl-intraday/scripts/__pycache__/validate_collected_data.cpython-313.pyc
+    reason: Python clutter
+    size: 11507
+    last_modified: Aug 31 16:34
+  - source: /home/jacobw/RL_trading/rl-intraday/src/data/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 324
+    last_modified: Aug 17 16:46
+  - source: /home/jacobw/RL_trading/rl-intraday/src/features/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 370
+    last_modified: Aug 17 16:46
+  - source: /home/jacobw/RL_trading/rl-intraday/src/rl/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 327
+    last_modified: Aug 17 17:01
+  - source: /home/jacobw/RL_trading/rl-intraday/src/sim/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 319
+    last_modified: Aug 17 16:47
+  - source: /home/jacobw/RL_trading/rl-intraday/src/trading/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 347
+    last_modified: Aug 17 16:46
+  - source: /home/jacobw/RL_trading/rl-intraday/src/utils/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 214
+    last_modified: Aug 17 16:44
+  - source: /home/jacobw/RL_trading/rl-intraday/tests/__pycache__/__init__.cpython-313.pyc
+    reason: Python clutter
+    size: 359
+    last_modified: Aug 17 16:44
+  - source: /home/jacobw/RL_trading/rl-intraday/tests/__pycache__/test_config_loader.cpython-313-pytest-8.4.1.pyc
+    reason: Python clutter
+    size: 21368
+    last_modified: Aug 17 16:44
+  - source: /home/jacobw/RL_trading/rl-intraday/tests/__pycache__/test_config_loader.cpython-313.pyc
+    reason: Python clutter
+    size: 9712
+    last_modified: Aug 17 17:11
+  - source: /home/jacobw/RL_trading/rl-intraday/.pytest_cache/.gitignore
+    reason: Python clutter
+    size: 37
+    last_modified: Sep  1 10:28
+  - source: /home/jacobw/RL_trading/rl-intraday/.pytest_cache/CACHEDIR.TAG
+    reason: Python clutter
+    size: 191
+    last_modified: Sep  1 10:28
+  - source: /home/jacobw/RL_trading/rl-intraday/.pytest_cache/README.md
+    reason: Python clutter
+    size: 302
+    last_modified: Sep  1 10:28
+  - source: /home/jacobw/RL_trading/rl-intraday/.pytest_cache/v
+    reason: Python clutter
+    size: TBD # Directory size
+    last_modified: TBD # Directory last modified
+  - source: /home/jacobw/RL_trading/rl-intraday/bin/.pytest_cache/.gitignore
+    reason: Python clutter
+    size: 37
+    last_modified: Aug 17 16:44
+  - source: /home/jacobw/RL_trading/rl-intraday/bin/.pytest_cache/CACHEDIR.TAG
+    reason: Python clutter
+    size: 191
+    last_modified: Aug 17 16:44
+  - source: /home/jacobw/RL_trading/rl-intraday/bin/.pytest_cache/README.md
+    reason: Python clutter
+    size: 302
+    last_modified: Aug 17 16:44

@@ -20,8 +20,8 @@ def aggregate_spy_data(start_date: str = "2024-01-01", end_date: str = "2025-06-
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
     """
-    base_path = Path("data/polygon/historical/symbol=SPY")
-    output_file = Path("data/raw/spy_1min.parquet")
+    base_path = Path("rl-intraday/data/polygon/historical/symbol=SPY")
+    output_file = Path("rl-intraday/data/raw/spy_1min.parquet")
 
     # Ensure output directory exists
     output_file.parent.mkdir(parents=True, exist_ok=True)

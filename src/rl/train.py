@@ -15,20 +15,20 @@ import logging
 from datetime import datetime, timedelta
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.policies import ActorCriticPolicy
+# from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 
 # Alias for compatibility
-MlpLstmPolicy = ActorCriticPolicy
+# MlpLstmPolicy = ActorCriticPolicy
 
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
 from ..features.pipeline import FeaturePipeline
 from ..sim.env_intraday_rl import IntradayRLEnv, EnvConfig, RiskConfig
 from ..sim.execution import ExecParams
-from .ppo_lstm_policy import PPOLSTMPolicy, PolicyConfig
+from .ppo_lstm_policy import PPOLSTMPolicy
 
 logger = get_logger(__name__)
 
@@ -92,7 +92,37 @@ class RLTrainer:
         """Save trained model."""
         if self.model is None:
             raise ValueError("Model not trained yet")
-        self.model.save(path)
+        self.    # Save directory and zip for compatibility with backtest.
+    # Save directory and zip for compatibility with backtest.
+    # Save directory and zip for compatibility with backtest.
+    # Save directory and zip for compatibility with backtest.
+    # Save directory and zip for compatibility with backtest.
+    # Save directory and zip for compatibility with backtest.
+    model.save(args.output)
+    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
+    model.save(zip_path)
+    print(f"[TRAIN] Saved model dir: {args.output}")
+    print(f"[TRAIN] Saved model zip: {zip_path}")
+    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
+    model.save(zip_path)
+    print(f"[TRAIN] Saved model dir: {args.output}")
+    print(f"[TRAIN] Saved model zip: {zip_path}")
+    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
+    model.save(zip_path)
+    print(f"[TRAIN] Saved model dir: {args.output}")
+    print(f"[TRAIN] Saved model zip: {zip_path}")
+    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
+    model.save(zip_path)
+    print(f"[TRAIN] Saved model dir: {args.output}")
+    print(f"[TRAIN] Saved model zip: {zip_path}")
+    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
+    model.save(zip_path)
+    print(f"[TRAIN] Saved model dir: {args.output}")
+    print(f"[TRAIN] Saved model zip: {zip_path}")
+    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
+    model.save(zip_path)
+    print(f"[TRAIN] Saved model dir: {args.output}")
+    print(f"[TRAIN] Saved model zip: {zip_path}")
     
     def load_model(self, path: str):
         """Load trained model."""
@@ -138,8 +168,8 @@ class TrainingCallback(BaseCallback):
         """Called after each step."""
         # Log training progress
         if self.locals.get('dones', [False])[0]:
-            episode_reward = self.locals['episode_rewards'][0]
-            episode_length = self.locals['episode_lengths'][0]
+            episode_reward = self.locals.get('episode_rewards', [0])[0]
+            episode_length = self.locals.get('episode_lengths', [0])[0]
             
             self.episode_rewards.append(episode_reward)
             self.episode_lengths.append(episode_length)
@@ -262,14 +292,13 @@ def train_ppo_lstm(settings: Settings,
         activation_fn=torch.nn.ReLU,
         optimizer_class=torch.optim.Adam,
         optimizer_kwargs=dict(
-            lr=training_config.learning_rate,
             eps=1e-5
         )
     )
     
     # Create PPO model
     model = PPO(
-        ActorCriticPolicy,
+        PPOLSTMPolicy,
         vec_env,
         learning_rate=training_config.learning_rate,
         n_steps=training_config.n_steps,
@@ -281,7 +310,6 @@ def train_ppo_lstm(settings: Settings,
         ent_coef=training_config.ent_coef,
         max_grad_norm=training_config.max_grad_norm,
         n_epochs=training_config.n_epochs,
-        n_minibatches=training_config.n_minibatches,
         target_kl=training_config.target_kl,
         tensorboard_log=training_config.tensorboard_log,
         policy_kwargs=policy_kwargs,

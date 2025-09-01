@@ -1,15 +1,17 @@
 {
   "total_symbols": 1,
-  "successful_symbols": 1,
-  "total_ohlcv_records": 90000,
+  "successful_symbols": 0,
+  "total_ohlcv_records": 0,
   "total_quotes_records": 0,
-  "total_errors": 0,
+  "total_errors": 1,
   "symbol_results": [
     {
       "symbol": "SPY",
-      "ohlcv_records": 90000,
+      "ohlcv_records": 0,
       "quotes_records": 0,
-      "errors": []
+      "errors": [
+        "403, message='Forbidden', url='https://api.polygon.io/v2/aggs/ticker/SPY/range/1/minute/2023-01-01/2023-01-31?apiKey=ZBxeJYOn0_e0UcPgEYLA90CQ9S28_EfU'"
+      ]
     }
   ]
 }
