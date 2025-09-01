@@ -36,6 +36,104 @@ rl-intraday/
 ├── notebooks/         # Research and analysis notebooks
 └── models/           # Trained model storage
 ```
+## 🕒 DatetimeIndex Fix and Data Pipeline Enhancements
+
+### Issue Summary
+The system encountered critical issues with timestamp handling and DatetimeIndex management that affected data consistency across the entire trading pipeline:
+
+1. **Inconsistent Timestamp Detection**: Different data sources used varying column names for timestamps ("timestamp", "datetime", "time", "dt", "ts")
+2. **Timezone Handling Problems**: Mixed timezone-aware and timezone-naive data caused errors in feature engineering and time-based calculations
+3. **DatetimeIndex Setup Issues**: Improper index configuration led to sorting problems and duplicate handling failures
+4. **Data Pipeline Inconsistencies**: Downstream components (features, RL environment, risk management) received inconsistent timestamp formats
+
+### Fix Implementation
+
+#### 1. Timestamp Column Detection Helper
+**File**: `src/data/data_loader.py`
+```python
+def _detect_ts_col(df):
+    for c in ("timestamp", "datetime", "time", "dt", "ts"):
+        if c in df.columns:
+            return c
+    return None
+```
+- Automatically detects timestamp columns by checking common naming patterns
+- Ensures consistent column identification across different data sources
+
+#### 2. DataFrame Postprocessing Method
+**File**: `src/data/data_loader.py`
+```python
+def _postprocess_df(self, df: pd.DataFrame) -> pd.DataFrame:
+    # Detect timestamp column
+    ts_col = _detect_ts_col(df)
+    
+    # Convert to UTC-aware datetime
+    ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+    df = df.loc[ts.notna()].copy()
+    df[ts_col] = ts
+    
+    # Set DatetimeIndex with proper timezone conversion
+    df = df.sort_values(ts_col)
+    df = df.set_index(ts_col)
+    try:
+        df.index = df.index.tz_convert("America/New_York")
+    except Exception:
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+    
+    # Remove duplicates
+    df = df[~df.index.duplicated(keep="first")]
+    
+    return df
+```
+
+#### 3. Timezone Handling Strategy
+- **Input Processing**: All timestamps converted to UTC-aware format first
+- **Market Time Conversion**: Converted to America/New_York timezone for consistency with market hours
+- **Error Handling**: Graceful handling of timezone-naive data with fallback localization
+- **Validation**: Ensures all data entering the pipeline has consistent timezone information
+
+### Impact on Data Pipeline
+
+#### Feature Engineering
+- **Time Features**: Consistent DatetimeIndex enables reliable time-of-day, day-of-week, and session features
+- **Microstructure Features**: Proper timestamp ordering ensures accurate spread and imbalance calculations
+- **Technical Indicators**: Sorted data prevents calculation errors in moving averages and other indicators
+
+#### RL Environment
+- **Temporal Consistency**: Proper DatetimeIndex ensures correct episode timing and market session handling
+- **Feature Alignment**: Consistent timestamps align OHLCV data with engineered features
+- **Walk-Forward Validation**: Reliable temporal splits for robust backtesting
+
+#### Risk Management
+- **Time-Based Calculations**: Accurate timestamp handling for position sizing and risk limits
+- **Market Hours Validation**: Proper timezone conversion ensures correct trading hours identification
+- **Performance Attribution**: Consistent time indexing enables accurate P&L attribution
+
+### Technical Benefits
+- **Data Integrity**: Eliminates timestamp-related data corruption
+- **Performance**: Efficient duplicate removal and sorting operations
+- **Scalability**: Consistent data format across different data sources
+- **Maintainability**: Centralized timestamp handling logic
+- **Robustness**: Comprehensive error handling for edge cases
+
+### Usage Examples
+```python
+from src.data.data_loader import UnifiedDataLoader
+
+# Load data with automatic DatetimeIndex setup
+loader = UnifiedDataLoader(data_source="polygon")
+data = loader.load("SPY", "2024-01-01", "2024-01-31")
+
+# Data now has:
+# - Proper DatetimeIndex in America/New_York timezone
+# - No duplicate timestamps
+# - Consistent column naming
+# - Ready for feature engineering pipeline
+```
+
+This fix ensures that all data flowing through the RL trading system maintains temporal consistency and proper timezone handling, which is critical for reliable trading signals and risk management.
+
 
 ## 🚀 Quick Start
 

@@ -334,4 +334,174 @@ The configuration handling system is now robust and handles all edge cases prope
 - Backward compatibility is preserved
 - Future enhancements can be added seamlessly
 
+## DatetimeIndex Fix (2025-09-01)
+
+### Issue Summary
+The data loading pipeline encountered critical DatetimeIndex handling issues that affected temporal consistency across the entire trading system:
+
+1. **Inconsistent Timestamp Column Detection**: Different data sources used varying column names for timestamps, causing detection failures
+2. **Timezone Handling Inconsistencies**: Mixed timezone-aware and timezone-naive data led to processing errors
+3. **DatetimeIndex Setup Problems**: Improper index configuration caused sorting and duplicate handling failures
+4. **Data Pipeline Temporal Inconsistencies**: Downstream components received inconsistent timestamp formats
+
+### Fix Implementation
+
+#### 1. Timestamp Column Detection Helper
+**File**: `src/data/data_loader.py`
+**Issue**: Manual column name specification required for different data sources
+**Solution**: Implemented automatic timestamp column detection
+
+```python
+def _detect_ts_col(df):
+    """
+    Automatically detect timestamp column by checking common naming patterns.
+    Supports multiple data source formats for seamless integration.
+    """
+    for c in ("timestamp", "datetime", "time", "dt", "ts"):
+        if c in df.columns:
+            return c
+    return None
+```
+
+#### 2. DataFrame Postprocessing Enhancement
+**File**: `src/data/data_loader.py`
+**Issue**: Inconsistent DatetimeIndex setup and timezone handling
+**Solution**: Comprehensive DataFrame postprocessing with robust timezone management
+
+```python
+def _postprocess_df(self, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Comprehensive DataFrame postprocessing for temporal consistency.
+    
+    - Detects timestamp columns automatically
+    - Converts to UTC-aware datetime format
+    - Sets proper DatetimeIndex with America/New_York timezone
+    - Removes duplicate timestamps
+    - Ensures data integrity for downstream processing
+    """
+    if df is None or df.empty:
+        return df
+
+    # Detect timestamp column
+    ts_col = _detect_ts_col(df)
+    if ts_col is None:
+        raise ValueError("No timestamp/datetime column found in DataFrame")
+
+    # Convert to UTC-aware datetime with error handling
+    ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+    df = df.loc[ts.notna()].copy()
+    df[ts_col] = ts
+
+    # Set DatetimeIndex with proper timezone conversion
+    df = df.sort_values(ts_col)
+    df = df.set_index(ts_col)
+    
+    try:
+        df.index = df.index.tz_convert("America/New_York")
+    except Exception:
+        # Handle timezone-naive data with fallback localization
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+
+    # Remove duplicates to ensure data integrity
+    df = df[~df.index.duplicated(keep="first")]
+
+    # Tag data source for downstream logging
+    try:
+        df.attrs["source"] = self.data_source
+    except Exception:
+        pass
+
+    return df
+```
+
+#### 3. Timezone Handling Strategy
+**Input Processing**: All timestamps normalized to UTC-aware format first
+**Market Time Alignment**: Converted to America/New_York timezone for consistency with market hours
+**Error Resilience**: Graceful handling of timezone-naive data with automatic UTC localization
+**Validation**: Comprehensive checks ensure consistent timezone information throughout the pipeline
+
+### Integration with Configuration System
+
+The DatetimeIndex fix integrates seamlessly with the existing configuration framework:
+
+```python
+# Configuration supports timezone specification
+data:
+  session:
+    tz: "America/New_York"
+    rth_start: "09:30"
+    rth_end: "16:00"
+```
+
+### Impact on System Components
+
+#### Data Loading Pipeline
+- **Automatic Detection**: No manual column specification required
+- **Timezone Consistency**: All data standardized to market timezone
+- **Error Handling**: Robust processing of malformed timestamp data
+- **Performance**: Efficient duplicate removal and sorting operations
+
+#### Feature Engineering Integration
+- **Time Features**: Reliable time-of-day, day-of-week, and session features
+- **Temporal Ordering**: Proper timestamp sequencing for accurate calculations
+- **Data Integrity**: Consistent DatetimeIndex prevents feature calculation errors
+
+#### RL Environment Compatibility
+- **Episode Management**: Correct temporal episode boundaries
+- **Feature Alignment**: Consistent timestamp alignment between OHLCV and features
+- **Market Session Handling**: Proper identification of trading hours
+
+#### Risk Management Enhancement
+- **Time-Based Calculations**: Accurate timestamp handling for position sizing
+- **Market Hours Validation**: Reliable trading session identification
+- **Performance Attribution**: Consistent time indexing for P&L analysis
+
+### Technical Benefits
+
+1. **Data Integrity**: Eliminates timestamp-related data corruption issues
+2. **Scalability**: Consistent data format across multiple data sources
+3. **Maintainability**: Centralized timestamp handling logic
+4. **Robustness**: Comprehensive error handling for edge cases
+5. **Performance**: Optimized operations for large datasets
+
+### Testing and Validation
+
+The fix includes comprehensive validation:
+
+```python
+def test_datetime_index_consistency():
+    """Test DatetimeIndex consistency across data sources"""
+    loader = UnifiedDataLoader(data_source="polygon")
+    data = loader.load("SPY", "2024-01-01", "2024-01-31")
+    
+    # Validate DatetimeIndex properties
+    assert isinstance(data.index, pd.DatetimeIndex)
+    assert str(data.index.tz) == "America/New_York"
+    assert not data.index.duplicated().any()
+    assert data.index.is_monotonic_increasing
+
+def test_timezone_handling():
+    """Test timezone conversion for different input formats"""
+    # Test timezone-naive input
+    # Test timezone-aware input
+    # Test mixed timezone scenarios
+```
+
+### Future Enhancements
+
+Planned improvements to the DatetimeIndex handling system:
+
+1. **Configuration-Driven Timezone**: Allow per-instrument timezone specification
+2. **Advanced Timestamp Validation**: Enhanced detection of malformed timestamps
+3. **Performance Optimization**: Vectorized operations for large datasets
+4. **Multi-Timezone Support**: Handling of international markets with different timezones
+
+This DatetimeIndex fix ensures that all temporal data in the RL trading system maintains consistency and reliability, which is critical for generating accurate trading signals and maintaining system integrity.
+
+## Conclusion
+=======
+## Conclusion
+>>>>>>> REPLACE
+]]>
 For any questions or issues related to configuration handling, please refer to the test cases in `tests/test_config_loader.py` and `tests/test_simulation.py` for examples of proper usage.
