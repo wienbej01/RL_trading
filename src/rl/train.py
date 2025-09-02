@@ -92,37 +92,7 @@ class RLTrainer:
         """Save trained model."""
         if self.model is None:
             raise ValueError("Model not trained yet")
-        self.    # Save directory and zip for compatibility with backtest.
-    # Save directory and zip for compatibility with backtest.
-    # Save directory and zip for compatibility with backtest.
-    # Save directory and zip for compatibility with backtest.
-    # Save directory and zip for compatibility with backtest.
-    # Save directory and zip for compatibility with backtest.
-    model.save(args.output)
-    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
-    model.save(zip_path)
-    print(f"[TRAIN] Saved model dir: {args.output}")
-    print(f"[TRAIN] Saved model zip: {zip_path}")
-    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
-    model.save(zip_path)
-    print(f"[TRAIN] Saved model dir: {args.output}")
-    print(f"[TRAIN] Saved model zip: {zip_path}")
-    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
-    model.save(zip_path)
-    print(f"[TRAIN] Saved model dir: {args.output}")
-    print(f"[TRAIN] Saved model zip: {zip_path}")
-    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
-    model.save(zip_path)
-    print(f"[TRAIN] Saved model dir: {args.output}")
-    print(f"[TRAIN] Saved model zip: {zip_path}")
-    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
-    model.save(zip_path)
-    print(f"[TRAIN] Saved model dir: {args.output}")
-    print(f"[TRAIN] Saved model zip: {zip_path}")
-    zip_path = args.output if str(args.output).endswith(".zip") else f"{args.output}.zip"
-    model.save(zip_path)
-    print(f"[TRAIN] Saved model dir: {args.output}")
-    print(f"[TRAIN] Saved model zip: {zip_path}")
+        self.model.save(path)
     
     def load_model(self, path: str):
         """Load trained model."""
@@ -131,9 +101,9 @@ class RLTrainer:
 
 class TrainingConfig:
     """Training configuration."""
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     n_steps: int = 2048
-    batch_size: int = 8192
+    batch_size: int = 64
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
@@ -211,7 +181,7 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
     """
     # Load data
     df = pd.read_parquet(data_path)
-    df = df.tz_localize(None)
+
     
     # Limit to RTH
     rth_start = settings.get("data", "session", "rth_start", default="09:30")
@@ -244,7 +214,8 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
             cash=100_000.0,
             max_steps=390,
             reward_type="dsr"
-        )
+        ),
+        config=settings.to_dict()
     )
     
     return env
@@ -337,7 +308,7 @@ def train_ppo_lstm(settings: Settings,
     return model
 
 
-def evaluate_model(model: PPO, env: IntradayRLEnv, num_episodes: int = 5) -> Dict[str, float]:
+def evaluate_model(model: PPO, env: DummyVecEnv, num_episodes: int = 5) -> Dict[str, float]:
     """
     Evaluate trained model.
     
@@ -369,7 +340,9 @@ def evaluate_model(model: PPO, env: IntradayRLEnv, num_episodes: int = 5) -> Dic
         
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
-        equity_curves.append(env.get_equity_curve())
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
+        equity_curves.append(env.envs[0].get_equity_curve())
     
     # Calculate metrics
     metrics = {
@@ -378,7 +351,15 @@ def evaluate_model(model: PPO, env: IntradayRLEnv, num_episodes: int = 5) -> Dic
         'mean_length': np.mean(episode_lengths),
         'std_length': np.std(episode_lengths),
         'max_reward': np.max(episode_rewards),
-        'min_reward': np.min(episode_rewards)
+        'min_reward': np.min(episode_rewards),
+        'total_return': 0.0,
+        'annual_return': 0.0,
+        'annual_volatility': 0.0,
+        'sharpe_ratio': 0.0,
+        'max_drawdown': 0.0,
+        'calmar_ratio': 0.0,
+        'win_rate': 0.0,
+        'profit_factor': 0.0
     }
     
     # Calculate performance metrics
@@ -386,16 +367,17 @@ def evaluate_model(model: PPO, env: IntradayRLEnv, num_episodes: int = 5) -> Dic
         combined_equity = pd.concat(equity_curves, axis=1).mean(axis=1)
         returns = combined_equity.pct_change().dropna()
         
-        metrics.update({
-            'total_return': (combined_equity.iloc[-1] - combined_equity.iloc[0]) / combined_equity.iloc[0],
-            'annual_return': (1 + returns.mean()) ** 252 - 1,
-            'annual_volatility': returns.std() * np.sqrt(252),
-            'sharpe_ratio': returns.mean() / returns.std() * np.sqrt(252),
-            'max_drawdown': (combined_equity / combined_equity.cummax() - 1).min(),
-            'calmar_ratio': returns.mean() / abs((combined_equity / combined_equity.cummax() - 1).min()) * 252,
-            'win_rate': len(returns[returns > 0]) / len(returns),
-            'profit_factor': returns[returns > 0].sum() / abs(returns[returns < 0].sum()) if len(returns[returns < 0]) > 0 else np.inf
-        })
+        if len(returns) > 0:
+            metrics.update({
+                'total_return': (combined_equity.iloc[-1] - combined_equity.iloc[0]) / combined_equity.iloc[0],
+                'annual_return': (1 + returns.mean()) ** 252 - 1,
+                'annual_volatility': returns.std() * np.sqrt(252),
+                'sharpe_ratio': returns.mean() / returns.std() * np.sqrt(252),
+                'max_drawdown': (combined_equity / combined_equity.cummax() - 1).min(),
+                'calmar_ratio': returns.mean() / abs((combined_equity / combined_equity.cummax() - 1).min()) * 252,
+                'win_rate': len(returns[returns > 0]) / len(returns),
+                'profit_factor': returns[returns > 0].sum() / abs(returns[returns < 0].sum()) if len(returns[returns < 0]) > 0 else np.inf
+            })
     
     logger.info("Evaluation metrics:")
     for key, value in metrics.items():
@@ -426,7 +408,6 @@ def walk_forward_training(settings: Settings,
     
     # Load data
     df = pd.read_parquet(data_path)
-    df = df.tz_localize(None)
     
     # Get date index
     date_index = pd.to_datetime(df.index.date).unique()
@@ -445,13 +426,13 @@ def walk_forward_training(settings: Settings,
     
     # Generate walk-forward windows
     for i in range(0, len(date_index) - train_days - test_days + 1, test_days):
-        train_start = pd.Timestamp(date_index[i])
-        train_end = pd.Timestamp(date_index[i + train_days - 1]) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        train_start = pd.Timestamp(date_index[i], tz='America/New_York')
+        train_end = pd.Timestamp(date_index[i + train_days - 1], tz='America/New_York') + pd.Timedelta(hours=23, minutes=59, seconds=59)
         
         # Apply embargo
         test_start_day = date_index[i + train_days]
-        test_start = pd.Timestamp(test_start_day) + pd.Timedelta(minutes=embargo_minutes)
-        test_end = pd.Timestamp(date_index[i + train_days + test_days - 1]) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        test_start = pd.Timestamp(test_start_day, tz='America/New_York') + pd.Timedelta(minutes=embargo_minutes)
+        test_end = pd.Timestamp(date_index[i + train_days + test_days - 1], tz='America/New_York') + pd.Timedelta(hours=23, minutes=59, seconds=59)
         
         logger.info(f"Walk-forward fold {i//test_days + 1}:")
         logger.info(f"  Train: {train_start.date()} to {train_end.date()}")
@@ -465,7 +446,10 @@ def walk_forward_training(settings: Settings,
         test_df = df[test_mask]
         
         # Split features
-        train_features = pd.read_parquet(features_path).loc[train_df.index]
+        print("Training data index:", train_df.index)
+        features_df = pd.read_parquet(features_path)
+        print("Features data index:", features_df.index)
+        train_features = features_df.loc[train_df.index]
         test_features = pd.read_parquet(features_path).loc[test_df.index]
         
         # Save fold data
@@ -492,7 +476,123 @@ def walk_forward_training(settings: Settings,
         
         # Evaluate on test set
         test_env = build_env(settings, str(fold_dir / "test_data.parquet"), str(fold_dir / "test_features.parquet"))
-        test_metrics = evaluate_model(model, test_env, num_episodes=3)
+        vec_test_env = DummyVecEnv([lambda: test_env])
+        test_metrics = evaluate_model(model, vec_test_env, num_episodes=3)
+        
+        # Save results
+        fold_results = {
+            'fold': i//test_days + 1,
+            'train_start': train_start,
+            'train_end': train_end,
+            'test_start': test_start,
+            'test_end': test_end,
+            'test_metrics': test_metrics,
+            'model_path': str(model_path)
+        }
+        
+        wf_results.append(fold_results)
+        
+        # Save equity curve
+        equity_curve = test_env.get_equity_curve()
+        equity_curve.to_csv(fold_dir / "equity_curve.csv")
+        
+        # Save trades
+        trades = env.envs[0].get_trades()
+
+
+def walk_forward_training(settings: Settings,
+                         data_path: str,
+                         features_path: str,
+                         output_dir: str,
+                         training_config: TrainingConfig) -> Dict[str, Any]:
+    """
+    Perform walk-forward training with validation.
+    
+    Args:
+        settings: Configuration settings
+        data_path: Path to training data
+        features_path: Path to features
+        output_dir: Output directory for results
+        training_config: Training configuration
+        
+    Returns:
+        Walk-forward results
+    """
+    logger.info("Starting walk-forward training...")
+    
+    # Load data
+    df = pd.read_parquet(data_path)
+
+    
+    # Get date index
+    date_index = pd.to_datetime(df.index.date).unique()
+    
+    # Walk-forward parameters
+    train_days = settings.get("walkforward", "train_days", default=30)
+    test_days = settings.get("walkforward", "test_days", default=10)
+    embargo_minutes = settings.get("walkforward", "embargo_minutes", default=60)
+    
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Walk-forward results
+    wf_results = []
+    
+    # Generate walk-forward windows
+    for i in range(0, len(date_index) - train_days - test_days + 1, test_days):
+        train_start = pd.Timestamp(date_index[i], tz='America/New_York')
+        train_end = pd.Timestamp(date_index[i + train_days - 1], tz='America/New_York') + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        
+        # Apply embargo
+        test_start_day = date_index[i + train_days]
+        test_start = pd.Timestamp(test_start_day, tz='America/New_York') + pd.Timedelta(minutes=embargo_minutes)
+        test_end = pd.Timestamp(date_index[i + train_days + test_days - 1], tz='America/New_York') + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        
+        logger.info(f"Walk-forward fold {i//test_days + 1}:")
+        logger.info(f"  Train: {train_start.date()} to {train_end.date()}")
+        logger.info(f"  Test: {test_start.date()} to {test_end.date()}")
+        
+        # Split data
+        train_mask = (df.index >= train_start) & (df.index <= train_end)
+        test_mask = (df.index >= test_start) & (df.index <= test_end)
+        
+        train_df = df[train_mask]
+        test_df = df[test_mask]
+        
+        # Split features
+        print("Training data index:", train_df.index)
+        features_df = pd.read_parquet(features_path)
+        print("Features data index:", features_df.index)
+        train_features = features_df.loc[train_df.index]
+        test_features = pd.read_parquet(features_path).loc[test_df.index]
+        
+        # Save fold data
+        fold_dir = output_path / f"fold_{i//test_days + 1:02d}"
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        
+        train_df.to_parquet(fold_dir / "train_data.parquet")
+        test_df.to_parquet(fold_dir / "test_data.parquet")
+        train_features.to_parquet(fold_dir / "train_features.parquet")
+        test_features.to_parquet(fold_dir / "test_features.parquet")
+        
+        # Train model
+        model_path = fold_dir / "model"
+        train_ppo_lstm(
+            settings=settings,
+            data_path=str(fold_dir / "train_data.parquet"),
+            features_path=str(fold_dir / "train_features.parquet"),
+            model_path=str(model_path),
+            training_config=training_config
+        )
+        
+        # Load trained model
+        model = PPO.load(str(model_path))
+        
+        # Evaluate on test set
+        test_env = build_env(settings, str(fold_dir / "test_data.parquet"), str(fold_dir / "test_features.parquet"))
+        vec_test_env = DummyVecEnv([lambda: test_env])
+        test_metrics = evaluate_model(model, vec_test_env, num_episodes=3)
         
         # Save results
         fold_results = {

@@ -28,10 +28,11 @@ def aggregate_spy_data(start_date: str = "2024-01-01", end_date: str = "2025-06-
 
     logger.info(f"Aggregating SPY data from {start_date} to {end_date}")
 
+    start_ts = pd.Timestamp(start_date, tz="America/New_York")
+    end_ts = pd.Timestamp(end_date, tz="America/New_York")
+
     # Find all data files
-    data_files = []
-    for year_dir in base_path.glob("year=*/month=*/day=*/data.parquet"):
-        data_files.append(year_dir)
+    data_files = sorted(base_path.glob("year=*/month=*/day=*/data.parquet"))
 
     logger.info(f"Found {len(data_files)} data files")
 
@@ -40,15 +41,18 @@ def aggregate_spy_data(start_date: str = "2024-01-01", end_date: str = "2025-06-
 
     # Load and concatenate data
     dfs = []
-    for file_path in sorted(data_files):
+    for file_path in data_files:
         try:
             df = pd.read_parquet(file_path)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("America/New_York", ambiguous='infer')
+            else:
+                df.index = df.index.tz_convert("America/New_York")
+
             # Filter by date range
-            df.index = pd.to_datetime(df.index)
-            mask = (df.index >= start_date) & (df.index <= end_date)
+            mask = (df.index >= start_ts) & (df.index <= end_ts)
             if mask.any():
                 dfs.append(df[mask])
-                logger.info(f"Loaded {mask.sum()} rows from {file_path}")
         except Exception as e:
             logger.warning(f"Failed to load {file_path}: {e}")
 
