@@ -59,7 +59,10 @@ def generate_spy_features(data_path: str, output_path: str, config_path: str = "
                 'd_period': 3
             },
             'calculate_williams_r': True,
-            'williams_window': 14
+            'williams_window': 14,
+            'vol_of_vol': {'enabled': True, 'window': 14, 'vol_window': 14},
+            'sma_slope': {'enabled': True, 'window': 20, 'slope_window': 5},
+            'obv': {'enabled': True}
         },
         'microstructure': {
             'calculate_spread': True,
@@ -69,16 +72,33 @@ def generate_spy_features(data_path: str, output_path: str, config_path: str = "
             'calculate_vwap': True,
             'calculate_twap': True,
             'twap_window': 5,
-            'calculate_price_impact': True
+            'calculate_price_impact': True,
+            'fvg': {'enabled': True}
         },
         'time': {
             'extract_time_of_day': True,
             'extract_day_of_week': True,
             'extract_session_features': True
         },
+        'vix': {'enabled': True, 'path': 'rl-intraday/data/external/vix.parquet'},
         'normalization': {
             'method': 'standardize',
             'fit_on_train': True
+        },
+        'feature_selection': {
+            'method': 'manual',
+            'selected_features': [
+                'returns',
+                'sma_50',
+                'rsi_14',
+                'bb_width',
+                'vol_of_vol',
+                'sma_slope',
+                'obv',
+                'fvg',
+                'vix_close_^vix',
+                'time_from_open'
+            ]
         },
         'polygon': {
             'features': {

@@ -840,3 +840,54 @@ def calculate_williams_r(high: pd.Series, low: pd.Series, close: pd.Series,
     low_min = low.rolling(window=window).min()
     wr = -100 * (high_max - close) / (high_max - low_min)
     return wr
+
+def calculate_obv(data: pd.DataFrame) -> pd.Series:
+    """
+    Calculate On-Balance Volume (OBV).
+
+    Args:
+        data: DataFrame with close and volume series
+
+    Returns:
+        OBV series
+    """
+    close = data['close']
+    volume = data['volume']
+    signed_volume = volume * np.sign(close.diff()).fillna(0)
+    return signed_volume.cumsum()
+
+
+def calculate_sma_slope(series: pd.Series, window: int = 20, slope_window: int = 5) -> pd.Series:
+    """
+    Calculate the slope of a Simple Moving Average (SMA).
+
+    Args:
+        series: Data series
+        window: Lookback window for SMA
+        slope_window: Lookback window for slope calculation
+
+    Returns:
+        SMA slope series
+    """
+    sma = series.rolling(window=window).mean()
+    slope = sma.diff(slope_window)
+    return slope
+
+def calculate_vol_of_vol(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 20, vol_window: int = 20) -> pd.Series:
+    """
+    Calculate Volatility of Volatility.
+
+    Args:
+        high: High price series
+        low: Low price series
+        close: Close price series
+        window: Lookback window for historical volatility
+        vol_window: Lookback window for volatility of volatility
+
+    Returns:
+        Volatility of volatility series
+    """
+    returns = close.pct_change()
+    historical_vol = returns.rolling(window=window).std() * np.sqrt(252)
+    vol_of_vol = historical_vol.rolling(window=vol_window).std()
+    return vol_of_vol

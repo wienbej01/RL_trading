@@ -17,12 +17,13 @@ import os
 from .technical_indicators import (
     calculate_sma, calculate_ema, calculate_rsi, calculate_macd,
     calculate_bollinger_bands, calculate_atr, calculate_stochastic_oscillator,
-    calculate_williams_r, calculate_returns, calculate_log_returns
+    calculate_williams_r, calculate_returns, calculate_log_returns,
+    calculate_vol_of_vol, calculate_sma_slope, calculate_obv
 )
 from .microstructure_features import (
     calculate_spread, calculate_microprice, calculate_queue_imbalance,
     calculate_order_flow_imbalance, calculate_vwap, calculate_twap,
-    calculate_price_impact
+    calculate_price_impact, calculate_fvg
 )
 from .time_features import (
     extract_time_of_day_features, extract_day_of_week_features,
@@ -512,6 +513,41 @@ class FeaturePipeline:
                 # Handle test case where session_features is used instead
                 session_features = extract_session_features(data.index)
                 features = pd.concat([features, session_features], axis=1)
+        
+        # Add VIX data
+        if 'vix' in self.config and self.config['vix'].get('enabled', False):
+            vix_path = self.config['vix'].get('path', 'rl-intraday/data/external/vix.parquet')
+            if os.path.exists(vix_path):
+                vix_data = pd.read_parquet(vix_path)
+                # Ensure VIX data is timezone-aware and aligned with features index
+                if not vix_data.index.tz:
+                    vix_data = vix_data.tz_localize('America/New_York')
+                vix_data_resampled = vix_data.reindex(features.index, method='ffill')
+                features = features.join(vix_data_resampled)
+
+        # Add Volatility of Volatility
+        if 'vol_of_vol' in self.config.get('technical', {}) and self.config['technical']['vol_of_vol'].get('enabled', False):
+            window = self.config['technical']['vol_of_vol'].get('window', 14)
+            vol_window = self.config['technical']['vol_of_vol'].get('vol_window', 14)
+            features['vol_of_vol'] = calculate_vol_of_vol(data['high'], data['low'], data['close'], window, vol_window)
+
+        # Add SMA Slope
+        if 'sma_slope' in self.config.get('technical', {}) and self.config['technical']['sma_slope'].get('enabled', False):
+            window = self.config['technical']['sma_slope'].get('window', 20)
+            slope_window = self.config['technical']['sma_slope'].get('slope_window', 5)
+            features['sma_slope'] = calculate_sma_slope(data['close'], window, slope_window)
+
+        # Add On-Balance Volume (OBV)
+        if 'obv' in self.config.get('technical', {}) and self.config['technical']['obv'].get('enabled', False):
+            # OBV requires 'close' and 'volume' columns
+            if 'close' in data.columns and 'volume' in data.columns:
+                features['obv'] = calculate_obv(data)
+            else:
+                self.logger.warning("OBV calculation skipped: 'close' or 'volume' column missing.")
+
+        # Add Fair Value Gaps (FVG)
+        if 'fvg' in self.config.get('microstructure', {}) and self.config['microstructure']['fvg'].get('enabled', False):
+            features['fvg'] = calculate_fvg(data['high'], data['low'])
         
         self.logger.info("Extracted %d features", len(features.columns))
 

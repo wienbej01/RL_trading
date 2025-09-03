@@ -28,7 +28,7 @@ from ..utils.logging import get_logger
 from ..features.pipeline import FeaturePipeline
 from ..sim.env_intraday_rl import IntradayRLEnv, EnvConfig, RiskConfig
 from ..sim.execution import ExecParams
-from .ppo_lstm_policy import PPOLSTMPolicy
+
 
 logger = get_logger(__name__)
 
@@ -101,9 +101,9 @@ class RLTrainer:
 
 class TrainingConfig:
     """Training configuration."""
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-5
     n_steps: int = 2048
-    batch_size: int = 64
+    batch_size: int = 2048
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
@@ -181,6 +181,9 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
     """
     # Load data
     df = pd.read_parquet(data_path)
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.set_index('timestamp')
 
     
     # Limit to RTH
@@ -213,7 +216,8 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
         env_config=EnvConfig(
             cash=100_000.0,
             max_steps=390,
-            reward_type="dsr"
+            reward_type="pnl",
+            reward_scaling=0.1
         ),
         config=settings.to_dict()
     )
@@ -255,7 +259,6 @@ def train_ppo_lstm(settings: Settings,
     
     # Policy configuration
     policy_kwargs = dict(
-        lstm_hidden_size=settings.get("train", "policy_kwargs", "lstm_hidden_size", default=128),
         net_arch=dict(
             pi=settings.get("train", "policy_kwargs", "net_arch_pi", default=[128, 64]),
             vf=settings.get("train", "policy_kwargs", "net_arch_vf", default=[128, 64])
@@ -269,7 +272,7 @@ def train_ppo_lstm(settings: Settings,
     
     # Create PPO model
     model = PPO(
-        PPOLSTMPolicy,
+        'MlpPolicy',
         vec_env,
         learning_rate=training_config.learning_rate,
         n_steps=training_config.n_steps,
@@ -493,166 +496,14 @@ def walk_forward_training(settings: Settings,
         wf_results.append(fold_results)
         
         # Save equity curve
-        equity_curve = test_env.get_equity_curve()
+        equity_curve = test_env.envs[0].get_equity_curve()
         equity_curve.to_csv(fold_dir / "equity_curve.csv")
         
         # Save trades
-        trades = env.envs[0].get_trades()
+        trades = test_env.envs[0].get_trades()
 
 
-def walk_forward_training(settings: Settings,
-                         data_path: str,
-                         features_path: str,
-                         output_dir: str,
-                         training_config: TrainingConfig) -> Dict[str, Any]:
-    """
-    Perform walk-forward training with validation.
-    
-    Args:
-        settings: Configuration settings
-        data_path: Path to training data
-        features_path: Path to features
-        output_dir: Output directory for results
-        training_config: Training configuration
-        
-    Returns:
-        Walk-forward results
-    """
-    logger.info("Starting walk-forward training...")
-    
-    # Load data
-    df = pd.read_parquet(data_path)
 
-    
-    # Get date index
-    date_index = pd.to_datetime(df.index.date).unique()
-    
-    # Walk-forward parameters
-    train_days = settings.get("walkforward", "train_days", default=30)
-    test_days = settings.get("walkforward", "test_days", default=10)
-    embargo_minutes = settings.get("walkforward", "embargo_minutes", default=60)
-    
-    # Create output directory
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Walk-forward results
-    wf_results = []
-    
-    # Generate walk-forward windows
-    for i in range(0, len(date_index) - train_days - test_days + 1, test_days):
-        train_start = pd.Timestamp(date_index[i], tz='America/New_York')
-        train_end = pd.Timestamp(date_index[i + train_days - 1], tz='America/New_York') + pd.Timedelta(hours=23, minutes=59, seconds=59)
-        
-        # Apply embargo
-        test_start_day = date_index[i + train_days]
-        test_start = pd.Timestamp(test_start_day, tz='America/New_York') + pd.Timedelta(minutes=embargo_minutes)
-        test_end = pd.Timestamp(date_index[i + train_days + test_days - 1], tz='America/New_York') + pd.Timedelta(hours=23, minutes=59, seconds=59)
-        
-        logger.info(f"Walk-forward fold {i//test_days + 1}:")
-        logger.info(f"  Train: {train_start.date()} to {train_end.date()}")
-        logger.info(f"  Test: {test_start.date()} to {test_end.date()}")
-        
-        # Split data
-        train_mask = (df.index >= train_start) & (df.index <= train_end)
-        test_mask = (df.index >= test_start) & (df.index <= test_end)
-        
-        train_df = df[train_mask]
-        test_df = df[test_mask]
-        
-        # Split features
-        print("Training data index:", train_df.index)
-        features_df = pd.read_parquet(features_path)
-        print("Features data index:", features_df.index)
-        train_features = features_df.loc[train_df.index]
-        test_features = pd.read_parquet(features_path).loc[test_df.index]
-        
-        # Save fold data
-        fold_dir = output_path / f"fold_{i//test_days + 1:02d}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        
-        train_df.to_parquet(fold_dir / "train_data.parquet")
-        test_df.to_parquet(fold_dir / "test_data.parquet")
-        train_features.to_parquet(fold_dir / "train_features.parquet")
-        test_features.to_parquet(fold_dir / "test_features.parquet")
-        
-        # Train model
-        model_path = fold_dir / "model"
-        train_ppo_lstm(
-            settings=settings,
-            data_path=str(fold_dir / "train_data.parquet"),
-            features_path=str(fold_dir / "train_features.parquet"),
-            model_path=str(model_path),
-            training_config=training_config
-        )
-        
-        # Load trained model
-        model = PPO.load(str(model_path))
-        
-        # Evaluate on test set
-        test_env = build_env(settings, str(fold_dir / "test_data.parquet"), str(fold_dir / "test_features.parquet"))
-        vec_test_env = DummyVecEnv([lambda: test_env])
-        test_metrics = evaluate_model(model, vec_test_env, num_episodes=3)
-        
-        # Save results
-        fold_results = {
-            'fold': i//test_days + 1,
-            'train_start': train_start,
-            'train_end': train_end,
-            'test_start': test_start,
-            'test_end': test_end,
-            'test_metrics': test_metrics,
-            'model_path': str(model_path)
-        }
-        
-        wf_results.append(fold_results)
-        
-        # Save equity curve
-        equity_curve = test_env.get_equity_curve()
-        equity_curve.to_csv(fold_dir / "equity_curve.csv")
-        
-        # Save trades
-        trades = test_env.get_trades()
-        if trades:
-            pd.DataFrame(trades).to_csv(fold_dir / "trades.csv", index=False)
-    
-    # Save summary
-    summary_df = pd.DataFrame([{
-        'fold': r['fold'],
-        'train_start': r['train_start'],
-        'train_end': r['train_end'],
-        'test_start': r['test_start'],
-        'test_end': r['test_end'],
-        **r['test_metrics']
-    } for r in wf_results])
-    
-    summary_df.to_csv(output_path / "walkforward_summary.csv", index=False)
-    
-    # Calculate overall performance
-    overall_metrics = {
-        'mean_reward': summary_df['mean_reward'].mean(),
-        'std_reward': summary_df['mean_reward'].std(),
-        'mean_total_return': summary_df['total_return'].mean(),
-        'std_total_return': summary_df['total_return'].std(),
-        'mean_sharpe_ratio': summary_df['sharpe_ratio'].mean(),
-        'std_sharpe_ratio': summary_df['sharpe_ratio'].std(),
-        'max_drawdown': summary_df['max_drawdown'].min(),
-        'win_rate': summary_df['win_rate'].mean()
-    }
-    
-    # Save overall metrics
-    pd.DataFrame([overall_metrics]).to_csv(output_path / "overall_metrics.csv", index=False)
-    
-    logger.info("Walk-forward training completed")
-    logger.info("Overall performance metrics:")
-    for key, value in overall_metrics.items():
-        logger.info(f"  {key}: {value:.4f}")
-    
-    return {
-        'fold_results': wf_results,
-        'summary': summary_df,
-        'overall_metrics': overall_metrics
-    }
 
 
 def main():
@@ -674,9 +525,9 @@ def main():
     
     # Training configuration
     training_config = TrainingConfig()
-    training_config.learning_rate = float(settings.get("train", "learning_rate", default=3e-4))
+    training_config.learning_rate = float(settings.get("train", "learning_rate", default=1e-5))
     training_config.n_steps = int(settings.get("train", "n_steps", default=2048))
-    training_config.batch_size = int(settings.get("train", "batch_size", default=8192))
+    training_config.batch_size = int(settings.get("train", "batch_size", default=2048))
     training_config.gamma = float(settings.get("train", "gamma", default=0.99))
     training_config.gae_lambda = float(settings.get("train", "gae_lambda", default=0.95))
     training_config.clip_range = float(settings.get("train", "clip_range", default=0.2))
@@ -712,7 +563,8 @@ def main():
         # Evaluate model if requested
         if args.eval:
             env = build_env(settings, args.data, args.features)
-            metrics = evaluate_model(model, env, num_episodes=args.eval_episodes)
+            vec_env = DummyVecEnv([lambda: env])
+            metrics = evaluate_model(model, vec_env, num_episodes=args.eval_episodes)
             
             logger.info("Evaluation completed successfully!")
 

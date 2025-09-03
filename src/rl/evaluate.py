@@ -95,13 +95,13 @@ class ModelEvaluator:
                 episode_length += 1
                 
                 # Track equity
-                equity = env.equity
+                equity = env.envs[0].equity
                 episode_equity.append(equity)
             
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
-            equity_curves.append(pd.Series(episode_equity, index=env.df.index[:len(episode_equity)]))
-            trade_lists.append(env.get_trades())
+            equity_curves.append(pd.Series(episode_equity, index=env.envs[0].df.index[:len(episode_equity)]))
+            trade_lists.append(env.envs[0].get_trades())
         
         # Calculate performance metrics
         performance_metrics = self._calculate_performance_metrics(equity_curves)
@@ -753,13 +753,13 @@ class RLEvaluator:
                 episode_length += 1
                 
                 # Track equity
-                equity = env.equity
+                equity = env.envs[0].equity
                 episode_equity.append(equity)
             
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
-            equity_curves.append(pd.Series(episode_equity, index=env.df.index[:len(episode_equity)]))
-            trade_lists.append(env.get_trades())
+            equity_curves.append(pd.Series(episode_equity, index=env.envs[0].df.index[:len(episode_equity)]))
+            trade_lists.append(env.envs[0].get_trades())
         
         # Calculate performance metrics
         performance_metrics = self._calculate_performance_metrics(equity_curves)

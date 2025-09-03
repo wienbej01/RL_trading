@@ -30,6 +30,7 @@ class EnvConfig:
     render_mode: str = 'human'
     reward_type: str = 'dsr'  # 'dsr', 'pnl', 'sharpe'
     penalty_factor: float = 0.1
+    reward_scaling: float = 0.1
 
 
 class IntradayRLEnv(Env):
@@ -348,8 +349,22 @@ class IntradayRLEnv(Env):
         realised_fraction = (self.realized_drawdown / max_daily_pct) if max_daily_pct > 0 else 0.0
         risk_penalty = max(0.0, float(realised_fraction))  # penalize only when drawdown is present
 
-        # Reward equals realized pnl minus penalties
-        reward = float(pnl) - float(drawdown_penalty) - float(risk_penalty)
+        # --- Reward Calculation ---
+        if self.env_config.reward_type == 'pnl':
+            reward = pnl
+        elif self.env_config.reward_type == 'dsr':
+            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+            reward = self.dsr.update(step_return)
+        elif self.env_config.reward_type == 'sharpe':
+            # Note: This is a simplified Sharpe ratio calculation for the step
+            # A more accurate Sharpe would be calculated over a longer period
+            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+            reward = step_return / (np.std(self.equity_curve) + 1e-8) if len(self.equity_curve) > 1 else 0.0
+        else: # Default to pnl with penalties
+            reward = pnl - float(drawdown_penalty) - float(risk_penalty)
+
+        reward *= self.env_config.reward_scaling
+        reward = np.clip(reward, -1, 1)
 
         # Daily kill-switch: terminate when realized drawdown exceeds threshold
         done = False
