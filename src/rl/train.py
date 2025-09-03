@@ -325,7 +325,9 @@ def train_ppo_lstm(settings: Settings,
     env = build_env(settings, data_path, features_path)
     
     # Create vectorized environment
+    from stable_baselines3.common.vec_env import VecNormalize
     vec_env = DummyVecEnv([lambda: env])
+    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.)
     
     # Policy configuration
     policy_kwargs = dict(
@@ -337,12 +339,16 @@ def train_ppo_lstm(settings: Settings,
         optimizer_class=torch.optim.Adam,
         optimizer_kwargs=dict(
             eps=1e-5
-        )
+        ),
+        # LSTM specific arguments
+        lstm_hidden_size=settings.get("train", "policy_kwargs", "lstm_hidden_size", default=128),
+        n_lstm_layers=1, # A reasonable default
+        enable_critic_lstm=True,
     )
     
     # Create PPO model
     model = PPO(
-        'MlpPolicy',
+        'MlpLstmPolicy',
         vec_env,
         learning_rate=training_config.learning_rate,
         n_steps=training_config.n_steps,
@@ -377,6 +383,10 @@ def train_ppo_lstm(settings: Settings,
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
     model.save(model_path)
     logger.info(f"Model saved to {model_path}")
+
+    # Save the VecNormalize statistics
+    vec_env.save(str(Path(model_path).parent / "vecnormalize.pkl"))
+    logger.info(f"VecNormalize statistics saved to {Path(model_path).parent / 'vecnormalize.pkl'}")
     
     return model
 

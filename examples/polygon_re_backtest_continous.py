@@ -761,6 +761,11 @@ class ContinuousIntradayRLEnv(IntradayRLEnv):
     Subclass of IntradayRLEnv that disables end-of-day termination so the episode
     spans the full data range. All other behavior is unchanged.
     """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Disable daily loss limit for continuous backtest by setting it to a very large number
+        self.risk_manager.risk_config.max_daily_loss_r = 1e9
+
     def _eod(self, ts):
         return False
 
@@ -938,7 +943,20 @@ def main():
         if args.model_path:
             print(f"Loading model from {args.model_path}")
             from stable_baselines3 import PPO
+            from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
             model = PPO.load(args.model_path)
+
+            # Load VecNormalize statistics if they exist
+            vec_normalize_path = Path(args.model_path).parent / "vecnormalize.pkl"
+            if vec_normalize_path.exists():
+                print(f"Loading VecNormalize statistics from {vec_normalize_path}")
+                vec_env = DummyVecEnv([lambda: env])
+                vec_env = VecNormalize.load(str(vec_normalize_path), vec_env)
+                # Important: set training to False to avoid updating running stats
+                vec_env.training = False
+                # Update the environment
+                env = vec_env
 
         if model is None:
             raise ValueError("A trained model must be provided via --model-path")
