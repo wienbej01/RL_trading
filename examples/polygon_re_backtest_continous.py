@@ -22,6 +22,8 @@ Usage:
 
 import argparse
 import logging
+logging.getLogger("src.data.data_loader").setLevel(logging.ERROR)
+
 import sys
 from pathlib import Path
 from typing import List
@@ -39,65 +41,91 @@ from src.sim.env_intraday_rl import IntradayRLEnv
 from src.utils.config_loader import Settings
 from src.utils.logging import get_logger
 
+
 logger = get_logger(__name__)
 
 
 # ----------------------------- Helpers -----------------------------
-
 def _normalize_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure df has a proper timestamp column and DateTimeIndex localized to
-    America/New_York. Accepts common names or uses a DatetimeIndex if present.
+    Return df with a proper DateTimeIndex in America/New_York named 'timestamp'.
+    Handles:
+      - explicit columns: 'timestamp','datetime','time','dt','ts','t',
+        'sip_timestamp','participant_timestamp','unix'
+      - datetime-like index
+      - numeric epoch in ns/ms/s (auto-detected)
+    Deduplicates + sorts ascending.
     """
-    if df is None or df.empty:
-        return df
+    if df is None or len(df) == 0:
+        return pd.DataFrame(index=pd.DatetimeIndex([], tz="America/New_York", name="timestamp"))
 
-    # Candidate timestamp columns in decreasing preference
-    candidates = ["timestamp", "datetime", "time", "dt", "ts", "t"]
+    # 1) Find a likely timestamp column
+    candidates = (
+        "timestamp", "datetime", "time", "dt", "ts", "t",
+        "sip_timestamp", "participant_timestamp", "unix"
+    )
+    ts_col = next((c for c in candidates if c in df.columns), None)
 
-    ts_col = None
-    for c in candidates:
-        if c in df.columns:
-            ts_col = c
-            break
-
-    # If no candidate column found but index looks like datetime, use it
+    # If not found, try the index
     if ts_col is None:
         if isinstance(df.index, pd.DatetimeIndex):
-            # Move index to a named column for uniform handling
-            df = df.reset_index()
-            df = df.rename(columns={"index": "timestamp"})
+            df = df.reset_index().rename(columns={"index": "timestamp"})
             ts_col = "timestamp"
         else:
-            # Last resort: try to auto-detect any column with datetime-ish dtype
+            # If any column is already datetime dtype, use that
             for c in df.columns:
                 if pd.api.types.is_datetime64_any_dtype(df[c]):
                     ts_col = c
                     break
 
     if ts_col is None:
-        raise ValueError("No usable timestamp/datetime column or index found in DataFrame")
+        # Last attempt: is there any single numeric-like col that could be epoch?
+        numeric_hint = next(
+            (c for c in df.columns if pd.api.types.is_integer_dtype(df[c]) or pd.api.types.is_float_dtype(df[c])),
+            None
+        )
+        if numeric_hint is None:
+            raise ValueError("No timestamp-like column, datetime index, or numeric epoch candidate found.")
+        ts_col = numeric_hint
 
-    # Coerce to UTC, then convert to America/New_York
-    ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-    df = df.loc[ts.notna()].copy()
-    df[ts_col] = ts
-    df = df.sort_values(ts_col).set_index(ts_col)
+    # 2) Build a UTC-aware Timestamp Series from the chosen column
+    s = df[ts_col]
 
-    try:
-        # If already tz-aware in UTC, convert; if tz-naive, localize to UTC first
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
-        else:
-            df.index = df.index.tz_convert("America/New_York")
-    except Exception:
-        # Fallback: force UTC then convert
-        df.index = df.index.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT").tz_convert("America/New_York")
+    # If it's already datetime-like, coerce with utc=True
+    if pd.api.types.is_datetime64_any_dtype(s):
+        ts = pd.to_datetime(s, utc=True, errors="coerce")
 
-    # Drop duplicate timestamps if any
-    df = df[~df.index.duplicated(keep="first")]
+    else:
+        # It may be epoch in ns/ms/s; try those units in order of likelihood for Polygon
+        ts = pd.to_datetime(s, utc=True, errors="coerce", unit="ns")
+        if ts.isna().all():
+            ts = pd.to_datetime(s, utc=True, errors="coerce", unit="ms")
+        if ts.isna().all():
+            ts = pd.to_datetime(s, utc=True, errors="coerce", unit="s")
 
-    return df
+        # If still all NaT, try a generic parse (strings like '2024-01-02T...')
+        if ts.isna().all():
+            ts = pd.to_datetime(s, utc=True, errors="coerce")
+
+    # Drop rows where we couldn't form a timestamp
+    mask = ts.notna()
+    if not mask.any():
+        raise ValueError(f"Could not parse timestamps from column '{ts_col}'.")
+
+    out = df.loc[mask].copy()
+    out["timestamp"] = ts[mask]
+
+    # 3) Sort, index, tz:America/New_York, dedupe
+    out = out.sort_values("timestamp").set_index("timestamp")
+    if out.index.tz is None:
+        out.index = out.index.tz_localize("UTC")
+    out.index = out.index.tz_convert("America/New_York")
+    out.index.name = "timestamp"
+
+    # Deduplicate timestamps
+    out = out[~out.index.duplicated(keep="first")]
+
+    return out
 
 
 def _iter_polygon_raw_files(raw_dir: Path, symbol: str) -> List[Path]:
@@ -111,112 +139,183 @@ def _iter_polygon_raw_files(raw_dir: Path, symbol: str) -> List[Path]:
         return []
     return sorted(sym_dir.rglob("data.parquet"))
 
-
-def _manual_load_polygon_raw(settings: Settings, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+def _manual_load_polygon_raw(
+    settings: "Settings",
+    symbol: str,
+    start_date: "str | pd.Timestamp",
+    end_date: "str | pd.Timestamp",
+) -> pd.DataFrame:
     """
-    Manually reconstruct OHLCV from RAW partitioned parquet files when the
-    UnifiedDataLoader cannot find a suitable timestamp column in cached/raw data.
+    Manual RAW loader for Polygon daily parquet partitions:
+      data/polygon/historical/symbol=SYMBOL/year=YYYY/month=MM/day=DD/data.parquet
+
+    - Reads each file, normalizes timestamps via _normalize_timestamp_column (robust).
+    - Concatenates, sorts, de-dupes.
+    - Filters to [start_date, end_date] in America/New_York.
     """
-    paths = settings.paths
-    raw_dir = Path(paths.get("polygon_raw_dir"))
-    files = _iter_polygon_raw_files(raw_dir, symbol)
-    if not files:
-        raise FileNotFoundError(f"No RAW parquet files found under {raw_dir}/symbol={symbol.upper()}")
+    import pandas as pd
+    from pathlib import Path
 
-    # Load and concatenate, then filter by date
-    dfs = []
-    for p in files:
-        try:
-            part = pd.read_parquet(p)
-            if part is None or part.empty:
-                continue
-            part = _normalize_timestamp_column(part)
-            dfs.append(part)
-        except Exception as ex:
-            logger.debug("Skipping %s due to read/normalize error: %s", p, ex)
-
-    if not dfs:
-        raise ValueError("Unable to reconstruct RAW data; all parquet reads failed or lacked timestamps.")
-
-    df = pd.concat(dfs, axis=0, ignore_index=False)
-    # Filter by provided date range in local market time
-    s = pd.Timestamp(start_date).tz_localize("America/New_York")
+    tz = "America/New_York"
+    # Parse inputs and make them tz-aware in market time
+    s = pd.Timestamp(start_date)
     e = pd.Timestamp(end_date)
-    # Treat midnight 'end' as exclusive next-day to mirror loader's normalization
-    if e.tzinfo is None:
-        e = e.tz_localize("America/New_York")
-    if e.hour == 0 and e.minute == 0 and e.second == 0:
-        e = e + pd.Timedelta(days=1)
+    if s.tz is None:
+        s = s.tz_localize(tz)
+    else:
+        s = s.tz_convert(tz)
+    if e.tz is None:
+        e = e.tz_localize(tz)
+    else:
+        e = e.tz_convert(tz)
 
-    df = df.loc[(df.index >= s) & (df.index < e)]
+    # Resolve RAW root from settings (with sane default)
+    try:
+        raw_root = Path(settings.get("paths", "polygon_raw_dir"))
+    except Exception:
+        raw_root = (Path(__file__).resolve().parents[1] / "data" / "polygon" / "historical").resolve()
 
-    # Basic column sanity: ensure standard OHLCV exist (rename if needed)
-    rename_map = {}
-    if "o" in df.columns and "open" not in df.columns:
-        rename_map["o"] = "open"
-    if "h" in df.columns and "high" not in df.columns:
-        rename_map["h"] = "high"
-    if "l" in df.columns and "low" not in df.columns:
-        rename_map["l"] = "low"
-    if "c" in df.columns and "close" not in df.columns:
-        rename_map["c"] = "close"
-    if "v" in df.columns and "volume" not in df.columns:
-        rename_map["v"] = "volume"
+    # Enumerate days (inclusive)
+    days = pd.date_range(s.normalize(), e.normalize(), freq="D")
+    parts: list[pd.DataFrame] = []
+    total = 0
+    bad = 0
 
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    for d in days:
+        total += 1
+        y = d.year
+        m = f"{d.month:02d}"
+        dd = f"{d.day:02d}"
+        path = raw_root / f"symbol={symbol}" / f"year={y}" / f"month={m}" / f"day={dd}" / "data.parquet"
+        if not path.exists():
+            continue
+        try:
+            df_part = pd.read_parquet(path)
+            df_part = _normalize_timestamp_column(df_part)  # <-- robust: no 'timestamp' assumption
+            # Keep only in-range rows (include end day; use < e+1 day to be safe)
+            mask = (df_part.index >= s) & (df_part.index < (e + pd.Timedelta(days=1)))
+            df_part = df_part.loc[mask]
+            if not df_part.empty:
+                parts.append(df_part)
+        except Exception as ex:
+            bad += 1
+            logger.warning("RAW: failed to load %s: %s", path, ex)
 
-    # Keep typical columns if present
-    cols_pref = [c for c in ["open", "high", "low", "close", "volume", "vwap", "transactions"] if c in df.columns]
-    other_cols = [c for c in df.columns if c not in cols_pref]
-    df = df[cols_pref + other_cols] if cols_pref else df
+    if not parts:
+        logger.info("RAW: loaded 0/%d partitions (bad=%d) -> empty frame", total, bad)
+        # Empty, but keep correct typed/tz index
+        return pd.DataFrame(index=pd.DatetimeIndex([], tz=tz, name="timestamp"))
 
-    logger.info("Manual RAW load complete: %d rows, %d cols", len(df), df.shape[1])
+    df = pd.concat(parts, axis=0, copy=False)
+    # Safety: sort, dedupe, name index
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = _normalize_timestamp_column(df)
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="first")]
+    df.index.name = "timestamp"
+
+    first = df.index.min()
+    last = df.index.max()
+    logger.info("RAW: loaded %d/%d partitions (bad=%d); rows=%d range=[%s .. %s] tz=%s",
+                len(parts), total, bad, len(df), first, last, df.index.tz)
+
     return df
-
-
-# -------------------------- Original-ish code --------------------------
 
 def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
-    Load Polygon data using UnifiedDataLoader; if it raises the timestamp error,
-    fall back to a manual RAW loader that reconstructs a proper datetime index.
+    Preferred path: UnifiedDataLoader with cache enabled.
+    If the cache is empty or a timestamp/datetime error occurs, fall back to RAW,
+    then rebuild the cache so subsequent runs are fast and stable.
+
+    Always returns a DataFrame indexed by NY-tz 'timestamp'.
     """
+    import pandas as pd
+    from pathlib import Path
+
     logger.info(f"Loading Polygon data for {symbol} from {start_date} to {end_date}")
 
+    # Settings/config path
     config_path = Path(__file__).parent.parent / 'configs' / 'settings.yaml'
     settings = Settings(config_path=str(config_path))
 
-    # Prefer bypassing cache to avoid stale parquet timestamp issues
+    # Build Unified loader (cache ON)
     loader = UnifiedDataLoader(
         data_source='polygon',
         config_path=str(config_path),
-        cache_enabled=False,            # <--- avoid cached parquet causing timestamp errors
+        cache_enabled=True,
         default_timeframe='1min'
     )
 
+    # Convert to Timestamps
+    s = pd.Timestamp(start_date)
+    e = pd.Timestamp(end_date)
+
+    # Compute expected cache path (mirrors loader naming)
     try:
-        df = loader.load(
+        cache_dir = Path(settings.get("paths", "cache_dir"))
+    except Exception:
+        cache_dir = (Path(__file__).resolve().parents[1] / "data" / "cache").resolve()
+    end_plus = (e + pd.Timedelta(days=1)).strftime("%Y%m%d")  # loader uses exclusive end
+    cache_name = f"{symbol.upper()}_{s.strftime('%Y%m%d')}_{end_plus}_ohlcv_1min.parquet"
+    cache_path = cache_dir / cache_name
+
+    def _fallback_from_raw_and_refresh_cache() -> pd.DataFrame:
+        """RAW fallback + rebuild cache if we got data."""
+        df_raw = _manual_load_polygon_raw(settings, symbol, s, e)
+        if not df_raw.empty:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                df_raw.to_parquet(cache_path)
+                logger.info(f"Rebuilt cache at {cache_path} with {len(df_raw)} rows")
+            except Exception as ce:
+                logger.warning(f"Failed to rebuild cache {cache_path}: {ce}")
+        else:
+            logger.info("RAW fallback produced empty frame.")
+        return df_raw
+
+    try:
+        df = loader.load_ohlcv(
             symbol=symbol,
-            start=start_date,
-            end=end_date,
-            timeframe='1min'
+            start=s,
+            end=e,
+            timeframe='1min',
+            use_cache=True
         )
-        # If loader returned something with index but no col, normalize anyway
+        # Normalize to canonical NY-tz index
         df = _normalize_timestamp_column(df)
+
+        # If cache produced empty → purge + RAW fallback + rebuild cache
+        if df is None or df.empty:
+            logger.warning("UnifiedDataLoader returned empty frame; purging cache and falling back to RAW.")
+            try:
+                if cache_path.exists():
+                    cache_path.unlink(missing_ok=True)
+            except Exception as ue:
+                logger.warning(f"Failed to unlink stale cache {cache_path}: {ue}")
+            df = _fallback_from_raw_and_refresh_cache()
+
         logger.info(f"Loaded {len(df)} records for {symbol}")
         return df
 
-    except ValueError as e:
-        msg = str(e).lower()
-        if "no timestamp/datetime column" in msg:
-            logger.warning("UnifiedDataLoader failed due to timestamp column detection; falling back to manual RAW load.")
-            df = _manual_load_polygon_raw(settings, symbol, start_date, end_date)
+    except Exception as ex:
+        msg = (str(ex) or "").lower()
+        # Timestamp/datetime-related → RAW fallback path
+        if "timestamp" in msg or "datetime" in msg:
+            logger.warning("UnifiedDataLoader failed due to timestamp/datetime detection; falling back to RAW.")
+            # Best-effort purge of possibly-bad cache
+            try:
+                if cache_path.exists():
+                    cache_path.unlink(missing_ok=True)
+            except Exception as ue:
+                logger.warning(f"Failed to unlink stale cache {cache_path}: {ue}")
+            df = _fallback_from_raw_and_refresh_cache()
             logger.info(f"Loaded {len(df)} records for {symbol} via RAW fallback")
             return df
-        else:
-            logger.error("Loader error: %s", e)
-            raise
+
+        # Other exceptions — surface them
+        logger.error(f"Loader error (non-timestamp-related): {ex}")
+        raise
+
 
 
 def create_feature_pipeline() -> FeaturePipeline:
@@ -263,140 +362,398 @@ def create_feature_pipeline() -> FeaturePipeline:
         }
     }
     return FeaturePipeline(config)
-
-
-def run_backtest_simulation(env: IntradayRLEnv, model, num_episodes: int = 5) -> dict:
+def _sanitize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Run backtest simulation with the provided environment and model.
-
-    Args:
-        env: RL environment
-        model: Trained PPO model (stable-baselines3)
-        num_episodes: Number of episodes (days) to run
-
-    Returns:
-        Dict of summary stats and per-episode metrics.
+    Ensure env-safe OHLCV:
+      - Guarantee a 'close' column (fallback: vwap -> price -> open).
+      - Drop rows where close is NaN or not finite.
+      - If O/H/L exist, drop rows with any NaN in them (avoid synthetic OHLC).
+      - Volume/vwap/transactions: coerce numeric; fill NaN volume with 0.
+    Returns a copy.
     """
-    logger.info(f"Running backtest simulation with {num_episodes} episodes")
+    if df is None or df.empty:
+        return df
 
-    results = {
-        'episodes': [],
-        'total_return': 0.0,
-        'total_steps': 0,
-        'avg_reward': 0.0,
-        'win_rate': 0.0
-    }
+    out = df.copy()
 
-    total_reward = 0.0
-    total_steps = 0
-    winning_episodes = 0
+    # 1) Ensure we have a 'close' column
+    if "close" not in out.columns:
+        for alt in ("vwap", "price", "open"):
+            if alt in out.columns:
+                out["close"] = out[alt]
+                break
+    if "close" not in out.columns:
+        # No usable price column at all -> empty (better than NaNs in env)
+        return out.iloc[0:0]
 
-    for episode in range(num_episodes):
-        episode_reward = 0.0
-        episode_steps = 0
+    # 2) Coerce candidate numeric columns to numeric
+    num_cols = [c for c in ("open", "high", "low", "close", "volume", "vwap", "transactions") if c in out.columns]
+    for c in num_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
 
-        obs, info = env.reset()
+    # 3) Drop rows with invalid close
+    mask_close = out["close"].notna() & np.isfinite(out["close"]) & (out["close"] > 0)
+    out = out.loc[mask_close]
+
+    # 4) If OHLC exist, drop rows where any is NaN (safer than forward-filling)
+    ohlc_cols = [c for c in ("open", "high", "low", "close") if c in out.columns]
+    if ohlc_cols:
+        out = out.dropna(subset=ohlc_cols, how="any")
+
+    # 5) Volume: fill NaN with 0, clamp negatives to 0
+    if "volume" in out.columns:
+        out["volume"] = out["volume"].fillna(0)
+        out.loc[out["volume"] < 0, "volume"] = 0
+
+    # 6) Final tidy: sort, dedup, name index
+    out = out.sort_index()
+    out = out[~out.index.duplicated(keep="first")]
+    out.index.name = "timestamp"
+
+    return out
+
+def _apply_rth_resample_prune(df: pd.DataFrame, settings: "Settings") -> pd.DataFrame:
+    """
+    Enforce Regular Trading Hours and exact 1-minute bars, then prune sparse days.
+    Finally sanitize to guarantee non-NaN close prices for the env.
+
+    Config keys (defaults used if missing):
+      data.session.tz:           "America/New_York"
+      data.session.rth_start:    "09:30"
+      data.session.rth_end:      "16:00"
+      data.resample.strict:      True
+      data.prune.min_minutes_per_day: 0   (disabled if 0)
+    """
+    if df is None or df.empty:
+        logger.info("Usable records after RTH+resample+gap-prune: 0")
+        return df
+
+    # ----- config with defaults -----
+    try:
+        tz = settings.get("data", "session", "tz", default="America/New_York")
+    except Exception:
+        tz = "America/New_York"
+    try:
+        rth_start = settings.get("data", "session", "rth_start", default="09:30")
+    except Exception:
+        rth_start = "09:30"
+    try:
+        rth_end = settings.get("data", "session", "rth_end", default="16:00")
+    except Exception:
+        rth_end = "16:00"
+    try:
+        strict = bool(settings.get("data", "resample", "strict", default=True))
+    except Exception:
+        strict = True
+    try:
+        min_minutes = int(settings.get("data", "prune", "min_minutes_per_day", default=0))
+    except Exception:
+        min_minutes = 0
+
+    out = df.copy()
+
+    # ----- ensure NY-tz index -----
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out = _normalize_timestamp_column(out)
+    if out.index.tz is None:
+        out.index = out.index.tz_localize("UTC")
+    out.index = out.index.tz_convert(tz)
+
+    # ----- RTH filter -----
+    out = out.between_time(rth_start, rth_end, inclusive="left")
+
+    # ----- build resample aggregation map -----
+    agg = {}
+    if "open" in out.columns:
+        agg["open"] = "first"
+    if "high" in out.columns:
+        agg["high"] = "max"
+    if "low" in out.columns:
+        agg["low"] = "min"
+    if "close" in out.columns:
+        agg["close"] = "last"
+    if "volume" in out.columns:
+        agg["volume"] = "sum"
+    if "vwap" in out.columns:
+        agg["vwap"] = "last"
+    if "transactions" in out.columns:
+        agg["transactions"] = "sum"
+
+    if not agg:
+        # No known fields -> keep row count as a last-resort metric
+        out["rows"] = 1
+        agg = {"rows": "sum"}
+
+    # ----- strict 1-minute resample -----
+    if strict:
+        out = out.resample("1min").agg(agg)
+
+    # ----- prune sparse days if configured -----
+    if min_minutes and min_minutes > 0 and not out.empty:
+        counts = out.groupby(out.index.normalize()).size()
+        bad_days = counts[counts < min_minutes].index
+        if len(bad_days):
+            out = out[~out.index.normalize().isin(bad_days)]
+
+    # ----- sanitize OHLCV to remove NaN prices before env sees it -----
+    out = _sanitize_ohlcv(out)
+
+    # ----- logging summary -----
+    usable = len(out)
+    if usable:
+        first = out.index.min()
+        last = out.index.max()
+        logger.info(f"Usable records after RTH+resample+gap-prune: {usable}")
+        logger.info(f"Usable date range: {first} to {last}")
+    else:
+        logger.info("Usable records after RTH+resample+gap-prune: 0")
+
+    return out
+
+
+def run_backtest_simulation(env, model, episodes: int = 5) -> dict:
+    """
+    Run an episodic backtest for `episodes` episodes.
+
+    - Compatible with Gym (obs, reward, done, info) and Gymnasium
+      (obs, reward, terminated, truncated, info).
+    - Tracks per-episode rewards, steps, equity, and returns.
+    - Avoids off-by-one by appending exactly once per environment step.
+    """
+    import numpy as np
+
+    def _step_unpack(step_out):
+        # Support both Gym and Gymnasium signatures
+        if len(step_out) == 5:
+            obs, reward, terminated, truncated, info = step_out
+            done = bool(terminated) or bool(truncated)
+            return obs, reward, done, info
+        elif len(step_out) == 4:
+            obs, reward, done, info = step_out
+            return obs, reward, bool(done), info
+        else:
+            raise RuntimeError("Unknown env.step(...) return signature")
+
+    ep_summaries = []
+
+    for ep in range(1, int(episodes) + 1):
+        # Reset per episode
+        reset_out = env.reset()
+        if isinstance(reset_out, tuple) and len(reset_out) == 2:
+            obs, reset_info = reset_out
+        else:
+            obs, reset_info = reset_out, {}
+
+        # Establish initial equity baseline
+        initial_equity = getattr(env, "cash", None)
+        if initial_equity is None:
+            initial_equity = getattr(env, "initial_cash", 100_000.0)
+        try:
+            initial_equity = float(reset_info.get("equity", initial_equity))
+        except Exception:
+            pass
+
+        rewards = []
+        equities = []
+        steps = 0
         done = False
+        last_equity = float(initial_equity)
 
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, truncated, info = env.step(action)
-
-            episode_reward += reward
-            episode_steps += 1
-            total_steps += 1
-
-        # Compute episode return from equity curve
-        equity_curve = env.get_equity_curve()
-        if len(equity_curve) >= 2:
-            start_equity = equity_curve.iloc[0]
-            end_equity = equity_curve.iloc[-1]
-            if np.isnan(start_equity) or np.isnan(end_equity) or start_equity == 0:
-                episode_return = 0.0
+            # Model action (deterministic during evaluation)
+            if hasattr(model, "predict"):
+                action, _ = model.predict(obs, deterministic=True)
             else:
-                episode_return = (end_equity - start_equity) / start_equity
-        else:
-            episode_return = 0.0
+                action = 0  # hold/no-op fallback
 
-        if episode_return > 0:
-            winning_episodes += 1
+            obs, reward, done, info = _step_unpack(env.step(action))
+            steps += 1
+            rewards.append(float(reward))
 
-        total_reward += episode_reward
+            eq = info.get("equity", last_equity)
+            try:
+                eq = float(eq)
+            except Exception:
+                eq = last_equity
+            equities.append(eq)
+            last_equity = eq
 
-        results['episodes'].append({
-            'episode': episode + 1,
-            'reward': episode_reward,
-            'steps': episode_steps,
-            'return': episode_return,
-            'final_equity': equity_curve.iloc[-1]
-                if len(equity_curve) > 0 and not np.isnan(equity_curve.iloc[-1])
-                else env.cash
-        })
+        total_reward = float(np.nansum(rewards)) if rewards else 0.0
+        final_equity = float(equities[-1]) if equities else float(initial_equity)
+        ep_return = (final_equity / float(initial_equity) - 1.0) if initial_equity else 0.0
 
-        logger.info(
-            f"Episode {episode + 1}: Reward={episode_reward:.2f}, "
-            f"Steps={episode_steps}, Return={episode_return:.4%}"
+        ep_summaries.append(
+            {
+                "episode": ep,
+                "reward": total_reward,
+                "steps": steps,
+                "return": ep_return,
+                "final_equity": final_equity,
+                "equity_series": equities,  # optional for plotting
+            }
         )
 
-    # Aggregate stats
-    results['total_return'] = sum(ep['return'] for ep in results['episodes']) / num_episodes
-    results['total_steps'] = total_steps
-    results['avg_reward'] = total_reward / total_steps if total_steps > 0 else 0.0
-    results['win_rate'] = winning_episodes / num_episodes
+    # Aggregate metrics
+    rewards_arr = np.array([e["reward"] for e in ep_summaries], dtype=float) if ep_summaries else np.array([0.0])
+    returns_arr = np.array([e["return"] for e in ep_summaries], dtype=float) if ep_summaries else np.array([0.0])
+    steps_sum = int(np.nansum([e["steps"] for e in ep_summaries])) if ep_summaries else 0
+
+    results = {
+        "episodes": ep_summaries,
+        "avg_reward": float(np.nanmean(rewards_arr)),
+        "win_rate": float(np.mean(returns_arr > 0.0)) if ep_summaries else 0.0,
+        "total_return": float(np.nanmean(returns_arr)),  # average return across episodes
+        "total_steps": steps_sum,
+    }
+
+    # Try to close env neatly
+    try:
+        env.close()
+    except Exception:
+        pass
 
     return results
 
 
-def run_continuous_backtest(env: IntradayRLEnv, model) -> dict:
+def run_continuous_backtest(env, model) -> dict:
     """
-    Run a single continuous episode across the entire date range.
+    Run a single continuous backtest over the entire dataset exposed by `env`.
+
+    - Works with Gym (obs, reward, done, info) and Gymnasium
+      (obs, reward, terminated, truncated, info) step signatures.
+    - Tracks rewards, steps, and equity (from info['equity'] if provided).
+    - Avoids off-by-one by appending exactly once per environment step.
+    - Returns a results dict compatible with the existing printing/plotting code.
     """
-    logger.info("Running continuous backtest...")
+    import numpy as np
 
-    total_reward = 0.0
-    total_steps = 0
+    def _step_unpack(step_out):
+        # Support both Gym and Gymnasium signatures
+        if len(step_out) == 5:
+            obs, reward, terminated, truncated, info = step_out
+            done = bool(terminated) or bool(truncated)
+            return obs, reward, done, info
+        elif len(step_out) == 4:
+            obs, reward, done, info = step_out
+            return obs, reward, bool(done), info
+        else:
+            raise RuntimeError("Unknown env.step(...) return signature")
 
-    obs, info = env.reset()
+    # Reset env
+    reset_out = env.reset()
+    # Gymnasium returns (obs, info); Gym returns obs
+    if isinstance(reset_out, tuple) and len(reset_out) == 2:
+        obs, reset_info = reset_out
+    else:
+        obs, reset_info = reset_out, {}
+
+    # Pull initial cash if the env exposes it; default to 100_000
+    initial_equity = getattr(env, "cash", None)
+    if initial_equity is None:
+        initial_equity = getattr(env, "initial_cash", 100_000.0)
+    try:
+        # Some envs track a current equity in info at reset
+        initial_equity = float(reset_info.get("equity", initial_equity))
+    except Exception:
+        pass
+
+    rewards = []
+    steps = 0
+    equities = []
+
     done = False
+    last_equity = float(initial_equity)
 
     while not done:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, truncated, info = env.step(action)
-        total_reward += reward
-        total_steps += 1
-
-    equity_curve = env.get_equity_curve()
-    if len(equity_curve) >= 2:
-        start_equity = equity_curve.iloc[0]
-        end_equity = equity_curve.iloc[-1]
-        if np.isnan(start_equity) or np.isnan(end_equity) or start_equity == 0:
-            episode_return = 0.0
+        # Model action (deterministic for eval)
+        if hasattr(model, "predict"):
+            action, _ = model.predict(obs, deterministic=True)
         else:
-            episode_return = (end_equity - start_equity) / start_equity
-    else:
-        episode_return = 0.0
+            # Fallback: hold/no-op if model interface is different
+            action = 0
 
-    result = {
-        'episodes': [{
-            'episode': 1,
-            'reward': total_reward,
-            'steps': total_steps,
-            'return': episode_return,
-            'final_equity': equity_curve.iloc[-1]
-                if len(equity_curve) > 0 and not np.isnan(equity_curve.iloc[-1])
-                else env.cash
-        }],
-        'total_return': episode_return,
-        'total_steps': total_steps,
-        'avg_reward': total_reward / total_steps if total_steps > 0 else 0.0,
-        'win_rate': 1.0 if episode_return > 0 else 0.0
+        obs, reward, done, info = _step_unpack(env.step(action))
+        steps += 1
+        rewards.append(float(reward))
+
+        # Track equity if provided; otherwise carry forward last known value
+        eq = info.get("equity", last_equity)
+        try:
+            eq = float(eq)
+        except Exception:
+            eq = last_equity
+        equities.append(eq)
+        last_equity = eq
+
+    # Final stats
+    total_reward = float(np.nansum(rewards)) if rewards else 0.0
+    final_equity = float(equities[-1]) if equities else float(initial_equity)
+
+    # Compute return robustly
+    if initial_equity and initial_equity != 0:
+        total_return = (final_equity / float(initial_equity)) - 1.0
+    else:
+        total_return = 0.0
+
+    # Build "episodes" list compatible with existing reporting
+    ep_summary = {
+        "episode": 1,
+        "reward": total_reward,
+        "steps": steps,
+        "return": total_return,
+        "final_equity": final_equity,
+        # optional: store equity series for plotting if your plotter uses it
+        "equity_series": equities,
     }
 
-    logger.info(
-        f"Continuous backtest: Reward={total_reward:.2f}, "
-        f"Steps={total_steps}, Return={episode_return:.4%}"
-    )
-    return result
+    results = {
+        "episodes": [ep_summary],
+        "avg_reward": total_reward / 1.0,
+        "win_rate": 1.0 if total_return > 0 else 0.0,
+        "total_return": total_return,
+        "total_steps": steps,
+    }
+
+    # Best effort to close the env if it exposes close()
+    try:
+        env.close()
+    except Exception:
+        pass
+
+    return results
+
+
+def get_clean_ohlcv(symbol: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, "Settings"]:
+    """
+    Main flow entry point for OHLCV:
+      1) UnifiedDataLoader (cache ON) -> timestamp error fallback to manual RAW.
+      2) RTH + strict 1-min resample + prune (from settings.yaml).
+      3) Returns (df, settings) where df is NY-tz indexed by 'timestamp'.
+    """
+    from pathlib import Path
+    import pandas as pd
+
+    # Load settings once here; return it so downstream (features/env) use the same config instance.
+    config_path = Path(__file__).parent.parent / 'configs' / 'settings.yaml'
+    settings = Settings(config_path=str(config_path))
+
+    # Step 1: load via Unified (or RAW fallback)
+    df = load_polygon_data(symbol, start_date, end_date)
+
+    if df is None or df.empty:
+        logger.info(f"No data available for {symbol}")
+        return df, settings
+
+    # Step 2: enforce RTH+resample+prune using config
+    df = _apply_rth_resample_prune(df, settings)
+
+    # Final logging (redundant with helper, but keeps the main flow informative)
+    if not df.empty:
+        logger.info(f"Final OHLCV shape after cleaning: {df.shape}")
+    else:
+        logger.info("Final OHLCV is empty after cleaning")
+
+    return df, settings
 
 
 class ContinuousIntradayRLEnv(IntradayRLEnv):
@@ -407,75 +764,115 @@ class ContinuousIntradayRLEnv(IntradayRLEnv):
     def _eod(self, ts):
         return False
 
+def plot_results(results: dict, symbol: str) -> None:
+    """
+    Save a results figure:
+      - If equity_series is present in episodes, plot the equity curve(s).
+      - Otherwise, plot per-episode returns as bars.
+      - Always annotate summary metrics.
 
-def plot_results(results: dict, symbol: str):
+    Saves to: backtest_results_{symbol}.png
     """
-    Plot backtest results.
-    """
+    import math
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    episodes = results.get("episodes", []) or []
+    avg_reward = results.get("avg_reward", 0.0)
+    win_rate = results.get("win_rate", 0.0)
+    total_return = results.get("total_return", 0.0)
+    total_steps = results.get("total_steps", 0)
+
+    # Determine if we have any equity series
+    has_equity = any(isinstance(ep.get("equity_series", None), (list, tuple, np.ndarray)) and len(ep["equity_series"]) > 1
+                     for ep in episodes)
+
+    # Prepare figure
+    fig = plt.figure(figsize=(12, 6))
+    ax = fig.add_subplot(111)
+
+    title = f"{symbol} Backtest"
+    if len(episodes) == 1:
+        title += f" — {len(episodes)} Episode"
+    else:
+        title += f" — {len(episodes)} Episodes"
+    ax.set_title(title, pad=12)
+
+    if has_equity:
+        # Plot equity curves (one per episode)
+        for ep in episodes:
+            eq = ep.get("equity_series", None)
+            if eq is None or len(eq) == 0:
+                continue
+            y = np.asarray(eq, dtype=float)
+            x = np.arange(len(y), dtype=int)
+            ax.plot(x, y, linewidth=1.2, alpha=0.85, label=f"Ep {ep.get('episode', '?')}")
+
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Equity")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        if len(episodes) > 1:
+            ax.legend(loc="best", frameon=False)
+
+    else:
+        # No equity series — show per-episode return bars
+        if len(episodes) == 0:
+            ax.text(0.5, 0.5, "No results", ha="center", va="center", transform=ax.transAxes)
+        else:
+            rets = [float(ep.get("return", 0.0)) for ep in episodes]
+            xs = np.arange(len(rets))
+            ax.bar(xs, rets)
+            ax.set_xticks(xs)
+            ax.set_xticklabels([f"Ep {ep.get('episode','?')}" for ep in episodes])
+            ax.set_ylabel("Return")
+            ax.grid(True, axis="y", linestyle="--", alpha=0.3)
+
+    # Summary box (in axes coords)
+    summary = (
+        f"Avg Reward: {avg_reward:.4f}\n"
+        f"Win Rate:   {win_rate:.1%}\n"
+        f"Avg Return: {total_return:.2%}\n"
+        f"Total Steps:{total_steps:,}"
+    )
+    ax.text(
+        0.99, 0.01, summary,
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=10,
+        bbox=dict(boxstyle="round", fc="white", ec="0.8", alpha=0.9),
+    )
+
+    fig.tight_layout()
+
+    out_name = f"backtest_results_{symbol}.png"
     try:
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f'RL Backtest Results - {symbol}', fontsize=16)
-
-        # Episode rewards
-        episodes = [ep['episode'] for ep in results['episodes']]
-        rewards = [ep['reward'] for ep in results['episodes']]
-        ax1.bar(episodes, rewards)
-        ax1.set_title('Episode Rewards')
-        ax1.set_xlabel('Episode')
-        ax1.set_ylabel('Total Reward')
-        ax1.grid(True, alpha=0.3)
-
-        # Episode returns
-        returns = [ep['return'] * 100 for ep in results['episodes']]
-        ax2.bar(episodes, returns)
-        ax2.set_title('Episode Returns (%)')
-        ax2.set_xlabel('Episode')
-        ax2.set_ylabel('Return (%)')
-        ax2.grid(True, alpha=0.3)
-
-        # Final equity
-        equity = [ep['final_equity'] for ep in results['episodes']]
-        ax3.plot(episodes, equity, 'o-', linewidth=2, markersize=8)
-        ax3.set_title('Final Equity')
-        ax3.set_xlabel('Episode')
-        ax3.set_ylabel('Equity ($)')
-        ax3.grid(True, alpha=0.3)
-
-        # Summary statistics
-        ax4.axis('off')
-        summary_text = f"""
-SUMMARY STATISTICS
-
-Total Episodes: {len(results['episodes'])}
-Average Reward: {results['avg_reward']:.4f}
-Win Rate: {results['win_rate']:.1%}
-Average Return: {results['total_return']:.2%}
-Total Steps: {results['total_steps']}
-"""
-        ax4.text(
-            0.1, 0.8, summary_text, fontsize=12, verticalalignment='top',
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray")
-        )
-
-        plt.tight_layout()
-        plt.savefig(f'backtest_results_{symbol}.png', dpi=300, bbox_inches='tight')
-        plt.show()
-        logger.info(f"Results plot saved as backtest_results_{symbol}.png")
-
-    except ImportError:
-        logger.warning("Matplotlib not available for plotting")
+        fig.savefig(out_name, dpi=140)
+        logger.info(f"Results plot saved as {out_name}")
     except Exception as e:
-        logger.error(f"Error creating plot: {e}")
+        logger.warning(f"Failed to save plot {out_name}: {e}")
+
+    # In headless environments, plt.show() will warn; keep it but ignore warning.
+    try:
+        plt.show()
+    except Exception:
+        pass
+    finally:
+        plt.close(fig)
 
 
 def main():
+    """Main example function."""
+    import argparse
+    import logging
+
     parser = argparse.ArgumentParser(description="RL Backtest with Polygon Data")
     parser.add_argument('--symbol', type=str, default='SPY', help='Stock symbol')
     parser.add_argument('--start-date', type=str, default='2024-01-01', help='Start date (YYYY-MM-DD)')
-    parser.add_argument('--end-date', type=str, default='2024-03-31', help='End date (YYYY-MM-DD)')
-    parser.add_argument('--episodes', type=int, default=5, help='Number of episodes to run')
+    parser.add_argument('--end-date', type=str, default='2024-06-30', help='End date (YYYY-MM-DD)')
+    parser.add_argument('--episodes', type=int, default=5, help='Number of episodes to run (episodic mode)')
     parser.add_argument('--plot', action='store_true', help='Generate result plots')
-    parser.add_argument('--model-path', type=str, help='Path to the trained model')
+    parser.add_argument('--model-path', type=str, help='Path to the trained model (Stable-Baselines3)')
     parser.add_argument('--continuous', action='store_true',
                         help='Run a single continuous backtest over the entire date range')
     args = parser.parse_args()
@@ -483,55 +880,72 @@ def main():
     print(f"RL Backtest Example - {args.symbol}")
     print("=" * 50)
     print(f"Date Range: {args.start_date} to {args.end_date}")
-    if args.continuous:
-        print("Mode: Continuous backtest over entire date range")
-    else:
-        print(f"Episodes: {args.episodes}")
+    print(f"Mode: {'Continuous backtest over entire date range' if args.continuous else f'Episodic ({args.episodes} episodes)'}")
     print()
 
     try:
-        # Load data
+        # ---------------------------
+        # 1) Load & Clean OHLCV data
+        # ---------------------------
         print("Loading data...")
-        ohlcv_data = load_polygon_data(args.symbol, args.start_date, args.end_date)
+        ohlcv_data, settings = get_clean_ohlcv(args.symbol, args.start_date, args.end_date)
         if ohlcv_data is None or ohlcv_data.empty:
             print(f"No data available for {args.symbol}")
             return
 
-        print(f"Loaded {len(ohlcv_data)} records")
+        print(f"Loaded {len(ohlcv_data):,} records")
         print(f"Date range: {ohlcv_data.index.min()} to {ohlcv_data.index.max()}")
         print()
 
-        # Create features
+        # ---------------------------
+        # 2) Feature Engineering
+        # ---------------------------
         print("Creating features...")
         pipeline = create_feature_pipeline()
         features = pipeline.fit_transform(ohlcv_data)
         print(f"Created {len(features.columns)} features")
         print()
 
-        # Initialize environment (choose episodic or continuous)
+        # --------------------------------
+        # 3) Initialize RL Trading Environment
+        # --------------------------------
         print("Initializing RL environment...")
-        config_path = Path(__file__).parent.parent / 'configs' / 'settings.yaml'
-        settings = Settings(config_path=str(config_path))
         EnvClass = ContinuousIntradayRLEnv if args.continuous else IntradayRLEnv
+
+        # If your YAML has env overrides, you can fetch here (optional)
+        # pv = 1.0 for SPY; keep consistent with training
+        try:
+            pv = float(settings.get("env", "point_value", default=1.0))
+        except Exception:
+            pv = 1.0
+
         env = EnvClass(
             ohlcv=ohlcv_data,
             features=features,
             cash=100000.0,
-            point_value=5.0,  # MES contract multiplier
-            config=settings.env
+            point_value=pv
         )
         print("Environment initialized successfully")
+        print(f"Usable bars in env: {len(ohlcv_data)}")
+        print(f"First/last: {ohlcv_data.index.min()} {ohlcv_data.index.max()}")
+        print(f"Env class: {EnvClass.__name__}")
         print()
 
-        # Load model
-        if not args.model_path:
+        # ---------------------------
+        # 4) Load Trained Model
+        # ---------------------------
+        model = None
+        if args.model_path:
+            print(f"Loading model from {args.model_path}")
+            from stable_baselines3 import PPO
+            model = PPO.load(args.model_path)
+
+        if model is None:
             raise ValueError("A trained model must be provided via --model-path")
 
-        from stable_baselines3 import PPO
-        print(f"Loading model from {args.model_path}")
-        model = PPO.load(args.model_path)
-
-        # Run backtest
+        # ---------------------------
+        # 5) Run Backtest
+        # ---------------------------
         print("Running backtest simulation...")
         if args.continuous:
             results = run_continuous_backtest(env, model)
@@ -539,7 +953,9 @@ def main():
             results = run_backtest_simulation(env, model, args.episodes)
         print()
 
-        # Print results
+        # ---------------------------
+        # 6) Print Results
+        # ---------------------------
         print("BACKTEST RESULTS")
         print("=" * 50)
         print(f"Episodes: {len(results['episodes'])}")
@@ -549,18 +965,17 @@ def main():
         print(f"Total Steps: {results['total_steps']}")
         print()
 
-        # Detailed episode results
         print("Episode Details:")
         for ep in results['episodes']:
-            print(
-                f"Episode {ep['episode']:2d}: "
-                f"Reward={ep['reward']:8.2f}, "
-                f"Steps={ep['steps']:6d}, "
-                f"Return={ep['return']:7.2%}, "
-                f"Final Equity=${ep['final_equity']:9.0f}"
-            )
+            print(f"Episode {ep['episode']:2d}: "
+                  f"Reward={ep['reward']:8.2f}, "
+                  f"Steps={ep['steps']:6d}, "
+                  f"Return={ep['return']:7.2%}, "
+                  f"Final Equity=${ep['final_equity']:9.0f}")
 
-        # Generate plots if requested
+        # ---------------------------
+        # 7) Plots
+        # ---------------------------
         if args.plot:
             print("\nGenerating plots...")
             plot_results(results, args.symbol)

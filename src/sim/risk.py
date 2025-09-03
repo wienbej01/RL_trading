@@ -152,7 +152,17 @@ class RiskManager:
         
         # Calculate position size
         if stop_distance > 0:
-            risk_per_contract = stop_distance * 5.0  # $5 per point for MES
+            #risk_per_contract = stop_distance * 5.0  # $5 per point for MES
+            # Use configured instrument point value (ETF = 1.0, futures differ)
+            point_value = 1.0
+            try:
+                if hasattr(self, "settings") and self.settings is not None:
+                    point_value = float(self.settings.get("execution", "point_value", default=1.0))
+            except Exception:
+                pass
+            risk_per_contract = stop_distance * point_value
+
+
             position_size = int(risk_per_trade / risk_per_contract)
         else:
             position_size = 0

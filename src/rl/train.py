@@ -166,62 +166,132 @@ class TrainingCallback(BaseCallback):
         logger.info("Training completed")
         logger.info(f"Best mean reward: {self.best_mean_reward:.2f}")
 
-
 def build_env(settings: Settings, data_path: str, features_path: str) -> IntradayRLEnv:
     """
-    Build training environment.
-    
-    Args:
-        settings: Configuration settings
-        data_path: Path to OHLCV data
-        features_path: Path to features data
-        
-    Returns:
-        Initialized environment
-    """
-    # Load data
-    df = pd.read_parquet(data_path)
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df = df.set_index('timestamp')
+    Build the training environment from OHLCV and feature store, using YAML-driven
+    execution, risk, and environment parameters so that training and backtest are aligned.
 
-    
-    # Limit to RTH
-    rth_start = settings.get("data", "session", "rth_start", default="09:30")
-    rth_end = settings.get("data", "session", "rth_end", default="16:00")
-    df = df.between_time(rth_start, rth_end)
-    
-    # Load features
+    Args:
+        settings: Settings object loaded from configs/settings.yaml
+        data_path: Path to OHLCV parquet (must contain columns like open/high/low/close/volume)
+        features_path: Path to features parquet (index or column with timestamps)
+
+    Returns:
+        An initialized IntradayRLEnv ready for training.
+    """
+    import pandas as pd
+    import numpy as np
+    from ..sim.env_intraday_rl import IntradayRLEnv, EnvConfig
+    from ..sim.risk import RiskConfig
+    from ..sim.execution import ExecParams
+
+    # ---------------------------
+    # 1) Load OHLCV and normalize timestamp/index
+    # ---------------------------
+    df = pd.read_parquet(data_path)
+
+    # Accept either a 'timestamp' column or a DatetimeIndex (optionally epoch ms)
+    if 'timestamp' in df.columns:
+        ts = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
+        df = df.loc[ts.notna()].copy()
+        df['timestamp'] = ts
+        df = df.sort_values('timestamp').set_index('timestamp')
+    else:
+        # If index is not datetime, try to interpret as epoch ms
+        if not isinstance(df.index, pd.DatetimeIndex):
+            idx = pd.to_datetime(df.index, utc=True, errors='coerce', unit='ms')
+            df = df.loc[idx.notna()].copy()
+            df.index = idx[idx.notna()]
+        # Ensure monotonic and tz-aware
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        df = df.sort_index()
+
+    # Convert to market timezone used by the rest of the stack
+    df.index = df.index.tz_convert("America/New_York")
+
+    # Keep standard OHLCV columns that exist
+    keep = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+    if not keep:
+        raise ValueError("OHLCV parquet must include at least one of: open/high/low/close/volume")
+    df = df[keep]
+
+    # ---------------------------
+    # 2) Load features and align to OHLCV index
+    # ---------------------------
     X = pd.read_parquet(features_path)
-    X = X.reindex(df.index, method='ffill')
-    
-    # Build environment
+
+    # Features may carry their own timestamp; normalize similarly
+    if 'timestamp' in X.columns:
+        tx = pd.to_datetime(X['timestamp'], utc=True, errors='coerce')
+        X = X.loc[tx.notna()].copy()
+        X['timestamp'] = tx
+        X = X.sort_values('timestamp').set_index('timestamp')
+    else:
+        if not isinstance(X.index, pd.DatetimeIndex):
+            # try epoch ms on index
+            idx = pd.to_datetime(X.index, utc=True, errors='coerce', unit='ms')
+            X = X.loc[idx.notna()].copy()
+            X.index = idx[idx.notna()]
+        if X.index.tz is None:
+            X.index = X.index.tz_localize("UTC")
+        X = X.sort_index()
+
+    X.index = X.index.tz_convert("America/New_York")
+
+    # Align features to price index, forward/back-fill for small gaps,
+    # then drop remaining NaNs in critical OHLCV fields.
+    X = X.reindex(df.index).ffill().bfill()
+    df = df.dropna(subset=["open", "high", "low", "close"])
+
+    # ---------------------------
+    # 3) Pull execution/risk/env params from YAML
+    # ---------------------------
+    # Execution parameters (costs & microstructure)
+    exec_params = ExecParams(
+        tick_value=float(settings.get("execution", "tick_value", default=0.01)),
+        spread_ticks=int(settings.get("execution", "spread_ticks", default=1)),
+        impact_bps=float(settings.get("execution", "impact_bps", default=0.5)),
+        commission_per_contract=float(settings.get("execution", "commission_per_contract", default=0.0035)),
+    )
+
+    # Risk configuration (position sizing & kill-switch thresholds)
+    risk_cfg = RiskConfig(
+        risk_per_trade_frac=float(settings.get("risk", "risk_per_trade_frac", default=0.02)),
+        stop_r_multiple=float(settings.get("risk", "stop_r_multiple", default=1.0)),
+        tp_r_multiple=float(settings.get("risk", "tp_r_multiple", default=1.5)),
+        max_daily_loss_r=float(settings.get("risk", "max_daily_loss_r", default=3.0)),
+    )
+
+    # Instrument point value (SPY ETF should be 1.0; futures differ)
+    point_value = float(settings.get("execution", "point_value", default=1.0))
+
+    # Environment config — single, consolidated instance
+    reward_type = str(settings.get("env", "reward", "kind", default="dsr"))
+    reward_scaling = float(settings.get("env", "reward_scaling", default=0.1))
+    max_steps = int(settings.get("env", "max_steps", default=390))  # episodic training horizon
+
+    env_cfg = EnvConfig(
+        cash=100_000.0,
+        max_steps=max_steps,
+        reward_type=reward_type,
+        reward_scaling=reward_scaling
+    )
+
+    # ---------------------------
+    # 4) Build environment (single EnvConfig here)
+    # ---------------------------
     env = IntradayRLEnv(
-        ohlcv=df[["open", "high", "low", "close", "volume"]],
+        ohlcv=df,
         features=X,
         cash=100_000.0,
-        exec_params=ExecParams(
-            tick_value=float(settings.get("execution", "tick_value", default=1.25)),
-            spread_ticks=int(settings.get("execution", "spread_ticks", default=1)),
-            impact_bps=float(settings.get("execution", "impact_bps", default=0.5)),
-            commission_per_contract=float(settings.get("execution", "commission_per_contract", default=0.6)),
-        ),
-        risk_cfg=RiskConfig(
-            risk_per_trade_frac=float(settings.get("risk", "risk_per_trade_frac", default=0.02)),
-            stop_r_multiple=float(settings.get("risk", "stop_r_multiple", default=1.0)),
-            tp_r_multiple=float(settings.get("risk", "tp_r_multiple", default=1.5)),
-            max_daily_loss_r=float(settings.get("risk", "max_daily_loss_r", default=3.0)),
-        ),
-        point_value=float(settings.get("execution", "point_value", default=5.0)),
-        env_config=EnvConfig(
-            cash=100_000.0,
-            max_steps=390,
-            reward_type="pnl",
-            reward_scaling=0.1
-        ),
-        config=settings.to_dict()
+        exec_params=exec_params,
+        risk_cfg=risk_cfg,
+        point_value=point_value,
+        env_config=env_cfg,
+        config=settings.to_dict()  # pass full YAML dict for any downstream needs
     )
-    
+
     return env
 
 
