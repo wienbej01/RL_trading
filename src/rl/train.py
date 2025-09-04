@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import logging
 from datetime import datetime, timedelta
 import re
+import json
 
 from sb3_contrib import RecurrentPPO
 # from stable_baselines3.common.policies import ActorCriticPolicy
@@ -173,6 +174,27 @@ class TrainingCallback(BaseCallback):
         logger.info("Training completed")
         logger.info(f"Best mean reward: {self.best_mean_reward:.2f}")
 
+
+class EntropyAnnealCallback(BaseCallback):
+    """Linearly anneal entropy coefficient from initial to final over total timesteps."""
+    def __init__(self, initial_ent: float, final_ent: float, total_timesteps: int):
+        super().__init__(verbose=0)
+        self.initial = float(initial_ent)
+        self.final = float(final_ent)
+        self.total = int(max(1, total_timesteps))
+
+    def _on_step(self) -> bool:
+        # progress in [0,1]
+        t = min(self.model.num_timesteps, self.total)
+        frac = t / self.total
+        new_ent = self.initial + (self.final - self.initial) * frac
+        try:
+            # SB3 stores ent_coef on the model
+            self.model.ent_coef = float(new_ent)
+        except Exception:
+            pass
+        return True
+
 def build_env(settings: Settings, data_path: str, features_path: str) -> IntradayRLEnv:
     """
     Build the training environment from OHLCV and feature store, using YAML-driven
@@ -328,6 +350,12 @@ def train_ppo_lstm(settings: Settings,
     
     # Build one environment (for single-env fallback)
     env = build_env(settings, data_path, features_path)
+    # Save feature metadata next to model later
+    feature_cols = []
+    try:
+        feature_cols = list(getattr(env, 'features', getattr(env, 'X', pd.DataFrame())).columns)
+    except Exception:
+        pass
     
     # Create vectorized environment (support multi-env with subprocess workers)
     from stable_baselines3.common.vec_env import VecNormalize
@@ -385,10 +413,28 @@ def train_ppo_lstm(settings: Settings,
                 pass
 
     # Create RecurrentPPO model with LSTM policy
+    # Learning rate schedule (optional): settings.train.lr_schedule: 'linear'|'cosine'|'none'
+    lr_value = training_config.learning_rate
+    try:
+        lr_sched = str(settings.get('train', 'lr_schedule', default='none')).lower()
+    except Exception:
+        lr_sched = 'none'
+
+    def make_lr_schedule(init_lr: float):
+        if lr_sched == 'linear':
+            # SB3 passes remaining_progress from 1 -> 0
+            return lambda progress: init_lr * progress
+        if lr_sched == 'cosine':
+            import math
+            return lambda progress: init_lr * 0.5 * (1 + math.cos(math.pi * (1 - progress)))
+        return init_lr
+
+    lr_param = make_lr_schedule(training_config.learning_rate)
+
     model = RecurrentPPO(
         'MlpLstmPolicy',
         vec_env,
-        learning_rate=training_config.learning_rate,
+        learning_rate=lr_param,
         n_steps=training_config.n_steps,
         batch_size=training_config.batch_size,
         gamma=training_config.gamma,
@@ -412,7 +458,7 @@ def train_ppo_lstm(settings: Settings,
     except Exception:
         pass
     
-    # Create callback
+    # Create callbacks
     callback = TrainingCallback(verbose=training_config.verbose)
     
     # Train model
@@ -423,9 +469,26 @@ def train_ppo_lstm(settings: Settings,
     else:
         m = re.search(r"[-+]?\d+", str(_raw_steps))
         total_steps = int(m.group()) if m else 1_200_000
+    # Optional entropy anneal: train.ent_anneal_final can override final coefficient
+    try:
+        ent_final = float(settings.get('train', 'ent_anneal_final', default=None))
+    except Exception:
+        ent_final = None
+
+    callbacks = [callback]
+    # Ensure integer type even if YAML has comments/strings like "10000#100000"
+    _raw_steps = settings.get("train", "total_steps", default=1_200_000)
+    if isinstance(_raw_steps, (int, np.integer)):
+        total_steps = int(_raw_steps)
+    else:
+        m = re.search(r"[-+]?\d+", str(_raw_steps))
+        total_steps = int(m.group()) if m else 1_200_000
+    if ent_final is not None:
+        callbacks.append(EntropyAnnealCallback(initial_ent=model.ent_coef, final_ent=ent_final, total_timesteps=total_steps))
+
     model.learn(
         total_timesteps=total_steps,
-        callback=callback,
+        callback=callbacks if len(callbacks) > 1 else callback,
         log_interval=1000,
         progress_bar=True
     )
@@ -438,6 +501,19 @@ def train_ppo_lstm(settings: Settings,
     # Save the VecNormalize statistics
     vec_env.save(str(Path(model_path).parent / "vecnormalize.pkl"))
     logger.info(f"VecNormalize statistics saved to {Path(model_path).parent / 'vecnormalize.pkl'}")
+    # Save feature column metadata for parity checks
+    try:
+        meta = {
+            'features': feature_cols,
+            'saved_at': datetime.now().isoformat(),
+            'data_path': data_path,
+            'features_path': features_path
+        }
+        with open(str(Path(model_path) ) + "_features.json", 'w') as f:
+            json.dump(meta, f, indent=2)
+        logger.info(f"Saved feature metadata to {str(Path(model_path))+'_features.json'}")
+    except Exception as e:
+        logger.warning(f"Failed to save feature metadata: {e}")
     
     return model
 
@@ -611,9 +687,18 @@ def walk_forward_training(settings: Settings,
         # Load trained model
         model = RecurrentPPO.load(str(model_path))
         
-        # Evaluate on test set
+        # Evaluate on test set with VecNormalize stats from the fold
         test_env = build_env(settings, str(fold_dir / "test_data.parquet"), str(fold_dir / "test_features.parquet"))
         vec_test_env = DummyVecEnv([lambda: test_env])
+        # Load vecnormalize if exists next to the fold model
+        try:
+            from stable_baselines3.common.vec_env import VecNormalize
+            vn_path = fold_dir / "vecnormalize.pkl"
+            if vn_path.exists():
+                vec_test_env = VecNormalize.load(str(vn_path), vec_test_env)
+                vec_test_env.training = False
+        except Exception as e:
+            logger.warning(f"VecNormalize load skipped in WF eval: {e}")
         test_metrics = evaluate_model(model, vec_test_env, num_episodes=3)
         
         # Save results

@@ -248,9 +248,17 @@ def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFra
         default_timeframe='1min'
     )
 
-    # Convert to Timestamps
+    # Convert to tz-aware NY timestamps
     s = pd.Timestamp(start_date)
     e = pd.Timestamp(end_date)
+    if s.tz is None:
+        s = s.tz_localize('America/New_York')
+    else:
+        s = s.tz_convert('America/New_York')
+    if e.tz is None:
+        e = e.tz_localize('America/New_York')
+    else:
+        e = e.tz_convert('America/New_York')
 
     # Compute expected cache path (mirrors loader naming)
     try:
@@ -300,7 +308,10 @@ def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFra
                 continue
         if not parts:
             return pd.DataFrame()
-        return _sanitize_ohlcv(pd.concat(parts, axis=0))
+        out = _sanitize_ohlcv(pd.concat(parts, axis=0))
+        # Enforce final slice to requested window (tz-aware)
+        out = out.loc[(out.index >= s) & (out.index <= e)]
+        return out
 
     try:
         df = loader.load_ohlcv(
@@ -332,6 +343,9 @@ def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFra
                     try:
                         df = pd.read_parquet(agg_path)
                         df = _normalize_timestamp_column(df)
+                        # Normalize tz and enforce final slice
+                        if df.index.tz is None:
+                            df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
                         df = df.loc[(df.index >= s) & (df.index <= e)]
                         logger.info(f"Loaded aggregated raw {agg_path} rows={len(df)}")
                     except Exception as ex:
@@ -1152,6 +1166,28 @@ def main():
             model_path = _resolve_model_path(args.model_path)
             model = RecurrentPPO.load(str(model_path))
 
+            # Feature parity check: try to load training feature metadata and align
+            try:
+                import json as _json
+                meta_path = str(model_path) + "_features.json"
+                if Path(meta_path).exists():
+                    with open(meta_path, 'r') as f:
+                        meta = _json.load(f)
+                    train_cols = meta.get('features', [])
+                    if train_cols:
+                        missing = [c for c in train_cols if c not in features.columns]
+                        extra = [c for c in features.columns if c not in train_cols]
+                        if missing:
+                            print(f"Warning: missing feature columns in evaluation: {missing}. Filling with zeros.")
+                            for c in missing:
+                                features[c] = 0.0
+                        # Reorder to training order
+                        features = features[train_cols + [c for c in features.columns if c not in train_cols]]
+                        # Align OHLCV to features index again after potential change
+                        ohlcv_data = ohlcv_data.reindex(features.index, method='ffill')
+            except Exception as e:
+                print(f"Feature parity check skipped: {e}")
+
             # Load VecNormalize statistics if they exist next to the model
             vec_normalize_path = model_path.parent / "vecnormalize.pkl"
             if vec_normalize_path.exists():
@@ -1187,6 +1223,24 @@ def main():
         print(f"Win Rate: {results['win_rate']:.1%}")
         print(f"Average Return: {results['total_return']:.2%}")
         print(f"Total Steps: {results['total_steps']}")
+        # Print action histogram and trades if available
+        try:
+            ah = results.get('action_hist', None)
+            if ah:
+                print(f"Action histogram: {ah}")
+        except Exception:
+            pass
+        try:
+            # Attempt to access underlying env to get trades
+            base_env = env
+            if hasattr(env, 'venv'):
+                base_env = env.venv
+            if hasattr(base_env, 'envs') and len(base_env.envs):
+                trades = getattr(base_env.envs[0], 'get_trades', lambda: [])()
+                if trades:
+                    print(f"Trades: {len(trades)}")
+        except Exception:
+            pass
         print()
 
         print("Episode Details:")

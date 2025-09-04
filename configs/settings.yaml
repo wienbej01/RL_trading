@@ -46,7 +46,7 @@ features:
     sma_windows: [5, 10, 20, 50]
     ema_windows: [5, 10, 20, 50]
     calculate_atr: true
-    atr_window: 14
+    atr_window: 10
     calculate_rsi: true
     rsi_window: 14
     calculate_macd: true
@@ -117,6 +117,8 @@ risk:
   stop_r_multiple: 1.0
   tp_r_multiple: 1.5
   max_daily_loss_r: 3.0       # kill-switch
+  max_position_size: 1000
+  max_leverage: 0.05
 
 env:
   step_seconds: 60
@@ -145,6 +147,8 @@ train:
   ent_coef: 0.005
   n_steps: 1024
   target_kl: 0.03
+  lr_schedule: cosine   # none|linear|cosine
+  ent_anneal_final: 0.003
   policy_kwargs:
     lstm_hidden_size: 128
     net_arch_pi: [128, 64]

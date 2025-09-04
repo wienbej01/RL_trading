@@ -313,6 +313,26 @@ class IntradayRLEnv(Env):
                 self.tp_price = None
                 hit_exit = True
 
+        # Time-stop (max holding minutes)
+        try:
+            max_hold = int(self.config.get('env', {}).get('trading', {}).get('max_holding_minutes', 0)) if isinstance(self.config, dict) else 0
+        except Exception:
+            max_hold = 0
+        if max_hold and self.pos != 0:
+            # approximate bar count equals minutes since entry
+            # track entry step index lazily
+            if not hasattr(self, 'entry_index') or self.entry_index is None:
+                self.entry_index = self.i
+            held = self.i - int(self.entry_index)
+            if held >= max_hold:
+                # flatten at market price with transaction cost
+                self.cash -= estimate_tc(self.pos, price, self.exec_sim)
+                self.pos = 0
+                self.entry_price = None
+                self.stop_price = None
+                self.tp_price = None
+                hit_exit = True
+
         # Trading windows control (no-trade in first/last N minutes)
         try:
             open_min = int(self.config.get('env', {}).get('trading', {}).get('no_trade_open_minutes', 0)) if isinstance(self.config, dict) else 0
@@ -327,6 +347,15 @@ class IntradayRLEnv(Env):
 
         # Apply desired action if flat (or change direction after exit) and not in no-trade window
         if desired_dir != 0 and self.pos == 0 and not hit_exit and not in_no_trade:
+            # Cap trades per hour
+            try:
+                max_tph = int(self.config.get('env', {}).get('trading', {}).get('max_trades_per_hour', 0)) if isinstance(self.config, dict) else 0
+            except Exception:
+                max_tph = 0
+            if max_tph:
+                recent = [t for t in self.trades if t.get('action') == 'open' and (ts - t['ts']) <= pd.Timedelta(minutes=60)]
+                if len(recent) >= max_tph:
+                    desired_dir = 0
             contracts = self._risk_sized_contracts(price, atr_val)
             if contracts > 0:
                 # open position
@@ -339,10 +368,31 @@ class IntradayRLEnv(Env):
                     self.trades.append({
                         'ts': ts,
                         'pos': int(self.pos),
-                        'price': float(price)
+                        'price': float(price),
+                        'action': 'open'
                     })
                 except Exception:
                     pass
+                self.entry_index = self.i
+                self.scale_out_done = False
+
+        # Partial scale-out when in profit (optional)
+        try:
+            scale_r = float(self.config.get('env', {}).get('trading', {}).get('scale_out_r_multiple', 0.0)) if isinstance(self.config, dict) else 0.0
+        except Exception:
+            scale_r = 0.0
+        if scale_r and self.pos != 0 and not self.scale_out_done and self.entry_price is not None and atr_val > 0:
+            r_unreal = ((price - self.entry_price) * np.sign(self.pos)) / (atr_val * max(1e-6, float(self.risk_manager.risk_config.stop_r_multiple)))
+            if r_unreal >= scale_r and abs(self.pos) > 1:
+                half = int(abs(self.pos) // 2) * int(np.sign(self.pos))
+                self.cash += (price - self.entry_price) * half * self.point_value
+                self.cash -= estimate_tc(half, price, self.exec_sim)
+                self.pos -= half
+                try:
+                    self.trades.append({'ts': ts, 'pos': int(self.pos), 'price': float(price), 'action': 'scale_out'})
+                except Exception:
+                    pass
+                self.scale_out_done = True
 
         # Update equity and equity curve
         self.equity = self.cash
@@ -403,8 +453,10 @@ class IntradayRLEnv(Env):
                 session_close = 16 * 60
                 in_widen = (widen_min and session_open <= minutes_since_midnight < session_open + widen_min) or \
                            (widen_min and session_close - widen_min <= minutes_since_midnight < session_close)
-                widen_factor = 1.0 + (0.5 if in_widen else 0.0)
-                reward -= mu_pen * widen_factor * (max(0.0, 1.5 - rvol) + spread)
+                widen_factor = 1.0 + (0.25 if in_widen else 0.0)
+                # apply micro penalty only under poor liquidity
+                if rvol < 1.0:
+                    reward -= mu_pen * widen_factor * (max(0.0, 1.5 - rvol) + spread)
             except Exception:
                 pass
             reward -= float(drawdown_penalty) + float(risk_penalty)
