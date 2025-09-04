@@ -6,13 +6,15 @@ Updated: 2025-09-04
 ## Status Summary
 
 - Phase 1 (Data Integrity) — Completed
-  - Added coverage QA (concise coverage reports; reduced log noise)
+  - Coverage QA (concise coverage reports; reduced log noise)
   - Cache rebuild logic hardened; strict RTH and early-close awareness
   - Context prep scripts with fallbacks (SPY/QQQ/VIX)
 
-- Phase 2 (Features) — Completed (first cut)
+- Phase 2 (Features) — Completed (expanded)
   - ICT: PDM/OR distances, displacement bars (+density), FVG (+density), equal highs/lows proximity
   - VPA: RVOL, climax volume, churn (+z), imbalance persistence, direction EMA, intrabar volatility
+  - Levels: prior/current day open/close, pivot points (S1/R1/S2/R2), rolling support/resistance, session VWAP distance
+  - True structure: swing highs/lows (causal), distances to last swings, break-of-structure flags
   - SMT: instrument vs SPY, and SPY vs QQQ divergence
   - VIX: base features and term-structure ratios; Yahoo path integrated
   - Pruning: variance + correlation
@@ -26,17 +28,18 @@ Updated: 2025-09-04
 
 - Policy/Hyperparameters
   - n_envs=8, n_steps=1024, batch=1024, gamma=0.995, gae=0.97, target_kl=0.03
-  - Next: LR/entropy schedules (cosine/linear decay)
+  - LR schedule (cosine/linear) and entropy annealing supported
 
 - Execution realism
-  - No-trade windows (first/last 5m), widened spreads (first/last 15m)
-  - Next: ATR time-stop; cap trades/hour; partial scale-outs
+  - No-trade windows (first/last 5m), widened penalties (first/last 15m)
+  - ATR time-stop added; cap trades/hour and partial scale-outs configurable
 
-## Phase 4 — Training Process + Evaluation (Planned)
+## Phase 4 — Training Process + Evaluation (In Progress)
 
 - Walk-forward automation (monthly/biweekly folds) with embargo; aggregate OOS metrics
-- Early stopping (validation Sharpe/Calmar); checkpoint best model per fold
-- Diagnostics: action histogram, trade counts, holding times; per-regime PnL (VIX bins, SMT buckets); steps/sec
+- Walk-forward CLI added (scripts/walkforward_train_eval.py)
+- Early stopping (validation Sharpe/Calmar); checkpoint best model per fold (planned)
+- Diagnostics: action histogram, trade counts, holding times; per-regime PnL buckets (VIX bins, SMT buckets) in backtests; steps/sec
 - Baselines: buy-and-hold and simple rules for context
 
 ## Phase 5 — Cleanup + UX (Planned)
@@ -51,8 +54,9 @@ Updated: 2025-09-04
 
 ## Action Items (Next 1–2 iterations)
 
-- [ ] Add LR/entropy schedules and optional asymmetric drawdown penalty
-- [ ] Implement walk-forward CLI and VecNormalize parity checks
-- [ ] Add per-regime (VIX/SMT) evaluation breakdown and summary in backtests
-- [ ] Add cap trades/hour and ATR time-stop options to env
+- [x] LR/entropy schedules; consider asymmetric drawdown penalty
+- [x] Walk-forward CLI; ensure VecNormalize parity checks
+- [x] Per-regime (VIX/SMT) evaluation breakdown in backtests
+- [x] Time-stop; cap trades/hour and scale-outs configurable
+- [ ] Swing-based stop option for risk sizing (min of ATR and swing stop)
 - [ ] Optional: microstructure PCA (grouped) and equal highs/lows distance refinement
