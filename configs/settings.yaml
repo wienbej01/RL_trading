@@ -94,6 +94,12 @@ features:
     paths:
       SPY: data/raw/SPY_1min.parquet
       QQQ: data/raw/QQQ_1min.parquet
+  levels:
+    enabled: true
+    pivot: true
+    pivots_from: 'prior_day'   # prior_day|current_day
+    roll_window: 20            # for rolling support/resistance
+    use_atr_norm: true
   polygon:
     features:
       use_vwap_column: true

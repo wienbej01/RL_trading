@@ -802,6 +802,102 @@ class FeaturePipeline:
                     features['smt_spy_qqq'] = (m_spy - m_qqq).shift(1).fillna(0.0)
         except Exception:
             pass
+
+        # Levels: pivots, rolling support/resistance, day open levels
+        try:
+            levels_cfg = self.config.get('levels', {})
+            if levels_cfg.get('enabled', False):
+                idx = data.index
+                day_idx = idx.normalize()
+                # Daily OHLC
+                daily_o = data['open'].groupby(day_idx).first()
+                daily_h = data['high'].groupby(day_idx).max()
+                daily_l = data['low'].groupby(day_idx).min()
+                daily_c = data['close'].groupby(day_idx).last()
+
+                # Current day open and prior day open
+                curr_open_map = daily_o
+                prior_open_map = daily_o.shift(1)
+                features['dist_cdo_bp'] = (data['close'] - day_idx.map(curr_open_map)).astype(float)
+                features['dist_pdo_bp'] = (data['close'] - day_idx.map(prior_open_map)).astype(float)
+
+                # Gap from prior close
+                prior_close_map = daily_c.shift(1)
+                day_open_const = day_idx.map(curr_open_map)
+                features['gap_open_prev_close'] = (day_open_const - day_idx.map(prior_close_map)).astype(float)
+
+                # Pivots (use prior day's HLC if configured)
+                if levels_cfg.get('pivot', True):
+                    use_prior = str(levels_cfg.get('pivots_from', 'prior_day')).lower() == 'prior_day'
+                    H = daily_h.shift(1) if use_prior else daily_h
+                    L = daily_l.shift(1) if use_prior else daily_l
+                    C = daily_c.shift(1) if use_prior else daily_c
+                    PP = (H + L + C) / 3.0
+                    R1 = 2 * PP - L
+                    S1 = 2 * PP - H
+                    R2 = PP + (H - L)
+                    S2 = PP - (H - L)
+                    features['dist_pp_bp'] = (data['close'] - day_idx.map(PP)).astype(float)
+                    features['dist_r1_bp'] = (data['close'] - day_idx.map(R1)).astype(float)
+                    features['dist_s1_bp'] = (data['close'] - day_idx.map(S1)).astype(float)
+                    features['dist_r2_bp'] = (data['close'] - day_idx.map(R2)).astype(float)
+                    features['dist_s2_bp'] = (data['close'] - day_idx.map(S2)).astype(float)
+
+                # Rolling support/resistance (past-only)
+                rw = int(levels_cfg.get('roll_window', 20))
+                roll_max = data['high'].rolling(rw, min_periods=5).max().shift(1)
+                roll_min = data['low'].rolling(rw, min_periods=5).min().shift(1)
+                features['dist_rollmax_bp'] = (data['close'] - roll_max).astype(float)
+                features['dist_rollmin_bp'] = (data['close'] - roll_min).astype(float)
+
+                # Session VWAP distance (intraday from session open)
+                try:
+                    vol = data['volume'].clip(lower=0)
+                    typical = data['close']
+                    # Cumulative from session open
+                    v_cum = vol.groupby(day_idx).cumsum()
+                    pv_cum = (typical * vol).groupby(day_idx).cumsum()
+                    session_vwap = (pv_cum / v_cum).replace([np.inf, -np.inf], np.nan)
+                    features['dist_session_vwap'] = (data['close'] - session_vwap).astype(float)
+                except Exception:
+                    pass
+
+                # Normalize some distances by ATR if configured
+                if levels_cfg.get('use_atr_norm', True):
+                    atr_series = features.get('atr', calculate_atr(data['high'], data['low'], data['close']))
+                    eps = 1e-6
+                    for col in ['dist_cdo_bp','dist_pdo_bp','gap_open_prev_close','dist_pp_bp','dist_r1_bp','dist_s1_bp','dist_r2_bp','dist_s2_bp','dist_rollmax_bp','dist_rollmin_bp','dist_session_vwap']:
+                        if col in features.columns:
+                            features[col + '_atr'] = (features[col] / (atr_series + eps)).astype(float)
+
+                # True swings (confirmed pivots) with causal confirmation (shift by right window)
+                try:
+                    swings = levels_cfg.get('swings', {'left': 3, 'right': 3})
+                    left = int(swings.get('left', 3))
+                    right = int(swings.get('right', 3))
+                    win = left + right + 1
+                    rh = data['high'].rolling(win, center=True).apply(lambda x: float(np.argmax(x) == left), raw=False)
+                    rl = data['low'].rolling(win, center=True).apply(lambda x: float(np.argmin(x) == left), raw=False)
+                    swing_high_flag = rh.shift(right).fillna(0).astype(int)
+                    swing_low_flag = rl.shift(right).fillna(0).astype(int)
+                    features['swing_high_flag'] = swing_high_flag
+                    features['swing_low_flag'] = swing_low_flag
+                    # Last swing levels and distances
+                    last_sh = data['high'].where(swing_high_flag == 1).ffill()
+                    last_sl = data['low'].where(swing_low_flag == 1).ffill()
+                    features['dist_last_swing_high'] = (data['close'] - last_sh).astype(float)
+                    features['dist_last_swing_low'] = (data['close'] - last_sl).astype(float)
+                    # Break-of-structure flags (buffer via ATR)
+                    atr_series = features.get('atr', calculate_atr(data['high'], data['low'], data['close']))
+                    buf = 0.1 * atr_series
+                    bos_up = (data['close'] > (last_sh + buf)).astype(int)
+                    bos_dn = (data['close'] < (last_sl - buf)).astype(int)
+                    features['bos_up'] = bos_up
+                    features['bos_down'] = bos_dn
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
         # Optional low-variance filter first
         min_var = float(self.feature_selection_config.get('min_variance', 0.0))

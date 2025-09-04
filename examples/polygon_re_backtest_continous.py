@@ -1241,6 +1241,74 @@ def main():
                     print(f"Trades: {len(trades)}")
         except Exception:
             pass
+
+        # Bucketed performance (VIX and SMT) to understand PnL drivers
+        try:
+            # Unwrap to base env and fetch equity curve (timestamp indexed)
+            base_env = env
+            if hasattr(env, 'venv'):
+                base_env = env.venv
+            if hasattr(base_env, 'envs') and len(base_env.envs):
+                eq_curve = base_env.envs[0].get_equity_curve()
+            else:
+                eq_curve = None
+            if eq_curve is not None and not eq_curve.empty:
+                ret = eq_curve.pct_change().dropna()
+                # Align features to equity index (features var available above)
+                f_idx = features.index if isinstance(features.index, pd.DatetimeIndex) else None
+                common_idx = ret.index
+                if f_idx is not None:
+                    common_idx = common_idx.intersection(f_idx)
+                ret = ret.reindex(common_idx)
+                fview = features.reindex(common_idx)
+                # VIX buckets
+                vix_series = None
+                for c in ['vix','vix_1m','vix_close','vix_close_^vix']:
+                    if c in fview.columns:
+                        vix_series = pd.to_numeric(fview[c], errors='coerce')
+                        break
+                if vix_series is not None:
+                    def vix_bucket(x):
+                        try:
+                            if x < 15: return 'VIX<15'
+                            if x < 25: return '15<=VIX<25'
+                            return 'VIX>=25'
+                        except Exception:
+                            return 'unknown'
+                    vix_b = vix_series.map(vix_bucket)
+                    by_vix = ret.groupby(vix_b).agg(['mean','count'])
+                    print("\nPerformance by VIX bucket (mean return, count):")
+                    try:
+                        for idx, row in by_vix.iterrows():
+                            print(f"  {idx:>10}: {row['mean']:.6f}  n={int(row['count'])}")
+                    except Exception:
+                        print(by_vix)
+                # SMT buckets
+                smt = None
+                for c in ['smt_vs_spy','smt_spy_qqq']:
+                    if c in fview.columns:
+                        smt = pd.to_numeric(fview[c], errors='coerce')
+                        break
+                if smt is not None and len(smt.dropna()) > 10:
+                    q1 = smt.quantile(0.33)
+                    q2 = smt.quantile(0.66)
+                    def smt_bucket(x):
+                        try:
+                            if x <= q1: return 'Low'
+                            if x >= q2: return 'High'
+                            return 'Mid'
+                        except Exception:
+                            return 'unknown'
+                    smt_b = smt.map(smt_bucket)
+                    by_smt = ret.groupby(smt_b).agg(['mean','count'])
+                    print("\nPerformance by SMT bucket (mean return, count):")
+                    try:
+                        for idx, row in by_smt.iterrows():
+                            print(f"  {idx:>10}: {row['mean']:.6f}  n={int(row['count'])}")
+                    except Exception:
+                        print(by_smt)
+        except Exception as e:
+            print(f"Bucketed performance reporting skipped: {e}")
         print()
 
         print("Episode Details:")
