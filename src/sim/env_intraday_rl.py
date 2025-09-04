@@ -243,7 +243,8 @@ class IntradayRLEnv(Env):
                 # Return final observation and end episode
                 next_ts = self.df.index[min(self.i - 1, len(self.df) - 1)]
                 obs = self._obs(next_ts, 0.0)
-                return obs, float(0.0), True, False, {}
+                info = {"equity": float(self.equity)}
+                return obs, float(0.0), True, False, info
             else:
                 # Update equity curve for skipped step (maintain previous equity)
                 # Ensure equity is not NaN before appending
@@ -253,9 +254,12 @@ class IntradayRLEnv(Env):
                 # Return safe observation with zero reward and continue
                 next_ts = self.df.index[self.i]
                 obs = self._obs(next_ts, 0.0)
-                return obs, float(0.0), False, False, {}
+                info = {"equity": float(self.equity)}
+                return obs, float(0.0), False, False, info
 
         atr_val = float(self.X.loc[ts].get("atr", 0.5))  # fallback small ATR
+        if not np.isfinite(atr_val) or atr_val <= 0:
+            atr_val = 0.5
 
         # Track equity prior to this step to compute realized pnl delta
         prev_equity = float(getattr(self, "equity", self.cash))
@@ -281,6 +285,7 @@ class IntradayRLEnv(Env):
             self.min_equity = min(self.min_equity, self.equity)
             self.equity_curve.append(self.equity)
             obs = self._obs(ts, price)
+            info["equity"] = float(self.equity)
             return obs, float(0.0), True, False, info
 
         # Update realized PnL between bars
@@ -308,8 +313,20 @@ class IntradayRLEnv(Env):
                 self.tp_price = None
                 hit_exit = True
 
-        # Apply desired action if flat (or change direction after exit)
-        if desired_dir != 0 and self.pos == 0 and not hit_exit:
+        # Trading windows control (no-trade in first/last N minutes)
+        try:
+            open_min = int(self.config.get('env', {}).get('trading', {}).get('no_trade_open_minutes', 0)) if isinstance(self.config, dict) else 0
+            close_min = int(self.config.get('env', {}).get('trading', {}).get('no_trade_close_minutes', 0)) if isinstance(self.config, dict) else 0
+        except Exception:
+            open_min = close_min = 0
+        minutes_since_midnight = ts.hour * 60 + ts.minute
+        session_open = 9 * 60 + 30
+        session_close = 16 * 60
+        in_no_trade = (open_min and session_open <= minutes_since_midnight < session_open + open_min) or \
+                      (close_min and session_close - close_min <= minutes_since_midnight < session_close)
+
+        # Apply desired action if flat (or change direction after exit) and not in no-trade window
+        if desired_dir != 0 and self.pos == 0 and not hit_exit and not in_no_trade:
             contracts = self._risk_sized_contracts(price, atr_val)
             if contracts > 0:
                 # open position
@@ -318,6 +335,14 @@ class IntradayRLEnv(Env):
                 self._set_barrier_prices(self.pos, price, atr_val)
                 # pay entry cost
                 self.cash -= estimate_tc(self.pos, price, self.exec_sim)
+                try:
+                    self.trades.append({
+                        'ts': ts,
+                        'pos': int(self.pos),
+                        'price': float(price)
+                    })
+                except Exception:
+                    pass
 
         # Update equity and equity curve
         self.equity = self.cash
@@ -356,11 +381,34 @@ class IntradayRLEnv(Env):
             step_return = pnl / prev_equity if prev_equity != 0 else 0.0
             reward = self.dsr.update(step_return)
         elif self.env_config.reward_type == 'sharpe':
-            # Note: This is a simplified Sharpe ratio calculation for the step
-            # A more accurate Sharpe would be calculated over a longer period
+            # Note: simplified Sharpe ratio proxy per step
             step_return = pnl / prev_equity if prev_equity != 0 else 0.0
             reward = step_return / (np.std(self.equity_curve) + 1e-8) if len(self.equity_curve) > 1 else 0.0
-        else: # Default to pnl with penalties
+        elif self.env_config.reward_type == 'blend':
+            # Blended reward: alpha * DSR + beta * raw_pnl - penalties
+            alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.5)) if isinstance(self.config, dict) else 0.5
+            beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.5)) if isinstance(self.config, dict) else 0.5
+            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+            dsr_val = self.dsr.update(step_return)
+            reward = alpha * dsr_val + beta * pnl
+            # Microstructure penalty (optional): discourage trading in poor liquidity
+            try:
+                rvol = float(self.X.loc[ts].get('rvol', 1.0))
+                spread = float(self.X.loc[ts].get('spread', 0.0))
+                mu_pen = float(self.config.get('env', {}).get('reward', {}).get('micro_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                # time-of-day widening: add extra penalty during first/last widen window
+                widen_min = int(self.config.get('env', {}).get('trading', {}).get('widen_spread_minutes', 0)) if isinstance(self.config, dict) else 0
+                minutes_since_midnight = ts.hour * 60 + ts.minute
+                session_open = 9 * 60 + 30
+                session_close = 16 * 60
+                in_widen = (widen_min and session_open <= minutes_since_midnight < session_open + widen_min) or \
+                           (widen_min and session_close - widen_min <= minutes_since_midnight < session_close)
+                widen_factor = 1.0 + (0.5 if in_widen else 0.0)
+                reward -= mu_pen * widen_factor * (max(0.0, 1.5 - rvol) + spread)
+            except Exception:
+                pass
+            reward -= float(drawdown_penalty) + float(risk_penalty)
+        else:  # Default to pnl with penalties
             reward = pnl - float(drawdown_penalty) - float(risk_penalty)
 
         reward *= self.env_config.reward_scaling
@@ -400,6 +448,7 @@ class IntradayRLEnv(Env):
             "risk_penalty": float(risk_penalty),
             "realized_drawdown": float(self.realized_drawdown),
         }
+        info["equity"] = float(self.equity)
         return obs, float(reward), bool(done), False, info
     
     def _obs(self, ts, price):
@@ -822,5 +871,3 @@ class IntradayRLEnvironment(IntradayRLEnv):
 
 # Keep the original alias for backward compatibility
 # IntradayRLEnv = IntradayRLEnv  // Remove this circular reference
-
-

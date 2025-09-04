@@ -80,26 +80,13 @@ def generate_spy_features(data_path: str, output_path: str, config_path: str = "
             'extract_day_of_week': True,
             'extract_session_features': True
         },
-        'vix': {'enabled': True, 'path': 'rl-intraday/data/external/vix.parquet'},
+        'vix': {'enabled': True, 'path': 'data/external/vix.parquet'},
         'normalization': {
             'method': 'standardize',
             'fit_on_train': True
         },
-        'feature_selection': {
-            'method': 'manual',
-            'selected_features': [
-                'returns',
-                'sma_50',
-                'rsi_14',
-                'bb_width',
-                'vol_of_vol',
-                'sma_slope',
-                'obv',
-                'fvg',
-                'vix_close_^vix',
-                'time_from_open'
-            ]
-        },
+        # Prefer automated correlation pruning over brittle manual lists
+        'feature_selection': { 'correlation_threshold': 0.95 },
         'polygon': {
             'features': {
                 'use_vwap_column': False  # SPY data may not have VWAP
@@ -110,6 +97,23 @@ def generate_spy_features(data_path: str, output_path: str, config_path: str = "
         }
     }
 
+    # SMT config from settings if available; default to SPY/QQQ raw files
+    try:
+        smt_enabled = True
+        spy_path = 'data/raw/SPY_1min.parquet'
+        qqq_path = 'data/raw/QQQ_1min.parquet'
+        from pathlib import Path as _P
+        if not (_P(spy_path).exists() and _P(qqq_path).exists()):
+            smt_enabled = False
+            print("SMT disabled: SPY/QQQ raw parquets not found. Place them under data/raw/.")
+        feature_config['smt'] = {
+            'enabled': smt_enabled,
+            'momentum_span': 5,
+            'paths': {'SPY': spy_path, 'QQQ': qqq_path}
+        }
+    except Exception:
+        pass
+
     # Create feature pipeline
     pipeline = FeaturePipeline(feature_config)
 
@@ -119,6 +123,18 @@ def generate_spy_features(data_path: str, output_path: str, config_path: str = "
 
     print(f"Features shape: {features.shape}")
     print(f"Feature columns: {list(features.columns)}")
+    # Brief feature summary
+    cats = {
+        'VIX base': any(c.startswith('vix_') for c in features.columns),
+        'VIX term-structure': any(c in ('vix_9d_ratio','vix_1m_3m_ratio') for c in features.columns),
+        'SMT vs SPY': 'smt_vs_spy' in features.columns,
+        'SMT SPY-QQQ': 'smt_spy_qqq' in features.columns,
+        'ICT (OR/PDM/disp/FVG)': any(k in features.columns for k in ['dist_orh_bp','dist_orl_bp','dist_pdm_mid','disp_bar','fvg','fvg_density']),
+        'VPA (climax/churn/etc)': any(k in features.columns for k in ['climax_vol','churn','churn_z','imbalance_persist','direction_ema','intrabar_vol'])
+    }
+    print("Feature summary:")
+    for k,v in cats.items():
+        print(f"  - {k}: {'yes' if v else 'no'}")
 
     # Ensure output directory exists
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)

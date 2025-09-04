@@ -107,6 +107,11 @@ class FeaturePipeline:
         self.time_config = config.get('time', {})
         self.normalization_config = config.get('normalization', {})
         self.feature_selection_config = config.get('feature_selection', {})
+        # New feature groups/toggles
+        self.vpa_config = config.get('vpa', {})
+        self.ict_config = config.get('ict', {})
+        self.vol_config = config.get('volatility', {})
+        self.smt_config = config.get('smt', {})
 
         # Data source detection and column mapping
         self.data_source = config.get('data_source', 'auto')
@@ -283,7 +288,7 @@ class FeaturePipeline:
             features = self._normalize_features(features)
 
         # Apply feature selection if configured
-        if self.feature_selection_config:
+        if self.feature_selection_config and 'method' in self.feature_selection_config:
             features = self._select_features(features)
 
         self.is_fitted = True
@@ -319,7 +324,7 @@ class FeaturePipeline:
             features = self._normalize_features(features)
 
         # Apply feature selection if configured
-        if self.feature_selection_config:
+        if self.feature_selection_config and 'method' in self.feature_selection_config:
             features = self._select_features(features)
 
         return features
@@ -514,16 +519,85 @@ class FeaturePipeline:
                 session_features = extract_session_features(data.index)
                 features = pd.concat([features, session_features], axis=1)
         
-        # Add VIX data
+        # Add VIX data and derived features
         if 'vix' in self.config and self.config['vix'].get('enabled', False):
-            vix_path = self.config['vix'].get('path', 'rl-intraday/data/external/vix.parquet')
-            if os.path.exists(vix_path):
-                vix_data = pd.read_parquet(vix_path)
-                # Ensure VIX data is timezone-aware and aligned with features index
-                if not vix_data.index.tz:
-                    vix_data = vix_data.tz_localize('America/New_York')
-                vix_data_resampled = vix_data.reindex(features.index, method='ffill')
-                features = features.join(vix_data_resampled)
+            vix_path = self.config['vix'].get('path', 'data/external/vix.parquet')
+            try:
+                if os.path.exists(vix_path):
+                    vix_df = pd.read_parquet(vix_path)
+                    # Normalize index to NY-tz DatetimeIndex
+                    if not isinstance(vix_df.index, pd.DatetimeIndex):
+                        if 'timestamp' in vix_df.columns:
+                            vix_df.index = pd.to_datetime(vix_df['timestamp'], utc=True, errors='coerce')
+                        else:
+                            vix_df.index = pd.to_datetime(vix_df.index, utc=True, errors='coerce')
+                    if vix_df.index.tz is None:
+                        vix_df.index = vix_df.index.tz_localize('UTC')
+                    vix_df.index = vix_df.index.tz_convert('America/New_York')
+                    vix_df = vix_df.sort_index()
+                    base = vix_df.copy()
+                    # Resolve a close column under various common names
+                    close_col = None
+                    for cand in ['vix_close', 'close', 'Close', 'VIXCLS', 'value']:
+                        if cand in base.columns:
+                            close_col = cand
+                            break
+                    if close_col is not None:
+                        base['vix_close'] = pd.to_numeric(base[close_col], errors='coerce')
+                        base['vix_ret'] = base['vix_close'].pct_change()
+                        base['vix_ma20'] = base['vix_close'].rolling(20, min_periods=5).mean()
+                        base['vix_z20'] = (base['vix_close'] - base['vix_ma20']) / (base['vix_close'].rolling(20, min_periods=5).std() + 1e-9)
+                        keep = [c for c in ['vix_close','vix_ret','vix_ma20','vix_z20'] if c in base.columns]
+                        if keep:
+                            base = base[keep]
+                            base = base.reindex(features.index, method='ffill')
+                            features = features.join(base)
+                    else:
+                        self.logger.info("VIX file found but no recognizable close column; skipping VIX features.")
+                else:
+                    self.logger.info(f"VIX file not found at {vix_path}; skipping VIX features.")
+            except Exception as e:
+                self.logger.warning(f"VIX features join failed: {e}")
+
+        # Volume–Price Analysis (VPA) and ICT-inspired features
+        try:
+            close = data['close']
+            open_ = data['open'] if 'open' in data.columns else data['close'].shift(1)
+            high = data['high'] if 'high' in data.columns else data['close']
+            low = data['low'] if 'low' in data.columns else data['close']
+            vol = data['volume'] if 'volume' in data.columns else pd.Series(0.0, index=data.index)
+
+            tr = (high - low).abs()
+            bar_range = (high - low).replace(0, np.nan)
+            body = (close - open_)
+            # Bar imbalance and effort/result
+            features['bar_imbalance'] = (body / bar_range).clip(-1, 1).fillna(0.0)
+            features['effort_result'] = (tr * vol).fillna(0.0)
+            # Relative volume (simple rolling baseline)
+            rv_window = self.technical_config.get('rvol_window', 390)
+            features['rvol'] = (vol / (vol.rolling(rv_window, min_periods=30).mean() + 1e-9)).fillna(1.0)
+            # Delta volume (up vs down bars)
+            direction = np.sign(close.diff().fillna(0.0))
+            features['delta_vol'] = (direction * vol).fillna(0.0)
+            # Previous day reference levels and distances
+            by_day = data.groupby(data.index.normalize())
+            pdh = by_day['high'].transform('max').shift(1)
+            pdl = by_day['low'].transform('min').shift(1)
+            pdc = by_day['close'].transform('last').shift(1)
+            features['dist_pdh_bp'] = (close - pdh)
+            features['dist_pdl_bp'] = (close - pdl)
+            features['dist_pdc_bp'] = (close - pdc)
+            # Opening range (first 15 mins)
+            minute = data.index.minute + data.index.hour * 60
+            session_start_min = data.index.normalize().map(lambda d: 9*60+30)
+            mins_from_open = minute - session_start_min
+            is_or = (mins_from_open >= 0) & (mins_from_open < 15)
+            or_high = by_day['high'].transform(lambda s: s[is_or.reindex(s.index, fill_value=False)].max())
+            or_low = by_day['low'].transform(lambda s: s[is_or.reindex(s.index, fill_value=False)].min())
+            features['dist_orh_bp'] = (close - or_high)
+            features['dist_orl_bp'] = (close - or_low)
+        except Exception:
+            pass
 
         # Add Volatility of Volatility
         if 'vol_of_vol' in self.config.get('technical', {}) and self.config['technical']['vol_of_vol'].get('enabled', False):
@@ -548,7 +622,203 @@ class FeaturePipeline:
         # Add Fair Value Gaps (FVG)
         if 'fvg' in self.config.get('microstructure', {}) and self.config['microstructure']['fvg'].get('enabled', False):
             features['fvg'] = calculate_fvg(data['high'], data['low'])
+            # Rolling density (shifted to avoid lookahead)
+            try:
+                win = int(self.config.get('microstructure', {}).get('fvg', {}).get('density_window', 50))
+                features['fvg_density'] = features['fvg'].rolling(win, min_periods=1).sum().shift(1)
+            except Exception:
+                pass
+
+        # ICT features
+        try:
+            if self.ict_config.get('enabled', True):
+                # Previous day mid (equilibrium) distance
+                by_day = data.groupby(data.index.normalize())
+                pdh = by_day['high'].transform('max').shift(1)
+                pdl = by_day['low'].transform('min').shift(1)
+                pdm = (pdh + pdl) / 2.0
+                features['dist_pdm_mid'] = (data['close'] - pdm)
+
+                # Opening range distances (first N minutes)
+                or_minutes = int(self.ict_config.get('opening_range_minutes', 15))
+                idx = data.index
+                mins = idx.hour * 60 + idx.minute
+                session_open_min = 9 * 60 + 30
+                in_or = (mins >= session_open_min) & (mins < session_open_min + or_minutes)
+                # Compute per-day ORH/ORL and map back
+                orh = by_day.apply(lambda df: df.loc[in_or[df.index], 'high'].max() if not df.loc[in_or[df.index]].empty else pd.NA)
+                orl = by_day.apply(lambda df: df.loc[in_or[df.index], 'low'].min() if not df.loc[in_or[df.index]].empty else pd.NA)
+                features['dist_orh_bp'] = (data['close'] - idx.normalize().map(orh))
+                features['dist_orl_bp'] = (data['close'] - idx.normalize().map(orl))
+
+                # Displacement bar and density
+                k_atr = float(self.ict_config.get('displacement_k_atr', 1.5))
+                atr_series = features.get('atr', calculate_atr(data['high'], data['low'], data['close']))
+                body = (data['close'] - data['open']).abs()
+                wick = (data['high'] - data['low']) - body
+                disp = (body > k_atr * (atr_series + 1e-9)) & ((wick / (body + 1e-9)) < 1.0)
+                features['disp_bar'] = disp.astype(int)
+                features['disp_density'] = features['disp_bar'].rolling(50, min_periods=1).sum().shift(1)
+        except Exception:
+            pass
+
+        # VPA enhancements
+        try:
+            if self.vpa_config.get('enabled', True):
+                # Climax volume flag via RVOL threshold
+                if 'rvol' in features.columns:
+                    thr = float(self.vpa_config.get('climax_rvol_threshold', 3.0))
+                    features['climax_vol'] = (features['rvol'] >= thr).astype(int)
+
+                # Churn index and z-score
+                tr = (data['high'] - data['low']).abs()
+                churn = (data['volume'] / (tr.replace(0, pd.NA)))
+                features['churn'] = churn.ffill().fillna(0.0).astype(float)
+                zwin = int(self.vpa_config.get('zscore_window', 100))
+                mu = features['churn'].rolling(zwin, min_periods=10).mean()
+                sd = features['churn'].rolling(zwin, min_periods=10).std()
+                features['churn_z'] = ((features['churn'] - mu) / (sd + 1e-9)).fillna(0.0)
+
+                # Imbalance persistence and direction EMA (shifted for causality)
+                ret = data['close'].pct_change().fillna(0.0)
+                sgn = np.sign(ret)
+                persist_win = int(self.vpa_config.get('persistence_window', 10))
+                features['imbalance_persist'] = pd.Series(sgn, index=data.index).rolling(persist_win, min_periods=1).mean().shift(1)
+                span = int(self.vpa_config.get('direction_ema_span', 10))
+                features['direction_ema'] = ret.ewm(span=span, adjust=False).mean().shift(1)
+
+                # Intrabar volatility proxy
+                features['intrabar_vol'] = ((data['high'] - data['low']) / data['close']).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        except Exception:
+            pass
+
+        # ICT: Liquidity pools (equal highs/lows) proximity
+        try:
+            if self.ict_config.get('enabled', True):
+                tol = float(self.ict_config.get('eq_tolerance_bp', 5.0))  # basis points tolerance
+                win = int(self.ict_config.get('eq_window', 50))
+                price = data['close']
+                bps = lambda x: x * 1e-4
+                eq_high = pd.Series(0, index=data.index, dtype=int)
+                eq_low = pd.Series(0, index=data.index, dtype=int)
+                # rolling detection of approximate equal highs/lows
+                roll_high = data['high'].rolling(win, min_periods=5)
+                roll_low = data['low'].rolling(win, min_periods=5)
+                # mark if last two local highs within tolerance
+                last_high = roll_high.max()
+                last_low = roll_low.min()
+                eq_high = ((last_high - data['high']).abs() <= bps(price)).astype(int)
+                eq_low = ((data['low'] - last_low).abs() <= bps(price)).astype(int)
+                features['eq_high_flag'] = eq_high
+                features['eq_low_flag'] = eq_low
+                # distance to last eq high/low levels in price terms
+                last_eq_high = last_high.ffill()
+                last_eq_low = last_low.ffill()
+                features['dist_eq_high'] = (price - last_eq_high).fillna(0.0)
+                features['dist_eq_low'] = (price - last_eq_low).fillna(0.0)
+        except Exception:
+            pass
+
+        # VIX term-structure ratios if provided in VIX parquet
+        try:
+            if 'vix' in self.config and self.config['vix'].get('enabled', False):
+                vix_path = self.config['vix'].get('path', 'data/external/vix.parquet')
+                if os.path.exists(vix_path):
+                    vix_df = pd.read_parquet(vix_path)
+                    if not isinstance(vix_df.index, pd.DatetimeIndex):
+                        if 'timestamp' in vix_df.columns:
+                            vix_df.index = pd.to_datetime(vix_df['timestamp'], utc=True, errors='coerce')
+                        else:
+                            vix_df.index = pd.to_datetime(vix_df.index, utc=True, errors='coerce')
+                    if vix_df.index.tz is None:
+                        vix_df.index = vix_df.index.tz_localize('UTC')
+                    vix_df.index = vix_df.index.tz_convert('America/New_York')
+                    vix_df = vix_df.sort_index()
+                    cols = {c.lower(): c for c in vix_df.columns}
+                    have_9d = cols.get('vix9d') or cols.get('vix_9d')
+                    have_1m = cols.get('vix') or cols.get('vix_1m') or cols.get('close')
+                    have_3m = cols.get('vix3m') or cols.get('vix_3m')
+                    base = pd.DataFrame(index=vix_df.index)
+                    if have_1m:
+                        base['vix_1m'] = pd.to_numeric(vix_df[have_1m], errors='coerce')
+                    if have_9d:
+                        base['vix_9d'] = pd.to_numeric(vix_df[have_9d], errors='coerce')
+                    if have_3m:
+                        base['vix_3m'] = pd.to_numeric(vix_df[have_3m], errors='coerce')
+                    if not base.empty:
+                        if 'vix_9d' in base and 'vix_1m' in base:
+                            base['vix_9d_ratio'] = base['vix_9d'] / (base['vix_1m'] + 1e-9)
+                        if 'vix_1m' in base and 'vix_3m' in base:
+                            base['vix_1m_3m_ratio'] = base['vix_1m'] / (base['vix_3m'] + 1e-9)
+                        base = base.reindex(features.index, method='ffill')
+                        features = features.join(base.drop(columns=[c for c in ['vix_9d','vix_1m','vix_3m'] if c in base.columns]))
+        except Exception:
+            pass
+
+        # SMT divergence features (intermarket divergence). Two modes supported:
+        # 1) vs SPY: compare instrument momentum to SPY momentum
+        # 2) SPY vs QQQ: overall market divergence context
+        try:
+            if self.smt_config.get('enabled', False):
+                mom_span = int(self.smt_config.get('momentum_span', 5))
+                # Helper to load benchmark close series from parquet
+                def _load_close_series(p: str) -> pd.Series:
+                    dfb = pd.read_parquet(p)
+                    idx = dfb.index
+                    if not isinstance(idx, pd.DatetimeIndex):
+                        return pd.Series(dtype=float)
+                    if idx.tz is None:
+                        idx = idx.tz_localize('UTC').tz_convert('America/New_York')
+                    close = dfb['close'] if 'close' in dfb.columns else dfb.iloc[:, 0]
+                    s = pd.Series(close.values, index=idx).sort_index()
+                    return s
+
+                # 1) vs SPY if path provided
+                spy_path = self.smt_config.get('paths', {}).get('SPY')
+                if spy_path and os.path.exists(spy_path):
+                    spy_close = _load_close_series(spy_path)
+                    # align and compute short-horizon momentum (EMA of returns)
+                    spy_ret = spy_close.pct_change().fillna(0.0)
+                    spy_mom = spy_ret.ewm(span=mom_span, adjust=False).mean()
+                    # primary instrument momentum
+                    prim_ret = data['close'].pct_change().fillna(0.0)
+                    prim_mom = prim_ret.ewm(span=mom_span, adjust=False).mean()
+                    spy_mom = spy_mom.reindex(features.index).ffill()
+                    prim_mom = prim_mom.reindex(features.index).ffill()
+                    features['smt_vs_spy'] = (prim_mom - spy_mom).shift(1).fillna(0.0)
+
+                # 2) SPY vs QQQ global divergence if both provided
+                spy_path = self.smt_config.get('paths', {}).get('SPY')
+                qqq_path = self.smt_config.get('paths', {}).get('QQQ')
+                if spy_path and qqq_path and os.path.exists(spy_path) and os.path.exists(qqq_path):
+                    s_spy = _load_close_series(spy_path)
+                    s_qqq = _load_close_series(qqq_path)
+                    r_spy = s_spy.pct_change().fillna(0.0)
+                    r_qqq = s_qqq.pct_change().fillna(0.0)
+                    m_spy = r_spy.ewm(span=mom_span, adjust=False).mean()
+                    m_qqq = r_qqq.ewm(span=mom_span, adjust=False).mean()
+                    m_spy = m_spy.reindex(features.index).ffill()
+                    m_qqq = m_qqq.reindex(features.index).ffill()
+                    features['smt_spy_qqq'] = (m_spy - m_qqq).shift(1).fillna(0.0)
+        except Exception:
+            pass
         
+        # Optional low-variance filter first
+        min_var = float(self.feature_selection_config.get('min_variance', 0.0))
+        if min_var and min_var > 0.0:
+            try:
+                features = self._drop_low_variance(features, min_var)
+            except Exception as e:
+                self.logger.warning(f"Variance filtering skipped: {e}")
+
+        # Optional correlation filtering to reduce redundancy
+        corr_thresh = float(self.feature_selection_config.get('correlation_threshold', 0.0))
+        if corr_thresh and corr_thresh > 0.0:
+            try:
+                features = self._drop_highly_correlated(features, corr_thresh)
+            except Exception as e:
+                self.logger.warning(f"Correlation filtering skipped: {e}")
+
         self.logger.info("Extracted %d features", len(features.columns))
 
         # Note: Warmup bars are kept to maintain alignment with OHLCV data
@@ -557,6 +827,33 @@ class FeaturePipeline:
         # features = features.iloc[max_lb:].copy()
 
         return features
+
+    def _drop_highly_correlated(self, features: pd.DataFrame, threshold: float = 0.95) -> pd.DataFrame:
+        """Drop one of each pair of features whose absolute correlation exceeds threshold.
+
+        Keeps earlier columns; removes later ones among highly correlated pairs.
+        """
+        if features.empty:
+            return features
+        X = features.select_dtypes(include=[np.number]).copy()
+        # Fill NaNs to compute corr
+        X = X.ffill().bfill()
+        corr = X.corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+        pruned = features.drop(columns=[c for c in to_drop if c in features.columns])
+        self.logger.info("Correlation filter dropped %d features (threshold=%.2f)", len(to_drop), threshold)
+        return pruned
+
+    def _drop_low_variance(self, features: pd.DataFrame, min_var: float = 1e-8) -> pd.DataFrame:
+        """Drop numeric features with variance below min_var."""
+        X = features.select_dtypes(include=[np.number])
+        variances = X.var()
+        to_keep = variances[variances >= min_var].index.tolist()
+        dropped = [c for c in X.columns if c not in to_keep]
+        pruned = features.drop(columns=dropped)
+        self.logger.info("Variance filter dropped %d features (min_var=%.2e)", len(dropped), min_var)
+        return pruned
 
     def _normalize_features(self, features: pd.DataFrame) -> pd.DataFrame:
         """

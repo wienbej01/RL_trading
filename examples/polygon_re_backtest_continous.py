@@ -15,7 +15,7 @@ Usage:
     --symbol SPY \
     --start-date 2024-01-01 \
     --end-date 2024-06-30 \
-    --model-path rl-intraday/models/trained_model.zip \
+    --model-path models/trained_model \
     --continuous \
     --plot
 """
@@ -31,6 +31,7 @@ from typing import List
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 # Ensure src is on sys.path (same as original)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -199,7 +200,8 @@ def _manual_load_polygon_raw(
                 parts.append(df_part)
         except Exception as ex:
             bad += 1
-            logger.warning("RAW: failed to load %s: %s", path, ex)
+            # Demote to debug to avoid noisy logs; count is summarized later
+            logger.debug("RAW: failed to load %s: %s", path, ex)
 
     if not parts:
         logger.info("RAW: loaded 0/%d partitions (bad=%d) -> empty frame", total, bad)
@@ -259,6 +261,8 @@ def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFra
     cache_name = f"{symbol.upper()}_{s.strftime('%Y%m%d')}_{end_plus}_ohlcv_1min.parquet"
     cache_path = cache_dir / cache_name
 
+    rebuilt_cache_flag = {"rebuilt": False}
+
     def _fallback_from_raw_and_refresh_cache() -> pd.DataFrame:
         """RAW fallback + rebuild cache if we got data."""
         df_raw = _manual_load_polygon_raw(settings, symbol, s, e)
@@ -267,11 +271,36 @@ def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFra
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 df_raw.to_parquet(cache_path)
                 logger.info(f"Rebuilt cache at {cache_path} with {len(df_raw)} rows")
+                rebuilt_cache_flag["rebuilt"] = True
             except Exception as ce:
                 logger.warning(f"Failed to rebuild cache {cache_path}: {ce}")
         else:
             logger.info("RAW fallback produced empty frame.")
         return df_raw
+
+    def _fallback_from_polygon_plus() -> pd.DataFrame:
+        """Try to load from upgraded US stocks directory data/polygon_plus/us_stocks/aggregates."""
+        try:
+            base = Path(settings.get("paths", "data_root", default="data"))
+        except Exception:
+            base = Path("data")
+        root = base / "polygon_plus" / "us_stocks" / "aggregates" / f"symbol={symbol}"
+        if not root.exists():
+            return pd.DataFrame()
+        parts = []
+        for p in sorted(root.glob("year=*/month=*/day=*/data.parquet")):
+            try:
+                dfp = pd.read_parquet(p)
+                dfp = _normalize_timestamp_column(dfp)
+                mask = (dfp.index >= s) & (dfp.index < (e + pd.Timedelta(days=1)))
+                dfp = dfp.loc[mask]
+                if not dfp.empty:
+                    parts.append(dfp)
+            except Exception:
+                continue
+        if not parts:
+            return pd.DataFrame()
+        return _sanitize_ohlcv(pd.concat(parts, axis=0))
 
     try:
         df = loader.load_ohlcv(
@@ -293,6 +322,55 @@ def load_polygon_data(symbol: str, start_date: str, end_date: str) -> pd.DataFra
             except Exception as ue:
                 logger.warning(f"Failed to unlink stale cache {cache_path}: {ue}")
             df = _fallback_from_raw_and_refresh_cache()
+            if (df is None or df.empty):
+                # Try upgraded polygon_plus directory
+                df = _fallback_from_polygon_plus()
+            if (df is None or df.empty):
+                # As last resort, try an aggregated raw parquet under data/raw/<SYMBOL>_1min.parquet
+                agg_path = Path("data/raw") / f"{symbol.upper()}_1min.parquet"
+                if agg_path.exists():
+                    try:
+                        df = pd.read_parquet(agg_path)
+                        df = _normalize_timestamp_column(df)
+                        df = df.loc[(df.index >= s) & (df.index <= e)]
+                        logger.info(f"Loaded aggregated raw {agg_path} rows={len(df)}")
+                    except Exception as ex:
+                        logger.warning(f"Failed to load aggregated raw {agg_path}: {ex}")
+
+        # Coverage check: if cached range ends significantly before the requested end, rebuild from RAW
+        if df is not None and not df.empty and not rebuilt_cache_flag["rebuilt"]:
+            try:
+                tz = "America/New_York"
+                last_ts = df.index.max().tz_convert(tz) if df.index.tz is not None else df.index.max().tz_localize(tz)
+                # Accept that the end day may be a weekend/holiday -> require coverage to at least end-3 days
+                if last_ts.date() < (e.tz_localize(tz) if e.tz is None else e.tz_convert(tz)).date() - pd.Timedelta(days=3):
+                    logger.warning(
+                        f"Cache seems stale (last={last_ts.date()} << end={e.date()}); rebuilding from RAW."
+                    )
+                    try:
+                        if cache_path.exists():
+                            cache_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    df = _fallback_from_raw_and_refresh_cache()
+            except Exception as ce:
+                logger.warning(f"Coverage check skipped: {ce}")
+
+        # Daily coverage report (handles early closes)
+        try:
+            import pandas_market_calendars as mcal
+            nyse = mcal.get_calendar("XNYS")
+            sched = nyse.schedule(start_date=s.date(), end_date=e.date())
+            trading_days = pd.to_datetime(sched.index).tz_localize("America/New_York")
+            counts = df.groupby(df.index.normalize()).size()
+            full_days = int((counts >= 375).sum())
+            early_days = int(((counts < 375) & (counts >= 180)).sum())
+            missing_days = int(len(trading_days) - counts.index.isin(trading_days).sum())
+            logger.info(
+                f"Coverage: days={len(trading_days)} full={full_days} early={early_days} missing~={missing_days}"
+            )
+        except Exception:
+            pass
 
         logger.info(f"Loaded {len(df)} records for {symbol}")
         return df
@@ -337,7 +415,11 @@ def create_feature_pipeline() -> FeaturePipeline:
             'calculate_bollinger_bands': True,
             'bollinger_window': 20,
             'calculate_stochastic': True,
-            'calculate_williams_r': True
+            'calculate_williams_r': True,
+            'rvol_window': 390,
+            'vol_of_vol': {'enabled': True, 'window': 14, 'vol_window': 14},
+            'sma_slope': {'enabled': True, 'window': 20, 'slope_window': 5},
+            'obv': {'enabled': True}
         },
         'microstructure': {
             'calculate_spread': True,
@@ -345,13 +427,16 @@ def create_feature_pipeline() -> FeaturePipeline:
             'calculate_queue_imbalance': True,
             'calculate_vwap': True,
             'calculate_twap': True,
-            'calculate_price_impact': True
+            'calculate_price_impact': True,
+            'fvg': {'enabled': True}
         },
         'time': {
             'extract_time_of_day': True,
             'extract_day_of_week': True,
             'extract_session_features': True
         },
+        'vix': {'enabled': True, 'path': 'data/external/vix.parquet', 'term_structure': False},
+        'feature_selection': { 'correlation_threshold': 0.95 },
         'polygon': {
             'features': {
                 'use_vwap_column': True
@@ -511,7 +596,7 @@ def _apply_rth_resample_prune(df: pd.DataFrame, settings: "Settings") -> pd.Data
     return out
 
 
-def run_backtest_simulation(env, model, episodes: int = 5) -> dict:
+def run_backtest_simulation(env, model, episodes: int = 5, total_steps_hint: int | None = None) -> dict:
     """
     Run an episodic backtest for `episodes` episodes.
 
@@ -535,6 +620,7 @@ def run_backtest_simulation(env, model, episodes: int = 5) -> dict:
             raise RuntimeError("Unknown env.step(...) return signature")
 
     ep_summaries = []
+    overall_action_hist = {0: 0, 1: 0, 2: 0}
 
     for ep in range(1, int(episodes) + 1):
         # Reset per episode
@@ -558,25 +644,54 @@ def run_backtest_simulation(env, model, episodes: int = 5) -> dict:
         steps = 0
         done = False
         last_equity = float(initial_equity)
+        # Recurrent state handling
+        state = None
+        episode_start = np.ones((1,), dtype=bool)
+        # Action histogram for debugging
+        action_counts = {0: 0, 1: 0, 2: 0}
 
+        pbar = tqdm(total=total_steps_hint, desc=f"Episode {ep}", unit="step", disable=(total_steps_hint is None))
         while not done:
             # Model action (deterministic during evaluation)
             if hasattr(model, "predict"):
-                action, _ = model.predict(obs, deterministic=True)
+                action, state = model.predict(
+                    obs, state=state, episode_start=episode_start, deterministic=True
+                )
             else:
                 action = 0  # hold/no-op fallback
 
             obs, reward, done, info = _step_unpack(env.step(action))
             steps += 1
-            rewards.append(float(reward))
+            
+            # Flatten vectorized outputs (VecNormalize/DummyVecEnv) to single-env scalars
+            import numpy as _np
+            reward_scalar = float(_np.asarray(reward).reshape(-1)[0]) if reward is not None else 0.0
+            done_scalar = bool(_np.asarray(done).reshape(-1)[0]) if done is not None else False
+            if isinstance(info, (list, tuple)):
+                info = info[0] if len(info) > 0 else {}
+            rewards.append(reward_scalar)
 
-            eq = info.get("equity", last_equity)
+            # Track action frequency
+            try:
+                act_scalar = int(_np.asarray(action).reshape(-1)[0])
+                if act_scalar in action_counts:
+                    action_counts[act_scalar] += 1
+            except Exception:
+                pass
+
+            eq = info.get("equity", last_equity) if isinstance(info, dict) else last_equity
             try:
                 eq = float(eq)
             except Exception:
                 eq = last_equity
             equities.append(eq)
             last_equity = eq
+
+            done = done_scalar
+            episode_start = _np.asarray(done).reshape(-1).astype(bool)
+            if total_steps_hint is not None:
+                pbar.update(1)
+        pbar.close()
 
         total_reward = float(np.nansum(rewards)) if rewards else 0.0
         final_equity = float(equities[-1]) if equities else float(initial_equity)
@@ -590,8 +705,12 @@ def run_backtest_simulation(env, model, episodes: int = 5) -> dict:
                 "return": ep_return,
                 "final_equity": final_equity,
                 "equity_series": equities,  # optional for plotting
+                "action_hist": dict(action_counts),
             }
         )
+        # Aggregate
+        for k in overall_action_hist:
+            overall_action_hist[k] += action_counts.get(k, 0)
 
     # Aggregate metrics
     rewards_arr = np.array([e["reward"] for e in ep_summaries], dtype=float) if ep_summaries else np.array([0.0])
@@ -604,6 +723,7 @@ def run_backtest_simulation(env, model, episodes: int = 5) -> dict:
         "win_rate": float(np.mean(returns_arr > 0.0)) if ep_summaries else 0.0,
         "total_return": float(np.nanmean(returns_arr)),  # average return across episodes
         "total_steps": steps_sum,
+        "action_hist": overall_action_hist,
     }
 
     # Try to close env neatly
@@ -615,7 +735,7 @@ def run_backtest_simulation(env, model, episodes: int = 5) -> dict:
     return results
 
 
-def run_continuous_backtest(env, model) -> dict:
+def run_continuous_backtest(env, model, total_steps_hint: int | None = None) -> dict:
     """
     Run a single continuous backtest over the entire dataset exposed by `env`.
 
@@ -660,30 +780,58 @@ def run_continuous_backtest(env, model) -> dict:
     rewards = []
     steps = 0
     equities = []
+    # Recurrent state handling
+    state = None
+    episode_start = np.ones((1,), dtype=bool)
+    # Action histogram for debugging
+    action_counts = {0: 0, 1: 0, 2: 0}
 
     done = False
     last_equity = float(initial_equity)
 
+    pbar = tqdm(total=total_steps_hint, desc="Backtest", unit="step", disable=(total_steps_hint is None))
     while not done:
         # Model action (deterministic for eval)
         if hasattr(model, "predict"):
-            action, _ = model.predict(obs, deterministic=True)
+            action, state = model.predict(
+                obs, state=state, episode_start=episode_start, deterministic=True
+            )
         else:
             # Fallback: hold/no-op if model interface is different
             action = 0
 
         obs, reward, done, info = _step_unpack(env.step(action))
         steps += 1
-        rewards.append(float(reward))
+
+        # Flatten vectorized outputs (VecNormalize/DummyVecEnv) to single-env scalars
+        import numpy as _np
+        reward_scalar = float(_np.asarray(reward).reshape(-1)[0]) if reward is not None else 0.0
+        done_scalar = bool(_np.asarray(done).reshape(-1)[0]) if done is not None else False
+        if isinstance(info, (list, tuple)):
+            info = info[0] if len(info) > 0 else {}
+        rewards.append(reward_scalar)
+        # Track action frequency
+        try:
+            act_scalar = int(_np.asarray(action).reshape(-1)[0])
+            if act_scalar in action_counts:
+                action_counts[act_scalar] += 1
+        except Exception:
+            pass
 
         # Track equity if provided; otherwise carry forward last known value
-        eq = info.get("equity", last_equity)
+        eq = info.get("equity", last_equity) if isinstance(info, dict) else last_equity
         try:
             eq = float(eq)
         except Exception:
             eq = last_equity
         equities.append(eq)
         last_equity = eq
+
+        done = done_scalar
+        episode_start = _np.asarray(done).reshape(-1).astype(bool)
+        if total_steps_hint is not None:
+            pbar.update(1)
+    pbar.close()
 
     # Final stats
     total_reward = float(np.nansum(rewards)) if rewards else 0.0
@@ -712,6 +860,7 @@ def run_continuous_backtest(env, model) -> dict:
         "win_rate": 1.0 if total_return > 0 else 0.0,
         "total_return": total_return,
         "total_steps": steps,
+        "action_hist": {k: int(v) for k, v in action_counts.items()},
     }
 
     # Best effort to close the env if it exposes close()
@@ -880,6 +1029,8 @@ def main():
     parser.add_argument('--model-path', type=str, help='Path to the trained model (Stable-Baselines3)')
     parser.add_argument('--continuous', action='store_true',
                         help='Run a single continuous backtest over the entire date range')
+    parser.add_argument('--features-path', type=str, default=None,
+                        help='Optional path to features parquet used during training; if provided, backtest will use it instead of recomputing features')
     args = parser.parse_args()
 
     print(f"RL Backtest Example - {args.symbol}")
@@ -906,9 +1057,36 @@ def main():
         # 2) Feature Engineering
         # ---------------------------
         print("Creating features...")
-        pipeline = create_feature_pipeline()
-        features = pipeline.fit_transform(ohlcv_data)
-        print(f"Created {len(features.columns)} features")
+        from pathlib import Path as _P
+        features = None
+        if args.features_path and _P(args.features_path).exists():
+            try:
+                X = pd.read_parquet(args.features_path)
+                # Normalize timestamp handling similar to training
+                if 'timestamp' in X.columns:
+                    tx = pd.to_datetime(X['timestamp'], utc=True, errors='coerce')
+                    X = X.loc[tx.notna()].copy()
+                    X['timestamp'] = tx
+                    X = X.sort_values('timestamp').set_index('timestamp')
+                else:
+                    if not isinstance(X.index, pd.DatetimeIndex):
+                        idx = pd.to_datetime(X.index, utc=True, errors='coerce', unit='ms')
+                        X = X.loc[idx.notna()].copy()
+                        X.index = idx[idx.notna()]
+                    if X.index.tz is None:
+                        X.index = X.index.tz_localize('UTC')
+                    X = X.sort_index()
+                X.index = X.index.tz_convert('America/New_York')
+                # Align to OHLCV index
+                features = X.reindex(ohlcv_data.index).ffill().bfill()
+                print(f"Loaded features from {args.features_path} with {features.shape[1]} columns")
+            except Exception as ex:
+                logger.warning(f"Failed to load features from {args.features_path}: {ex}. Recomputing instead.")
+
+        if features is None:
+            pipeline = create_feature_pipeline()
+            features = pipeline.fit_transform(ohlcv_data)
+            print(f"Created {len(features.columns)} features")
         print()
 
         # --------------------------------
@@ -928,7 +1106,8 @@ def main():
             ohlcv=ohlcv_data,
             features=features,
             cash=100000.0,
-            point_value=pv
+            point_value=pv,
+            config=settings.to_dict()
         )
         print("Environment initialized successfully")
         print(f"Usable bars in env: {len(ohlcv_data)}")
@@ -942,21 +1121,48 @@ def main():
         model = None
         if args.model_path:
             print(f"Loading model from {args.model_path}")
-            from stable_baselines3 import PPO
+            from sb3_contrib import RecurrentPPO
             from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-            model = PPO.load(args.model_path)
+            def _resolve_model_path(mp: str) -> Path:
+                p = Path(mp)
+                candidates = []
+                # As provided
+                candidates.append(p)
+                # With .zip extension
+                if p.suffix != ".zip":
+                    candidates.append(p.with_suffix(".zip"))
+                # Relative to project root (this file is <repo>/rl-intraday/examples/...)
+                repo_root = Path(__file__).resolve().parents[1]
+                for c in list(candidates):
+                    if not Path(c).is_absolute():
+                        candidates.append(repo_root / c)
+                # Strip accidental 'rl-intraday/' prefix if cwd is already repo root
+                if str(p).startswith("rl-intraday/"):
+                    stripped = str(p).split("rl-intraday/", 1)[1]
+                    sp = Path(stripped)
+                    candidates.append(repo_root / sp)
+                    if sp.suffix != ".zip":
+                        candidates.append((repo_root / sp).with_suffix('.zip'))
+                for c in candidates:
+                    if Path(c).exists():
+                        return Path(c)
+                raise FileNotFoundError(f"Model file not found for '{mp}'. Tried: " + ", ".join(str(c) for c in candidates))
 
-            # Load VecNormalize statistics if they exist
-            vec_normalize_path = Path(args.model_path).parent / "vecnormalize.pkl"
+            model_path = _resolve_model_path(args.model_path)
+            model = RecurrentPPO.load(str(model_path))
+
+            # Load VecNormalize statistics if they exist next to the model
+            vec_normalize_path = model_path.parent / "vecnormalize.pkl"
             if vec_normalize_path.exists():
-                print(f"Loading VecNormalize statistics from {vec_normalize_path}")
-                vec_env = DummyVecEnv([lambda: env])
-                vec_env = VecNormalize.load(str(vec_normalize_path), vec_env)
-                # Important: set training to False to avoid updating running stats
-                vec_env.training = False
-                # Update the environment
-                env = vec_env
+                try:
+                    print(f"Loading VecNormalize statistics from {vec_normalize_path}")
+                    vec_env = DummyVecEnv([lambda: env])
+                    vec_env = VecNormalize.load(str(vec_normalize_path), vec_env)
+                    vec_env.training = False  # do not update running stats at test time
+                    env = vec_env
+                except Exception as ex:
+                    logger.warning(f"Failed to load VecNormalize stats: {ex}. Proceeding without normalization.")
 
         if model is None:
             raise ValueError("A trained model must be provided via --model-path")
@@ -966,9 +1172,9 @@ def main():
         # ---------------------------
         print("Running backtest simulation...")
         if args.continuous:
-            results = run_continuous_backtest(env, model)
+            results = run_continuous_backtest(env, model, total_steps_hint=len(ohlcv_data))
         else:
-            results = run_backtest_simulation(env, model, args.episodes)
+            results = run_backtest_simulation(env, model, args.episodes, total_steps_hint=len(ohlcv_data))
         print()
 
         # ---------------------------

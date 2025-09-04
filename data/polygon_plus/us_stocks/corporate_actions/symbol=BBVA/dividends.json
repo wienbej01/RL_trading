@@ -1,0 +1,1 @@
+400, message='Bad Request', url='https://api.polygon.io/v3/reference/dividends?apiKey=ZBxeJYOn0_e0UcPgEYLA90CQ9S28_EfU&ticker=BBVA&limit=5000'

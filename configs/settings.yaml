@@ -54,6 +54,11 @@ features:
     bollinger_window: 20
     calculate_stochastic: true
     calculate_williams_r: true
+    # Additional intraday/VPA-style knobs
+    rvol_window: 390
+    vol_of_vol: { enabled: true, window: 14, vol_window: 14 }
+    sma_slope: { enabled: true, window: 20, slope_window: 5 }
+    obv: { enabled: true }
   microstructure:
     calculate_spread: true
     calculate_microprice: true
@@ -61,10 +66,34 @@ features:
     calculate_vwap: true
     calculate_twap: true
     calculate_price_impact: true
+    fvg: { enabled: true }
   time:
     extract_time_of_day: true
     extract_day_of_week: true
     extract_session_features: true
+  vix:
+    enabled: true
+    path: data/external/vix.parquet
+    term_structure: false
+  # New feature groups
+  vpa:
+    enabled: true
+    climax_rvol_threshold: 3.0
+    zscore_window: 100
+    persistence_window: 10
+    direction_ema_span: 10
+  ict:
+    enabled: true
+    opening_range_minutes: 15
+    displacement_k_atr: 1.5
+  volatility:
+    enabled: true
+  smt:
+    enabled: true
+    momentum_span: 5
+    paths:
+      SPY: data/raw/SPY_1min.parquet
+      QQQ: data/raw/QQQ_1min.parquet
   polygon:
     features:
       use_vwap_column: true
@@ -92,26 +121,40 @@ risk:
 env:
   step_seconds: 60
   reward:
-    kind: "dsr"               # differential sharpe
+    kind: "blend"             # blend of DSR and raw pnl with penalties
     dd_penalty: 0.1
     eod_inventory_penalty: 0.5
+    alpha: 0.5   # DSR weight
+    beta: 0.5    # raw pnl weight
+    micro_penalty: 0.001
+  trading:
+    no_trade_open_minutes: 5
+    no_trade_close_minutes: 5
+    widen_spread_minutes: 15
 
 train:
   algo: "ppo_lstm"
-  total_steps: 100000
-  batch_size: 2048
+  total_steps: 300000
+  batch_size: 1024
   learning_rate: 1.0e-4
-  n_envs: 1
-  gamma: 0.99
-  gae_lambda: 0.95
+  n_envs: 8
+  gamma: 0.995
+  gae_lambda: 0.97
   clip_range: 0.2
   vf_coef: 0.5
-  ent_coef: 0.0
-  n_steps: 2048
+  ent_coef: 0.005
+  n_steps: 1024
+  target_kl: 0.03
   policy_kwargs:
     lstm_hidden_size: 128
     net_arch_pi: [128, 64]
     net_arch_vf: [128, 64]
+  torch_threads: 1
+  device: cpu
+  # Feature selection and pruning
+  feature_selection:
+    correlation_threshold: 0.95
+    min_variance: 1.0e-10
 
 walkforward:
   train_days: 30

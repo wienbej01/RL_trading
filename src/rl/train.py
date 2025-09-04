@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import logging
 from datetime import datetime, timedelta
+import re
 
-from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 # from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 
@@ -31,6 +32,12 @@ from ..sim.execution import ExecParams
 
 
 logger = get_logger(__name__)
+
+
+def _make_env_worker(config_path: str, data_path: str, features_path: str):
+    """Top-level factory for SubprocVecEnv picklability."""
+    settings = Settings.from_yaml(config_path)
+    return build_env(settings, data_path, features_path)
 
 
 class RLTrainer:
@@ -49,7 +56,7 @@ class RLTrainer:
         self.training_config = TrainingConfig()
         self.model = None
         
-    def train(self, data_path: str, features_path: str, model_path: str) -> PPO:
+    def train(self, data_path: str, features_path: str, model_path: str) -> RecurrentPPO:
         """
         Train RL model.
         
@@ -96,7 +103,7 @@ class RLTrainer:
     
     def load_model(self, path: str):
         """Load trained model."""
-        self.model = PPO.load(path)
+        self.model = RecurrentPPO.load(path)
 
 
 class TrainingConfig:
@@ -299,7 +306,7 @@ def train_ppo_lstm(settings: Settings,
                   data_path: str, 
                   features_path: str,
                   model_path: str,
-                  training_config: TrainingConfig) -> PPO:
+                  training_config: TrainingConfig) -> RecurrentPPO:
     """
     Train PPO-LSTM model.
     
@@ -315,18 +322,31 @@ def train_ppo_lstm(settings: Settings,
     """
     logger.info("Starting PPO-LSTM training...")
     
-    # Set random seeds
+    # Set random seeds (avoid CUDA calls if CPU-only)
     np.random.seed(training_config.seed)
     torch.manual_seed(training_config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(training_config.seed)
     
-    # Build environment
+    # Build one environment (for single-env fallback)
     env = build_env(settings, data_path, features_path)
     
-    # Create vectorized environment
+    # Create vectorized environment (support multi-env with subprocess workers)
     from stable_baselines3.common.vec_env import VecNormalize
-    vec_env = DummyVecEnv([lambda: env])
+    n_envs = int(settings.get("train", "n_envs", default=1))
+    if n_envs > 1:
+        # Use SubprocVecEnv for parallel env stepping; pass config path for picklable factory
+        try:
+            from functools import partial
+            config_path = settings.meta.get("config_file") if hasattr(settings, "meta") else "configs/settings.yaml"
+            env_fn = partial(_make_env_worker, config_path, data_path, features_path)
+            vec_env = make_vec_env(env_fn, n_envs=n_envs, vec_env_cls=SubprocVecEnv)
+            logger.info(f"Using SubprocVecEnv with n_envs={n_envs}")
+        except Exception as e:
+            # Fallback to DummyVecEnv replication
+            logger.warning(f"SubprocVecEnv init failed ({e}); falling back to DummyVecEnv x{n_envs}")
+            vec_env = DummyVecEnv([lambda: build_env(settings, data_path, features_path) for _ in range(n_envs)])
+    else:
+        vec_env = DummyVecEnv([lambda: env])
+        logger.info("Using DummyVecEnv with n_envs=1")
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.)
     
     # Policy configuration
@@ -346,8 +366,26 @@ def train_ppo_lstm(settings: Settings,
         enable_critic_lstm=True,
     )
     
-    # Create PPO model
-    model = PPO(
+    # Resolve device (avoid CUDA/NVML queries when user forces CPU)
+    desired_device = str(getattr(training_config, 'device', 'auto'))
+    if desired_device == 'cpu':
+        effective_device = 'cpu'
+        logger.info("Using device=cpu (CUDA checks skipped)")
+    else:
+        auto_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        effective_device = auto_device if desired_device == 'auto' else desired_device
+        logger.info(
+            f"Torch CUDA available={torch.cuda.is_available()} | torch.cuda.device_count={torch.cuda.device_count()} | device={effective_device}"
+        )
+        # Only seed CUDA if we are actually using it
+        if effective_device == 'cuda':
+            try:
+                torch.cuda.manual_seed_all(training_config.seed)
+            except Exception:
+                pass
+
+    # Create RecurrentPPO model with LSTM policy
+    model = RecurrentPPO(
         'MlpLstmPolicy',
         vec_env,
         learning_rate=training_config.learning_rate,
@@ -363,20 +401,33 @@ def train_ppo_lstm(settings: Settings,
         target_kl=training_config.target_kl,
         tensorboard_log=training_config.tensorboard_log,
         policy_kwargs=policy_kwargs,
-        device=training_config.device,
+        device=effective_device,
         verbose=training_config.verbose,
         seed=training_config.seed
     )
+    
+    # Hint to PyTorch for small-CPU + GPU setups
+    try:
+        torch.set_num_threads(int(settings.get("train", "torch_threads", default=1)))
+    except Exception:
+        pass
     
     # Create callback
     callback = TrainingCallback(verbose=training_config.verbose)
     
     # Train model
-    total_steps = settings.get("train", "total_steps", default=1_200_000)
+    # Ensure integer type even if YAML has comments/strings like "10000#100000"
+    _raw_steps = settings.get("train", "total_steps", default=1_200_000)
+    if isinstance(_raw_steps, (int, np.integer)):
+        total_steps = int(_raw_steps)
+    else:
+        m = re.search(r"[-+]?\d+", str(_raw_steps))
+        total_steps = int(m.group()) if m else 1_200_000
     model.learn(
         total_timesteps=total_steps,
         callback=callback,
-        log_interval=1000
+        log_interval=1000,
+        progress_bar=True
     )
     
     # Save model
@@ -391,7 +442,7 @@ def train_ppo_lstm(settings: Settings,
     return model
 
 
-def evaluate_model(model: PPO, env: DummyVecEnv, num_episodes: int = 5) -> Dict[str, float]:
+def evaluate_model(model: RecurrentPPO, env: DummyVecEnv, num_episodes: int = 5) -> Dict[str, float]:
     """
     Evaluate trained model.
     
@@ -411,18 +462,21 @@ def evaluate_model(model: PPO, env: DummyVecEnv, num_episodes: int = 5) -> Dict[
     
     for episode in range(num_episodes):
         obs = env.reset()
-        done = False
-        episode_reward = 0
+        state = None
+        episode_start = np.ones((env.num_envs,), dtype=bool)
+        done = np.array([False])
+        episode_reward = 0.0
         episode_length = 0
-        
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
+
+        while not done.all():
+            action, state = model.predict(
+                obs, state=state, episode_start=episode_start, deterministic=True
+            )
             obs, reward, done, info = env.step(action)
-            episode_reward += reward
+            episode_start = done
+            episode_reward += float(np.array(reward).sum())
             episode_length += 1
-        
-        episode_rewards.append(episode_reward)
-        episode_lengths.append(episode_length)
+
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
         equity_curves.append(env.envs[0].get_equity_curve())
@@ -555,7 +609,7 @@ def walk_forward_training(settings: Settings,
         )
         
         # Load trained model
-        model = PPO.load(str(model_path))
+        model = RecurrentPPO.load(str(model_path))
         
         # Evaluate on test set
         test_env = build_env(settings, str(fold_dir / "test_data.parquet"), str(fold_dir / "test_features.parquet"))
@@ -590,9 +644,10 @@ def main():
     """Main training script."""
     parser = argparse.ArgumentParser(description="Train PPO-LSTM trading model")
     parser.add_argument("--config", default="configs/settings.yaml", help="Configuration file")
+    parser.add_argument("--ticker", type=str, default=None, help="Ticker symbol for naming outputs (e.g., SPY, BBVA)")
     parser.add_argument("--data", required=True, help="Path to training data")
     parser.add_argument("--features", required=True, help="Path to features")
-    parser.add_argument("--output", default="models/trained_model", help="Output model path")
+    parser.add_argument("--output", default=None, help="Output model path (defaults to models/<TICKER>_trained_model if --ticker set)")
     parser.add_argument("--walkforward", action="store_true", help="Perform walk-forward training")
     parser.add_argument("--wf-output", default="runs/walkforward", help="Walk-forward output directory")
     parser.add_argument("--eval", action="store_true", help="Evaluate trained model")
@@ -614,7 +669,17 @@ def main():
     training_config.vf_coef = float(settings.get("train", "vf_coef", default=0.5))
     training_config.ent_coef = float(settings.get("train", "ent_coef", default=0.0))
     training_config.verbose = int(settings.get("train", "verbose", default=1))
+    # Device selection (cpu/auto)
+    try:
+        training_config.device = str(settings.get("train", "device", default="auto"))
+    except Exception:
+        training_config.device = "auto"
     
+    # Resolve default output path using ticker if not provided
+    if args.output is None:
+        default_out = f"models/{args.ticker}_trained_model" if args.ticker else "models/trained_model"
+        args.output = default_out
+
     # Perform training
     if args.walkforward:
         # Walk-forward training

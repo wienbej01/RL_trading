@@ -394,7 +394,7 @@ def _postprocess_df(self, df: pd.DataFrame) -> pd.DataFrame:
 
     # Set DatetimeIndex with proper timezone conversion
     df = df.sort_values(ts_col)
-    df = df.set_index(ts_col)
+        df = df.set_index(ts_col)
     
     try:
         df.index = df.index.tz_convert("America/New_York")
@@ -500,8 +500,61 @@ Planned improvements to the DatetimeIndex handling system:
 This DatetimeIndex fix ensures that all temporal data in the RL trading system maintains consistency and reliability, which is critical for generating accurate trading signals and maintaining system integrity.
 
 ## Conclusion
-=======
-## Conclusion
->>>>>>> REPLACE
-]]>
+
 For any questions or issues related to configuration handling, please refer to the test cases in `tests/test_config_loader.py` and `tests/test_simulation.py` for examples of proper usage.
+
+## Training Configuration Keys (CPU Parallelism)
+
+The trainer reads several keys under `train:` in `configs/settings.yaml`:
+
+- `n_envs` (int): Number of parallel environments. Use 6–8 to saturate an 8‑core CPU.
+- `n_steps` (int): Rollout length per env. 512–1024 recommended for PPO.
+- `batch_size` (int): Minibatch size used in PPO updates (sampled from rollouts).
+- `device` (str): `cpu`|`auto`. Use `cpu` to skip CUDA checks and avoid NVML warnings.
+- `torch_threads` (int): Torch intraop threads; set to 1 to reduce contention.
+- `feature_selection.correlation_threshold` (float): Drop highly correlated features above this absolute correlation.
+- `features.vix.path` (str): Path to a VIX parquet file (optional); the pipeline will forward‑fill daily features to minute cadence.
+
+Example:
+
+```yaml
+train:
+  n_envs: 8
+  n_steps: 512
+  batch_size: 1024
+  device: cpu
+  torch_threads: 1
+feature_selection:
+  correlation_threshold: 0.95
+features:
+  vix:
+    enabled: true
+    path: data/external/vix.parquet
+```
+
+## US Stocks Downloader (Upgraded Polygon)
+
+New script: `scripts/collect_polygon_us_stocks.py`
+
+- Parallel async fetch with configurable concurrency
+- Supports minute aggregates, reference, fundamentals, corporate actions, and snapshots
+- Output layout under `data/polygon_plus/us_stocks/`
+- Use `scripts/aggregate_us_stock_data.py` to build a single training Parquet per ticker.
+
+Example commands:
+
+```bash
+export POLYGON_API_KEY=YOUR_KEY
+python scripts/collect_polygon_us_stocks.py \
+  --tickers BBVA \
+  --start-date 2020-01-01 --end-date 2025-09-04 \
+  --types aggregates fundamentals reference corp_actions snapshot \
+  --concurrency 20
+
+python scripts/aggregate_us_stock_data.py --ticker BBVA --start-date 2020-01-01 --end-date 2025-09-04
+
+python scripts/generate_spy_features.py \
+  --data data/raw/BBVA_1min.parquet \
+  --output data/features/BBVA_features.parquet \
+  --config configs/settings.yaml
+```

@@ -36,6 +36,61 @@ rl-intraday/
 ├── notebooks/         # Research and analysis notebooks
 └── models/           # Trained model storage
 ```
+## 📈 US Stocks (Polygon) — Data + Training
+
+This repo now supports high‑throughput US stocks collection for upgraded Polygon subscriptions while keeping the original downloader for other asset classes (forex, futures, indices, options).
+
+Key scripts and usage:
+- Collect US stocks (minute aggregates, reference, fundamentals, corporate actions, snapshots):
+  - `export POLYGON_API_KEY=YOUR_KEY`
+  - `python scripts/collect_polygon_us_stocks.py --tickers BBVA --start-date 2020-01-01 --end-date 2025-09-04 --types aggregates fundamentals reference corp_actions snapshot --concurrency 20`
+- Aggregate a single ticker to one Parquet for training:
+  - `python scripts/aggregate_us_stock_data.py --ticker BBVA --start-date 2020-01-01 --end-date 2025-09-04`
+  - Output: `data/raw/BBVA_1min.parquet`
+- Generate features (generic, works for any ticker):
+  - `python scripts/generate_spy_features.py --data data/raw/BBVA_1min.parquet --output data/features/BBVA_features.parquet --config configs/settings.yaml`
+- Train with ticker‑aware model naming and CPU parallelism:
+  - `PYTHONPATH=. python -m src.rl.train --ticker BBVA --config configs/settings.yaml --data data/raw/BBVA_1min.parquet --features data/features/BBVA_features.parquet`
+  - Saves model to `models/BBVA_trained_model` and `vecnormalize.pkl` alongside.
+- Backtest (continuous mode shown):
+  - `python examples/polygon_re_backtest_continous.py --symbol BBVA --start-date 2025-01-01 --end-date 2025-06-30 --model-path models/BBVA_trained_model --features-path data/features/BBVA_features.parquet --continuous --plot`
+
+Performance (CPU‑only):
+- Set `train.n_envs: 8`, `train.n_steps: 512–1024`, `train.batch_size: 1024`, `train.device: cpu`, `train.torch_threads: 1` in `configs/settings.yaml`.
+- Progress bars are enabled for both training and backtesting.
+
+See `docs/rl_improvement_plan.md` for the staged roadmap.
+
+## 🧠 Feature Engineering Highlights
+
+- ICT: prior‑day levels and equilibrium (PDM), opening‑range (OR) distances, displacement bars (+ density), fair‑value gaps (+ density), equal highs/lows proximity.
+- VPA: relative volume (RVOL), climax volume flags, churn (+ z‑score), imbalance persistence, direction EMA, intrabar volatility.
+- SMT (intermarket divergence): instrument vs SPY short‑horizon momentum; SPY vs QQQ momentum divergence for regime context.
+- VIX term structure: 9D/1M ratio, 1M/3M ratio; base VIX returns/levels normalized to minute cadence.
+- Time‑of‑day: cyclic encodings (hour/minute/day), market‑open flags; can be toggled off.
+- Pruning: low variance filter and correlation threshold.
+
+Feature generation prints a summary so you can verify VIX/SMT/ICT/VPA coverage.
+
+## ⚙️ Training Settings (CPU‑only optimized)
+
+- Parallel envs: `train.n_envs: 8`
+- Rollouts: `n_steps: 1024`, `batch_size: 1024`
+- PPO: `gamma: 0.995`, `gae_lambda: 0.97`, `target_kl: 0.03`, `ent_coef: 0.005`
+- Device: `train.device: cpu`, `torch_threads: 1`
+- Reward (blend): `alpha * DSR + beta * raw_pnl - micro_penalties - risk/drawdown penalties`
+  - No‑trade windows (first/last 5m) and widened micro‑penalties during first/last 15m.
+
+## 🧰 Utility Scripts
+
+- `scripts/collect_polygon_us_stocks.py` — upgraded US stocks downloader (parallel, per‑day aggregates, reference, fundamentals, CA, snapshots)
+- `scripts/aggregate_us_stock_data.py` — aggregate per‑day minute files to `data/raw/<TICKER>_1min.parquet`
+- `scripts/download_vix_data.py` — Yahoo (^VIX, ^VIX9D, ^VIX3M) to `data/external/vix.parquet`
+- `scripts/download_vix_term_structure.py` — Polygon indices with fallback (may be restricted)
+- `scripts/ingest_external_vix.py` — ingest Databento/FRED/CBOE VIX files into unified parquet
+- `scripts/prepare_context_with_fallback.py` — orchestrates SPY/QQQ/VIX context with fallbacks
+- `scripts/audit_data_inventory.py` — inventory report of available data, features, and models
+
 ## 🕒 DatetimeIndex Fix and Data Pipeline Enhancements
 
 ### Issue Summary
