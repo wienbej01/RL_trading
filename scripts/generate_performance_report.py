@@ -16,11 +16,11 @@ import argparse
 import sys
 from pathlib import Path
 
-# Add src to path for in-repo execution
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add repo root to path for package-style imports (src.*)
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.config_loader import Settings
-from evaluation.backtest_evaluator import BacktestEvaluator
+from src.utils.config_loader import Settings
+from src.evaluation.backtest_evaluator import BacktestEvaluator
 
 
 def main():
