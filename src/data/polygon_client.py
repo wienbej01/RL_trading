@@ -28,6 +28,7 @@ except ImportError:
     PYDANTIC_AVAILABLE = False
     logging.warning("pydantic not available. Data validation will be disabled.")
 
+import os
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
 
@@ -131,8 +132,17 @@ class PolygonClient:
         self.cache_dir = Path("data/cache/polygon")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # API key from environment
-        self.api_key = settings.get('data', 'polygon_api_key')
+        # Resolve API key from config or environment (support multiple placements)
+        api_key = (
+            settings.get('data', 'polygon', 'api_key')
+            or settings.get('data', 'polygon_api_key')
+            or os.getenv('POLYGON_API_KEY')
+        )
+        # If YAML contains a placeholder like ${POLYGON_API_KEY}, resolve it
+        if isinstance(api_key, str) and api_key.strip().startswith('${') and api_key.strip().endswith('}'):
+            env_name = api_key.strip()[2:-1]
+            api_key = os.getenv(env_name) or None
+        self.api_key = api_key
         if not self.api_key:
             raise ValueError("POLYGON_API_KEY environment variable not set")
 
