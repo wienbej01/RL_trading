@@ -288,12 +288,13 @@ class BacktestEvaluator:
             # Run backtest
             logger.info("Running backtest...")
             obs = vec_env.reset()
-            done = False
+            import numpy as _np
+            done = _np.array([False])
             step = 0
             
             state = None
             episode_start = np.ones((1,), dtype=bool)
-            while not done:
+            while not done.all():
                 if use_recurrent:
                     action, state = model.predict(obs, state=state, episode_start=episode_start, deterministic=True)
                 else:
