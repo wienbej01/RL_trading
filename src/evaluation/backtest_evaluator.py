@@ -221,6 +221,20 @@ class BacktestEvaluator:
                 model = PPO.load(model_path)
                 logger.info("Loaded PPO model")
                 use_recurrent = False
+
+            # Try to load feature column metadata saved at training
+            self._feature_list = None
+            try:
+                meta_path = Path(str(model_path) + "_features.json")
+                if meta_path.exists():
+                    with open(meta_path, 'r') as f:
+                        meta = json.load(f)
+                    feats = meta.get('features')
+                    if isinstance(feats, list) and feats:
+                        self._feature_list = feats
+                        logger.info(f"Loaded {len(self._feature_list)} training feature columns from metadata")
+            except Exception as e:
+                logger.warning(f"Feature metadata load skipped: {e}")
             
             # Load data
             df_all = pd.read_parquet(data_path)
@@ -306,6 +320,19 @@ class BacktestEvaluator:
         features_cfg = self.settings.get('features', default={})
         feature_pipeline = FeaturePipeline(features_cfg if isinstance(features_cfg, dict) else {})
         X = feature_pipeline.transform(df)
+
+        # Align features to training feature list if available
+        try:
+            feat_list = getattr(self, '_feature_list', None)
+            if isinstance(feat_list, list) and feat_list:
+                # Add any missing columns as zeros, drop extras
+                for col in feat_list:
+                    if col not in X.columns:
+                        X[col] = 0.0
+                X = X[feat_list]
+                logger.info(f"Aligned features to training list: {len(feat_list)} columns")
+        except Exception as e:
+            logger.warning(f"Feature alignment skipped: {e}")
         
         # Create execution parameters
         exec_params = ExecParams(
@@ -332,6 +359,7 @@ class BacktestEvaluator:
             exec_params=exec_params,
             risk_cfg=risk_cfg,
             point_value=self.config.point_value,
+            config=self.settings.to_dict() if hasattr(self.settings, 'to_dict') else None,
         )
         
         return env
