@@ -1250,8 +1250,10 @@ def main():
                 base_env = env.venv
             if hasattr(base_env, 'envs') and len(base_env.envs):
                 eq_curve = base_env.envs[0].get_equity_curve()
+                trade_list = base_env.envs[0].get_trades() if hasattr(base_env.envs[0],'get_trades') else []
             else:
                 eq_curve = None
+                trade_list = []
             if eq_curve is not None and not eq_curve.empty:
                 ret = eq_curve.pct_change().dropna()
                 # Align features to equity index (features var available above)
@@ -1307,6 +1309,40 @@ def main():
                             print(f"  {idx:>10}: {row['mean']:.6f}  n={int(row['count'])}")
                     except Exception:
                         print(by_smt)
+                # Trade performance summary
+                try:
+                    closes = [t for t in (trade_list or []) if t.get('action') == 'close']
+                    if closes:
+                        import numpy as _np
+                        pnl = _np.array([t.get('pnl', 0.0) for t in closes], dtype=float)
+                        dur = _np.array([t.get('duration_min', 0) for t in closes], dtype=float)
+                        dirs = _np.array([t.get('dir', 0) for t in closes], dtype=int)
+                        n = len(closes)
+                        n_long = int((dirs > 0).sum())
+                        n_short = int((dirs < 0).sum())
+                        avg_pnl = float(_np.nanmean(pnl))
+                        avg_pnl_long = float(_np.nanmean(pnl[dirs>0])) if n_long else 0.0
+                        avg_pnl_short = float(_np.nanmean(pnl[dirs<0])) if n_short else 0.0
+                        wins = int((pnl > 0).sum())
+                        losses = int((pnl <= 0).sum())
+                        win_loss = (wins / max(1, losses)) if losses else float('inf')
+                        avg_dur = float(_np.nanmean(dur))
+                        avg_dur_long = float(_np.nanmean(dur[dirs>0])) if n_long else 0.0
+                        avg_dur_short = float(_np.nanmean(dur[dirs<0])) if n_short else 0.0
+                        # Sharpe/Sortino, max drawdown from equity curve
+                        eret = ret.copy()
+                        sharpe = (eret.mean() / max(1e-9, eret.std())) * (252 ** 0.5) if len(eret)>1 else 0.0
+                        downside = eret[eret<0].std()
+                        sortino = (eret.mean() / max(1e-9, downside)) * (252 ** 0.5) if len(eret)>1 else 0.0
+                        dd = (eq_curve / eq_curve.cummax() - 1.0).min() if len(eq_curve)>1 else 0.0
+                        print("\nTrade Performance Summary:")
+                        print(f"  Trades: {n}  Long: {n_long}  Short: {n_short}")
+                        print(f"  Avg PnL: {avg_pnl:.4f}  Long: {avg_pnl_long:.4f}  Short: {avg_pnl_short:.4f}")
+                        print(f"  Win/Loss: {wins}/{losses}  W/L Ratio: {win_loss:.2f}")
+                        print(f"  Sharpe: {sharpe:.2f}  Sortino: {sortino:.2f}  Max DD: {dd:.2%}")
+                        print(f"  Avg Duration (min): {avg_dur:.1f}  Long: {avg_dur_long:.1f}  Short: {avg_dur_short:.1f}")
+                except Exception as e:
+                    print(f"Trade performance summary skipped: {e}")
         except Exception as e:
             print(f"Bucketed performance reporting skipped: {e}")
         print()

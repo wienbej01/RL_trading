@@ -1,7 +1,7 @@
 import pandas as pd
 
-# Load the features
-features_path = '/home/jacobw/RL_trading/rl-intraday/data/features/spy_features.parquet'
+# Load the features (use repo-relative default path)
+features_path = 'data/features/SPY_features.parquet'
 features = pd.read_parquet(features_path)
 
 # Print feature info
@@ -9,7 +9,7 @@ print("Features Info:")
 features.info()
 
 # Load VIX data
-vix_path = '/home/jacobw/RL_trading/rl-intraday/data/external/vix.parquet'
+vix_path = 'data/external/vix.parquet'
 vix_data = pd.read_parquet(vix_path)
 
 # Print VIX info

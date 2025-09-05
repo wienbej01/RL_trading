@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timedelta
 import re
 import json
+import os
 
 from sb3_contrib import RecurrentPPO
 # from stable_baselines3.common.policies import ActorCriticPolicy
@@ -129,6 +130,8 @@ class TrainingConfig:
     eval_episodes: int = 5
     save_replay_buffer: bool = False
     verbose: int = 1
+    # Optional override for total timesteps
+    total_steps: Optional[int] = None
 
 
 class TrainingCallback(BaseCallback):
@@ -452,23 +455,34 @@ def train_ppo_lstm(settings: Settings,
         seed=training_config.seed
     )
     
-    # Hint to PyTorch for small-CPU + GPU setups
+    # Hint to PyTorch threading; respect config if provided, otherwise keep library defaults
     try:
-        torch.set_num_threads(int(settings.get("train", "torch_threads", default=1)))
-    except Exception:
-        pass
+        tt = settings.get("train", "torch_threads", default=None)
+        if tt is not None:
+            torch.set_num_threads(int(tt))
+            logger.info(f"torch.set_num_threads({int(tt)})")
+        it = settings.get("train", "torch_interop_threads", default=None)
+        if it is not None and hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(int(it))
+            logger.info(f"torch.set_num_interop_threads({int(it)})")
+    except Exception as e:
+        logger.warning(f"Torch threading config skipped: {e}")
     
     # Create callbacks
     callback = TrainingCallback(verbose=training_config.verbose)
     
     # Train model
-    # Ensure integer type even if YAML has comments/strings like "10000#100000"
-    _raw_steps = settings.get("train", "total_steps", default=1_200_000)
-    if isinstance(_raw_steps, (int, np.integer)):
-        total_steps = int(_raw_steps)
+    # Determine total_steps from training_config if provided; otherwise from settings
+    if getattr(training_config, 'total_steps', None) is not None:
+        total_steps = int(training_config.total_steps)
     else:
-        m = re.search(r"[-+]?\d+", str(_raw_steps))
-        total_steps = int(m.group()) if m else 1_200_000
+        # Ensure integer type even if YAML has comments/strings like "10000#100000"
+        _raw_steps = settings.get("train", "total_steps", default=1_200_000)
+        if isinstance(_raw_steps, (int, np.integer)):
+            total_steps = int(_raw_steps)
+        else:
+            m = re.search(r"[-+]?\d+", str(_raw_steps))
+            total_steps = int(m.group()) if m else 1_200_000
     # Optional entropy anneal: train.ent_anneal_final can override final coefficient
     try:
         ent_final = float(settings.get('train', 'ent_anneal_final', default=None))
@@ -476,13 +490,7 @@ def train_ppo_lstm(settings: Settings,
         ent_final = None
 
     callbacks = [callback]
-    # Ensure integer type even if YAML has comments/strings like "10000#100000"
-    _raw_steps = settings.get("train", "total_steps", default=1_200_000)
-    if isinstance(_raw_steps, (int, np.integer)):
-        total_steps = int(_raw_steps)
-    else:
-        m = re.search(r"[-+]?\d+", str(_raw_steps))
-        total_steps = int(m.group()) if m else 1_200_000
+    # Reuse total_steps determined above
     if ent_final is not None:
         callbacks.append(EntropyAnnealCallback(initial_ent=model.ent_coef, final_ent=ent_final, total_timesteps=total_steps))
 
@@ -737,6 +745,7 @@ def main():
     parser.add_argument("--wf-output", default="runs/walkforward", help="Walk-forward output directory")
     parser.add_argument("--eval", action="store_true", help="Evaluate trained model")
     parser.add_argument("--eval-episodes", type=int, default=5, help="Number of evaluation episodes")
+    parser.add_argument("--total-steps", type=int, default=None, help="Override total training timesteps")
     
     args = parser.parse_args()
     
@@ -754,6 +763,9 @@ def main():
     training_config.vf_coef = float(settings.get("train", "vf_coef", default=0.5))
     training_config.ent_coef = float(settings.get("train", "ent_coef", default=0.0))
     training_config.verbose = int(settings.get("train", "verbose", default=1))
+    # Optional override of total steps from CLI
+    if args.total_steps is not None:
+        training_config.total_steps = int(args.total_steps)
     # Device selection (cpu/auto)
     try:
         training_config.device = str(settings.get("train", "device", default="auto"))

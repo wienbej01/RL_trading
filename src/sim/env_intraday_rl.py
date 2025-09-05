@@ -190,6 +190,9 @@ class IntradayRLEnv(Env):
         self.i = 0
         self.done = False
         self.trades = []
+        # Daily trade tracking for reward shaping
+        self._daily_date = None
+        self._daily_trade_count = 0
         
         # Reset risk manager
         self.risk_manager.reset_daily_metrics()
@@ -231,6 +234,14 @@ class IntradayRLEnv(Env):
         """
         # Current bar
         ts = self.df.index[self.i]
+        # Reset daily counters on date change
+        try:
+            cur_date = ts.date()
+            if self._daily_date is None or cur_date != self._daily_date:
+                self._daily_date = cur_date
+                self._daily_trade_count = 0
+        except Exception:
+            pass
         row = self.df.iloc[self.i]
         price = float(row["close"])
         # Handle NaN price values
@@ -274,6 +285,34 @@ class IntradayRLEnv(Env):
             if self.pos != 0:
                 # charge closing cost
                 tc = estimate_tc(self.pos, price, self.exec_sim)
+                # Log close event at EOD
+                try:
+                    open_ts = getattr(self, '_open_ts', None)
+                    entry_tc = float(getattr(self, '_entry_tc', 0.0))
+                    qty = int(abs(self.pos))
+                    direction = 'long' if self.pos > 0 else 'short'
+                    exit_price = float(price)
+                    gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
+                    net_pnl = gross_pnl - entry_tc - float(tc)
+                    self.trades.append({
+                        'ts': ts,
+                        'pos': 0,
+                        'price': float(exit_price),
+                        'action': 'close',
+                        'reason': 'eod',
+                        'entry_time': open_ts if open_ts is not None else ts,
+                        'exit_time': ts,
+                        'entry_price': float(self.entry_price),
+                        'exit_price': float(exit_price),
+                        'quantity': qty,
+                        'direction': direction,
+                        'pnl': float(net_pnl),
+                        'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
+                        'commission_entry': float(entry_tc),
+                        'commission_exit': float(tc)
+                    })
+                except Exception:
+                    pass
                 self.cash -= tc
                 self.pos = 0
                 self.entry_price = None
@@ -307,6 +346,32 @@ class IntradayRLEnv(Env):
                 pnl_exit = (exit_price - self.entry_price) * self.pos * self.point_value
                 tc_exit = estimate_tc(self.pos, float(exit_price), self.exec_sim)
                 self.cash += pnl_exit - tc_exit
+                # Log trade close with PnL/duration metadata
+                try:
+                    open_ts = getattr(self, '_open_ts', None)
+                    entry_tc = float(getattr(self, '_entry_tc', 0.0))
+                    qty = int(abs(self.pos))
+                    direction = 'long' if self.pos > 0 else 'short'
+                    gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
+                    net_pnl = gross_pnl - entry_tc - float(tc_exit)
+                    self.trades.append({
+                        'ts': ts,
+                        'pos': 0,
+                        'price': float(exit_price),
+                        'action': 'close',
+                        'entry_time': open_ts if open_ts is not None else ts,
+                        'exit_time': ts,
+                        'entry_price': float(self.entry_price),
+                        'exit_price': float(exit_price),
+                        'quantity': qty,
+                        'direction': direction,
+                        'pnl': float(net_pnl),
+                        'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
+                        'commission_entry': float(entry_tc),
+                        'commission_exit': float(tc_exit)
+                    })
+                except Exception:
+                    pass
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -326,7 +391,35 @@ class IntradayRLEnv(Env):
             held = self.i - int(self.entry_index)
             if held >= max_hold:
                 # flatten at market price with transaction cost
-                self.cash -= estimate_tc(self.pos, price, self.exec_sim)
+                tc_exit = estimate_tc(self.pos, price, self.exec_sim)
+                try:
+                    # Log trade close with PnL/duration metadata
+                    open_ts = getattr(self, '_open_ts', None)
+                    entry_tc = float(getattr(self, '_entry_tc', 0.0))
+                    qty = int(abs(self.pos))
+                    direction = 'long' if self.pos > 0 else 'short'
+                    exit_price = float(price)
+                    gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
+                    net_pnl = gross_pnl - entry_tc - float(tc_exit)
+                    self.trades.append({
+                        'ts': ts,
+                        'pos': 0,
+                        'price': float(exit_price),
+                        'action': 'close',
+                        'entry_time': open_ts if open_ts is not None else ts,
+                        'exit_time': ts,
+                        'entry_price': float(self.entry_price),
+                        'exit_price': float(exit_price),
+                        'quantity': qty,
+                        'direction': direction,
+                        'pnl': float(net_pnl),
+                        'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
+                        'commission_entry': float(entry_tc),
+                        'commission_exit': float(tc_exit)
+                    })
+                except Exception:
+                    pass
+                self.cash -= tc_exit
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -363,7 +456,8 @@ class IntradayRLEnv(Env):
                 self.entry_price = price
                 self._set_barrier_prices(self.pos, price, atr_val)
                 # pay entry cost
-                self.cash -= estimate_tc(self.pos, price, self.exec_sim)
+                entry_tc = estimate_tc(self.pos, price, self.exec_sim)
+                self.cash -= entry_tc
                 try:
                     self.trades.append({
                         'ts': ts,
@@ -371,6 +465,11 @@ class IntradayRLEnv(Env):
                         'price': float(price),
                         'action': 'open'
                     })
+                    # Track open trade context for close logging
+                    self._open_ts = ts
+                    self._entry_tc = float(entry_tc)
+                    # Increment daily trade count
+                    self._daily_trade_count = int(self._daily_trade_count) + 1
                 except Exception:
                     pass
                 self.entry_index = self.i
@@ -459,6 +558,24 @@ class IntradayRLEnv(Env):
                     reward -= mu_pen * widen_factor * (max(0.0, 1.5 - rvol) + spread)
             except Exception:
                 pass
+            # Optional activity shaping toward target trades/day
+            try:
+                if self.entry_index == self.i:
+                    target = int(self.config.get('env', {}).get('reward', {}).get('trade_target_per_day', 2)) if isinstance(self.config, dict) else 2
+                    bonus = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
+                    penalty = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                    if self._daily_trade_count <= target:
+                        reward += bonus
+                    else:
+                        # penalize excess trades beyond target
+                        reward -= penalty * max(0, int(self._daily_trade_count) - target)
+                else:
+                    # Backward-compatible open bonus
+                    open_bonus = float(self.config.get('env', {}).get('reward', {}).get('open_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
+                    if open_bonus > 0 and self.entry_index == self.i:
+                        reward += open_bonus
+            except Exception:
+                pass
             reward -= float(drawdown_penalty) + float(risk_penalty)
         else:  # Default to pnl with penalties
             reward = pnl - float(drawdown_penalty) - float(risk_penalty)
@@ -471,7 +588,36 @@ class IntradayRLEnv(Env):
         if self.realized_drawdown > max_daily_pct:
             # Force flat and charge closing costs
             if self.pos != 0:
-                self.cash -= estimate_tc(self.pos, price, self.exec_sim)
+                tc = estimate_tc(self.pos, price, self.exec_sim)
+                try:
+                    # Log close due to kill-switch
+                    open_ts = getattr(self, '_open_ts', None)
+                    entry_tc = float(getattr(self, '_entry_tc', 0.0))
+                    qty = int(abs(self.pos))
+                    direction = 'long' if self.pos > 0 else 'short'
+                    exit_price = float(price)
+                    gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
+                    net_pnl = gross_pnl - entry_tc - float(tc)
+                    self.trades.append({
+                        'ts': ts,
+                        'pos': 0,
+                        'price': float(exit_price),
+                        'action': 'close',
+                        'reason': 'kill_switch',
+                        'entry_time': open_ts if open_ts is not None else ts,
+                        'exit_time': ts,
+                        'entry_price': float(self.entry_price),
+                        'exit_price': float(exit_price),
+                        'quantity': qty,
+                        'direction': direction,
+                        'pnl': float(net_pnl),
+                        'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
+                        'commission_entry': float(entry_tc),
+                        'commission_exit': float(tc)
+                    })
+                except Exception:
+                    pass
+                self.cash -= tc
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -529,31 +675,67 @@ class IntradayRLEnv(Env):
         return (curr_price - prev_price) * pos * self.point_value
     
     def _risk_sized_contracts(self, price, atr):
-        """Calculate position size based on risk management."""
-        contracts = self.risk_manager.calculate_position_size(
-            self.equity, price,
-            price - atr * self.risk_manager.risk_config.stop_r_multiple,
-            atr
-        )
-
-        # Handle NaN values - comprehensive check
-        if np.isnan(contracts) or np.isinf(contracts) or contracts is None:
-            contracts = 0.0
-
-        # Ensure contracts is a valid number before int conversion
+        """Calculate position size based on risk rules using the tighter of ATR and swing stops."""
         try:
-            contracts_int = int(max(0, contracts))
-        except (ValueError, OverflowError):
-            logger.warning(f"Invalid contracts value: {contracts}, defaulting to 0")
-            contracts_int = 0
+            stop_r = float(self.risk_manager.risk_config.stop_r_multiple)
+        except Exception:
+            stop_r = 1.0
+        atr_stop = max(atr * stop_r, 1e-6)
+        # Swing-based stop distance from features
+        buffer_atr = 0.1 * max(atr, 1e-6)
+        swing_stop = None
+        try:
+            if self.pos == 0:
+                # if we are about to open long (desired_dir handled outside), estimate both directions by proximity
+                last_sl = float(self.X.loc[self.df.index[self.i]].get('dist_last_swing_low', np.nan))
+                last_sh = float(self.X.loc[self.df.index[self.i]].get('dist_last_swing_high', np.nan))
+                if last_sl == last_sl:  # not NaN
+                    swing_stop_long = max((price - (price - last_sl) + buffer_atr), 1e-6)
+                else:
+                    swing_stop_long = np.inf
+                if last_sh == last_sh:
+                    swing_stop_short = max(((price + last_sh) - price + buffer_atr), 1e-6)
+                else:
+                    swing_stop_short = np.inf
+                # pick the smaller as an estimate of plausible stop distance
+                swing_stop = min(swing_stop_long, swing_stop_short)
+        except Exception:
+            swing_stop = None
+        stop_distance = atr_stop
+        if swing_stop is not None and np.isfinite(swing_stop):
+            stop_distance = max(1e-6, min(atr_stop, swing_stop))
 
+        # Calculate contracts from 2% risk rule
+        risk_per_trade = self.equity * float(self.risk_manager.risk_config.risk_per_trade_frac)
+        point_value = float(getattr(self, 'point_value', 1.0))
+        risk_per_contract = stop_distance * point_value
+        raw_contracts = int(max(0, risk_per_trade / max(risk_per_contract, 1e-6)))
+
+        # Apply leverage/notional cap
+        max_notional = self.equity * float(getattr(self.risk_manager.risk_config, 'max_leverage', 1.0))
+        by_notional = int(max_notional / max(price, 1e-6))
+        max_pos = int(getattr(self.risk_manager.risk_config, 'max_position_size', 100000))
+        contracts_int = int(max(0, min(raw_contracts, by_notional, max_pos)))
         return contracts_int
     
     def _set_barrier_prices(self, pos, price, atr):
         """Set stop loss and take profit prices."""
-        self.stop_price, self.tp_price = self.risk_manager.calculate_stop_prices(
-            price, pos, atr
-        )
+        # Use ATR-based as baseline
+        stop, tp = self.risk_manager.calculate_stop_prices(price, pos, atr)
+        # Use swing stop if tighter
+        try:
+            last_sl = float(self.X.loc[self.df.index[self.i]].get('dist_last_swing_low', np.nan))
+            last_sh = float(self.X.loc[self.df.index[self.i]].get('dist_last_swing_high', np.nan))
+            buffer_atr = 0.1 * atr
+            if pos > 0 and last_sl == last_sl:
+                swing_stop_price = price - max((price - (price - last_sl) + buffer_atr), 1e-6)
+                stop = max(min(stop, swing_stop_price), 0.0)
+            if pos < 0 and last_sh == last_sh:
+                swing_stop_price = price + max(((price + last_sh) - price + buffer_atr), 1e-6)
+                stop = min(max(stop, swing_stop_price), price + 10 * atr)
+        except Exception:
+            pass
+        self.stop_price, self.tp_price = stop, tp
     
     def _tod(self, ts):
         """Check if timestamp is within trading day."""

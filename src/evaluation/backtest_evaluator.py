@@ -94,6 +94,17 @@ class BacktestResult:
     max_consecutive_losses: int
     recovery_factor: float
     payoff_ratio: float
+    # Directional trade stats
+    num_long_trades: int
+    num_short_trades: int
+    avg_pnl_long: float
+    avg_pnl_short: float
+    avg_duration_min: float
+    avg_duration_long_min: float
+    avg_duration_short_min: float
+    long_win_rate: float
+    short_win_rate: float
+    trades_per_day: float
     total_commission: float
     total_slippage: float
     total_transaction_costs: float
@@ -299,9 +310,11 @@ class BacktestEvaluator:
         if hasattr(env, 'equity_curve'):
             self.equity_curve = env.equity_curve
         
-        # Extract trade history
-        if hasattr(env, 'trade_history'):
+        # Extract trade history (prefer rich 'trades' if available)
+        if hasattr(env, 'trade_history') and env.trade_history:
             self.trade_history = env.trade_history
+        elif hasattr(env, 'trades'):
+            self.trade_history = env.trades
         
         # Extract position history
         if hasattr(env, 'position_history'):
@@ -394,6 +407,42 @@ class BacktestEvaluator:
             largest_loss = 0.0
             profit_factor = 0.0
         
+        # Directional and consecutive analysis
+        # Use only closed trades when available
+        closed = [t for t in self.trade_history if t.get('action') == 'close'] if self.trade_history else []
+        long_trades = [t for t in closed if t.get('direction') == 'long']
+        short_trades = [t for t in closed if t.get('direction') == 'short']
+        num_long_trades = len(long_trades)
+        num_short_trades = len(short_trades)
+        # Durations (minutes)
+        def _avg(lst, key):
+            vals = [float(t.get(key, 0.0)) for t in lst if key in t]
+            return float(np.mean(vals)) if vals else 0.0
+        avg_duration_min = _avg(closed, 'duration_min')
+        avg_duration_long_min = _avg(long_trades, 'duration_min')
+        avg_duration_short_min = _avg(short_trades, 'duration_min')
+        # Avg PnL by side
+        def _avg_pnl(lst):
+            pnls = [float(t.get('pnl', 0.0)) for t in lst if 'pnl' in t]
+            return float(np.mean(pnls)) if pnls else 0.0
+        avg_pnl_long = _avg_pnl(long_trades)
+        avg_pnl_short = _avg_pnl(short_trades)
+        # Win rates by side
+        def _winrate(lst):
+            if not lst:
+                return 0.0
+            wins = sum(1 for t in lst if float(t.get('pnl', 0.0)) > 0.0)
+            return wins / len(lst)
+        long_win_rate = _winrate(long_trades)
+        short_win_rate = _winrate(short_trades)
+        # Trades per day
+        trades_per_day = 0.0
+        if closed:
+            dates = pd.to_datetime([t.get('exit_time') or t.get('ts') for t in closed]).date
+            if len(dates) > 0:
+                per_day = pd.Series(1, index=pd.Index(dates)).groupby(level=0).sum()
+                trades_per_day = float(per_day.mean()) if len(per_day) > 0 else 0.0
+
         # Consecutive analysis
         max_consecutive_wins = self._calculate_consecutive([t.get('pnl', 0) > 0 for t in self.trade_history])
         max_consecutive_losses = self._calculate_consecutive([t.get('pnl', 0) < 0 for t in self.trade_history])
@@ -447,6 +496,16 @@ class BacktestEvaluator:
             max_consecutive_losses=max_consecutive_losses,
             recovery_factor=recovery_factor,
             payoff_ratio=payoff_ratio,
+            num_long_trades=num_long_trades,
+            num_short_trades=num_short_trades,
+            avg_pnl_long=avg_pnl_long,
+            avg_pnl_short=avg_pnl_short,
+            avg_duration_min=avg_duration_min,
+            avg_duration_long_min=avg_duration_long_min,
+            avg_duration_short_min=avg_duration_short_min,
+            long_win_rate=long_win_rate,
+            short_win_rate=short_win_rate,
+            trades_per_day=trades_per_day,
             total_commission=total_commission,
             total_slippage=total_slippage,
             total_transaction_costs=total_transaction_costs,
@@ -536,6 +595,16 @@ class BacktestEvaluator:
                 'max_consecutive_losses': self.backtest_result.max_consecutive_losses,
                 'recovery_factor': self.backtest_result.recovery_factor,
                 'payoff_ratio': self.backtest_result.payoff_ratio,
+                'num_long_trades': self.backtest_result.num_long_trades,
+                'num_short_trades': self.backtest_result.num_short_trades,
+                'avg_pnl_long': self.backtest_result.avg_pnl_long,
+                'avg_pnl_short': self.backtest_result.avg_pnl_short,
+                'avg_duration_min': self.backtest_result.avg_duration_min,
+                'avg_duration_long_min': self.backtest_result.avg_duration_long_min,
+                'avg_duration_short_min': self.backtest_result.avg_duration_short_min,
+                'long_win_rate': self.backtest_result.long_win_rate,
+                'short_win_rate': self.backtest_result.short_win_rate,
+                'trades_per_day': self.backtest_result.trades_per_day,
                 'total_commission': self.backtest_result.total_commission,
                 'total_slippage': self.backtest_result.total_slippage,
                 'total_transaction_costs': self.backtest_result.total_transaction_costs,

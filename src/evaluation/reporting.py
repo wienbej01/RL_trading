@@ -377,6 +377,20 @@ class TradingReportGenerator:
                 'largest_loss': np.mean([r.largest_loss for r in self.backtest_results]),
                 'profit_factor': np.mean([r.profit_factor for r in self.backtest_results])
             },
+            'directional_breakdown': {
+                'num_long_trades': np.mean([getattr(r, 'num_long_trades', 0) for r in self.backtest_results]),
+                'num_short_trades': np.mean([getattr(r, 'num_short_trades', 0) for r in self.backtest_results]),
+                'avg_pnl_long': np.mean([getattr(r, 'avg_pnl_long', 0.0) for r in self.backtest_results]),
+                'avg_pnl_short': np.mean([getattr(r, 'avg_pnl_short', 0.0) for r in self.backtest_results]),
+                'long_win_rate': np.mean([getattr(r, 'long_win_rate', 0.0) for r in self.backtest_results]),
+                'short_win_rate': np.mean([getattr(r, 'short_win_rate', 0.0) for r in self.backtest_results])
+            },
+            'durations': {
+                'avg_duration_min': np.mean([getattr(r, 'avg_duration_min', 0.0) for r in self.backtest_results]),
+                'avg_duration_long_min': np.mean([getattr(r, 'avg_duration_long_min', 0.0) for r in self.backtest_results]),
+                'avg_duration_short_min': np.mean([getattr(r, 'avg_duration_short_min', 0.0) for r in self.backtest_results]),
+                'trades_per_day': np.mean([getattr(r, 'trades_per_day', 0.0) for r in self.backtest_results])
+            },
             'trade_patterns': {
                 'max_consecutive_wins': np.mean([r.max_consecutive_wins for r in self.backtest_results]),
                 'max_consecutive_losses': np.mean([r.max_consecutive_losses for r in self.backtest_results]),

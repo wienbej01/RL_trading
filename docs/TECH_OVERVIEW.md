@@ -61,8 +61,8 @@ The training process is initiated via the `src/rl/train.py` script.
 ```bash
 PYTHONPATH=/home/jacobw/RL_trading/rl-intraday python -m src.rl.train \
   --config /home/jacobw/RL_trading/rl-intraday/configs/settings.yaml \
-  --data /home/jacobw/RL_trading/rl-intraday/data/raw/spy_1min.parquet \
-  --features /home/jacobw/RL_trading/rl-intraday/data/features/SPY_features.parquet \
+  --data data/raw/spy_1min.parquet \
+  --features data/features/SPY_features.parquet \
   --output /home/jacobw/RL_trading/rl-intraday/models/trained_model
 ```
 

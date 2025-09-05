@@ -689,6 +689,11 @@ class FeaturePipeline:
 
                 # Intrabar volatility proxy
                 features['intrabar_vol'] = ((data['high'] - data['low']) / data['close']).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                # VWAP derivatives (if vwap exists)
+                if 'vwap' in data.columns:
+                    features['dist_vwap'] = (data['close'] - data['vwap']).astype(float)
+                    if 'atr' in features.columns:
+                        features['dist_vwap_atr'] = (features['dist_vwap'] / (features['atr'] + 1e-6)).astype(float)
         except Exception:
             pass
 
