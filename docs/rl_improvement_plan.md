@@ -60,3 +60,18 @@ Updated: 2025-09-04
 - [x] Time-stop; cap trades/hour and scale-outs configurable
 - [ ] Swing-based stop option for risk sizing (min of ATR and swing stop)
 - [ ] Optional: microstructure PCA (grouped) and equal highs/lows distance refinement
+
+## Phase 6 — Backtest Debugging (In Progress)
+
+- **Status:** The backtest is no longer crashing, but it is still not producing any trades.
+
+- **Work Done:**
+  - Investigated the backtest module and the data loading process.
+  - Fixed a dependency issue with the `pandas` library.
+  - Fixed a bug in the feature pipeline that was causing a large number of NaNs.
+  - Fixed a bug in the `BacktestEvaluator` that was causing the backtest to fail due to an API mismatch between `gym` and `gymnasium`.
+
+- **Pending Tasks:**
+  - [ ] Investigate why the agent is not producing any trades, even though the backtest is running without errors.
+  - [ ] Add more logging to the backtest module to get more insight into the agent's behavior.
+  - [ ] Consider adding a simple baseline agent to the backtest to verify that the backtest module is working correctly.

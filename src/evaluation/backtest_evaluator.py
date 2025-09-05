@@ -27,6 +27,7 @@ from ..features.pipeline import FeaturePipeline
 logger = get_logger(__name__)
 
 
+
 @dataclass
 class BacktestConfig:
     """Backtest configuration."""
@@ -272,20 +273,12 @@ class BacktestEvaluator:
             # Run backtest with VecNormalize if available (normalized obs to match training)
             logger.info("Running backtest...")
             try:
-                from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-                base_env = DummyVecEnv([lambda: env])
-                vn_path = Path(model_path).with_name('vecnormalize.pkl')
-                if vn_path.exists():
-                    vec_env = VecNormalize.load(str(vn_path), base_env)
-                    vec_env.training = False
-                    logger.info(f"Loaded VecNormalize stats from {vn_path}")
-                else:
-                    vec_env = base_env
-                    logger.info("VecNormalize stats not found; proceeding without normalization")
+                from src.sim.dummy_vec_env import GymnasiumDummyVecEnv
+                vec_env = GymnasiumDummyVecEnv([lambda: env])
             except Exception as e:
                 logger.warning(f"VecNormalize setup failed: {e}. Proceeding without it.")
-                from stable_baselines3.common.vec_env import DummyVecEnv
-                vec_env = DummyVecEnv([lambda: env])
+                from src.sim.dummy_vec_env import GymnasiumDummyVecEnv
+                vec_env = GymnasiumDummyVecEnv([lambda: env])
 
             import numpy as _np
             obs = vec_env.reset()
@@ -314,7 +307,8 @@ class BacktestEvaluator:
                         action_counts["hold"] += 1
                     elif a == 2:
                         action_counts["long"] += 1
-                obs, reward, done, info = vec_env.step(_np.array(acts))
+                obs, reward, done, info, truncated = vec_env.step(_np.array(acts))
+                done = _np.array(done)
                 episode_start = done
                 step += 1
             logger.info(f"Backtest steps={step}, first_actions={first_actions}, action_counts={action_counts}")
@@ -363,6 +357,10 @@ class BacktestEvaluator:
                 logger.info(f"Aligned features to training list: {len(feat_list)} columns")
         except Exception as e:
             logger.warning(f"Feature alignment skipped: {e}")
+
+        # Drop rows with NaNs
+        X.dropna(inplace=True)
+        df = df.loc[X.index]
         
         # Create execution parameters
         exec_params = ExecParams(
