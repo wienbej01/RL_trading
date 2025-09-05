@@ -299,9 +299,6 @@ class BacktestEvaluator:
                 episode_start = done
                 step += 1
             logger.info(f"Backtest steps={step}, action_counts={action_counts}")
-                
-                if step % 1000 == 0:
-                    logger.info(f"Backtest progress: {step} steps")
             
             # Extract results
             self._extract_results(env)
