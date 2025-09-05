@@ -28,9 +28,22 @@ def main():
     parser.add_argument('--model', required=True, help='Path to trained SB3 model')
     parser.add_argument('--data', required=True, help='Path to backtest data (parquet)')
     parser.add_argument('--out', required=True, help='Output JSON path for report')
+    parser.add_argument('--start', help='Override start date (YYYY-MM-DD) for backtest window')
+    parser.add_argument('--end', help='Override end date (YYYY-MM-DD) for backtest window')
     args = parser.parse_args()
 
     settings = Settings.from_paths('configs/settings.yaml')
+    # Optionally override evaluation date window in settings for this run
+    if args.start or args.end:
+        from copy import deepcopy
+        cfg = deepcopy(settings._cfg)
+        eval_block = cfg.setdefault('evaluation', {})
+        if args.start:
+            eval_block['start_date'] = args.start
+        if args.end:
+            eval_block['end_date'] = args.end
+        settings._cfg = cfg
+
     evaluator = BacktestEvaluator(settings)
     result = evaluator.run_backtest(model_path=args.model, data_path=args.data)
     if result is None:

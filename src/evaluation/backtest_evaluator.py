@@ -209,18 +209,48 @@ class BacktestEvaluator:
         try:
             logger.info("Starting backtest...")
             
-            # Load model
-            from stable_baselines3 import PPO
-            model = PPO.load(model_path)
+            # Load model (support RecurrentPPO and PPO)
+            model = None
+            try:
+                from sb3_contrib import RecurrentPPO
+                model = RecurrentPPO.load(model_path)
+                logger.info("Loaded RecurrentPPO model")
+                use_recurrent = True
+            except Exception:
+                from stable_baselines3 import PPO
+                model = PPO.load(model_path)
+                logger.info("Loaded PPO model")
+                use_recurrent = False
             
             # Load data
-            df = pd.read_parquet(data_path)
-            df = df.tz_localize(None)
-            
-            # Filter by date range
-            start_date = pd.to_datetime(self.config.start_date)
-            end_date = pd.to_datetime(self.config.end_date)
-            df = df.loc[(df.index >= start_date) & (df.index <= end_date)]
+            df_all = pd.read_parquet(data_path)
+            # Normalize to naive timestamps for env compatibility
+            try:
+                df_all = df_all.tz_localize(None)
+            except Exception:
+                # If already naive
+                pass
+
+            # Filter by date range if it intersects data; otherwise use full range
+            try:
+                cfg_start = pd.to_datetime(self.config.start_date)
+                cfg_end = pd.to_datetime(self.config.end_date)
+                data_min = df_all.index.min()
+                data_max = df_all.index.max()
+                # If configured window intersects data
+                if (cfg_end >= data_min) and (cfg_start <= data_max):
+                    start_date = max(cfg_start, data_min)
+                    end_date = min(cfg_end, data_max)
+                    df = df_all.loc[(df_all.index >= start_date) & (df_all.index <= end_date)]
+                else:
+                    logger.info("Config evaluation window outside data range; using full data range")
+                    df = df_all
+            except Exception:
+                df = df_all
+
+            if len(df) == 0:
+                logger.warning("No rows after date filtering; using full dataset for backtest")
+                df = df_all
             
             # Initialize environment
             env = self._create_environment(df)
@@ -231,9 +261,15 @@ class BacktestEvaluator:
             done = False
             step = 0
             
+            state = None
+            episode_start = np.ones((1,), dtype=bool)
             while not done:
-                action, _ = model.predict(obs, deterministic=True)
+                if use_recurrent:
+                    action, state = model.predict(obs, state=state, episode_start=episode_start, deterministic=True)
+                else:
+                    action, _ = model.predict(obs, deterministic=True)
                 obs, reward, done, trunc, info = env.step(int(action))
+                episode_start = np.array([done], dtype=bool)
                 step += 1
                 
                 if step % 1000 == 0:
@@ -266,9 +302,10 @@ class BacktestEvaluator:
         Returns:
             RL environment
         """
-        # Create feature pipeline
-        feature_pipeline = FeaturePipeline(self.settings)
-        X = feature_pipeline.build_feature_matrix(df)
+        # Create feature pipeline configuration and transform data
+        features_cfg = self.settings.get('features', default={})
+        feature_pipeline = FeaturePipeline(features_cfg if isinstance(features_cfg, dict) else {})
+        X = feature_pipeline.transform(df)
         
         # Create execution parameters
         exec_params = ExecParams(
@@ -309,6 +346,12 @@ class BacktestEvaluator:
         # Extract equity curve
         if hasattr(env, 'equity_curve'):
             self.equity_curve = env.equity_curve
+            # align timeline for plotting/report
+            try:
+                if hasattr(env, 'df') and hasattr(env.df, 'index'):
+                    self.timeline = list(env.df.index[:len(self.equity_curve)])
+            except Exception:
+                self.timeline = []
         
         # Extract trade history (prefer rich 'trades' if available)
         if hasattr(env, 'trade_history') and env.trade_history:
@@ -325,12 +368,15 @@ class BacktestEvaluator:
         if not self.equity_curve:
             return
         
-        # Convert equity curve to DataFrame
-        equity_df = pd.DataFrame(self.equity_curve)
-        equity_df.set_index('timestamp', inplace=True)
-        
-        # Calculate returns
-        returns = equity_df['equity'].pct_change().dropna()
+        # Handle equity as list of floats
+        if isinstance(self.equity_curve, list) and self.equity_curve and not isinstance(self.equity_curve[0], dict):
+            equity_series = pd.Series(self.equity_curve)
+            returns = equity_series.pct_change().dropna()
+        else:
+            equity_df = pd.DataFrame(self.equity_curve)
+            if 'timestamp' in equity_df.columns:
+                equity_df.set_index('timestamp', inplace=True)
+            returns = equity_df['equity'].pct_change().dropna()
         
         # Calculate performance metrics
         self.performance_metrics = calculate_performance_metrics(returns)
@@ -348,12 +394,16 @@ class BacktestEvaluator:
         if not self.equity_curve:
             return None
         
-        # Convert equity curve to DataFrame
-        equity_df = pd.DataFrame(self.equity_curve)
-        equity_df.set_index('timestamp', inplace=True)
-        
-        # Calculate returns
-        returns = equity_df['equity'].pct_change().dropna()
+        # Convert equity to series
+        if isinstance(self.equity_curve, list) and self.equity_curve and not isinstance(self.equity_curve[0], dict):
+            equity_series = pd.Series(self.equity_curve)
+            returns = equity_series.pct_change().dropna()
+            equity_df = equity_series.to_frame('equity')
+        else:
+            equity_df = pd.DataFrame(self.equity_curve)
+            if 'timestamp' in equity_df.columns:
+                equity_df.set_index('timestamp', inplace=True)
+            returns = equity_df['equity'].pct_change().dropna()
         
         # Basic performance metrics
         total_return = (equity_df['equity'].iloc[-1] / equity_df['equity'].iloc[0]) - 1
@@ -559,6 +609,25 @@ class BacktestEvaluator:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Prepare report data
+        if isinstance(self.equity_curve, list) and self.equity_curve and not isinstance(self.equity_curve[0], dict):
+            eq_list = [
+                {
+                    'timestamp': (self.timeline[i].isoformat() if (self.timeline and i < len(self.timeline) and hasattr(self.timeline[i], 'isoformat')) else i),
+                    'equity': float(v),
+                    'pnl': 0.0
+                }
+                for i, v in enumerate(self.equity_curve)
+            ]
+        else:
+            eq_list = [
+                {
+                    'timestamp': entry['timestamp'].isoformat() if isinstance(entry.get('timestamp', None), (datetime,)) else entry.get('timestamp'),
+                    'equity': entry.get('equity'),
+                    'pnl': entry.get('pnl', 0)
+                }
+                for entry in self.equity_curve
+            ]
+
         report_data = {
             'timestamp': datetime.now().isoformat(),
             'backtest_config': self.config.__dict__,
@@ -611,14 +680,7 @@ class BacktestEvaluator:
                 'final_equity': self.backtest_result.final_equity,
                 'peak_equity': self.backtest_result.peak_equity
             },
-            'equity_curve': [
-                {
-                    'timestamp': entry['timestamp'].isoformat(),
-                    'equity': entry['equity'],
-                    'pnl': entry.get('pnl', 0)
-                }
-                for entry in self.equity_curve
-            ],
+            'equity_curve': eq_list,
             'trade_history': self.trade_history,
             'position_history': self.position_history,
             'risk_metrics': self.risk_metrics,
@@ -646,8 +708,15 @@ class BacktestEvaluator:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Convert to DataFrame
-        equity_df = pd.DataFrame(self.equity_curve)
-        equity_df.set_index('timestamp', inplace=True)
+        if isinstance(self.equity_curve, list) and self.equity_curve and not isinstance(self.equity_curve[0], dict):
+            if self.timeline and len(self.timeline) == len(self.equity_curve):
+                equity_df = pd.DataFrame({'equity': self.equity_curve}, index=pd.DatetimeIndex(self.timeline))
+            else:
+                equity_df = pd.DataFrame({'equity': self.equity_curve})
+        else:
+            equity_df = pd.DataFrame(self.equity_curve)
+            if 'timestamp' in equity_df.columns:
+                equity_df.set_index('timestamp', inplace=True)
         
         # Create figure with subplots
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
