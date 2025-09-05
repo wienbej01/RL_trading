@@ -268,10 +268,26 @@ class BacktestEvaluator:
             
             # Initialize environment
             env = self._create_environment(df)
+
+            # Load VecNormalize statistics if available to match training normalization
+            try:
+                from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+                vn_path = Path(model_path).with_name('vecnormalize.pkl')
+                vec_env = DummyVecEnv([lambda: env])
+                if vn_path.exists():
+                    vec_env = VecNormalize.load(str(vn_path), vec_env)
+                    vec_env.training = False
+                    logger.info(f"Loaded VecNormalize stats from {vn_path}")
+                else:
+                    logger.info("VecNormalize stats not found; proceeding without normalization wrapper")
+            except Exception as e:
+                logger.warning(f"VecNormalize load skipped: {e}")
+                from stable_baselines3.common.vec_env import DummyVecEnv
+                vec_env = DummyVecEnv([lambda: env])
             
             # Run backtest
             logger.info("Running backtest...")
-            obs, _ = env.reset()
+            obs = vec_env.reset()
             done = False
             step = 0
             
@@ -282,8 +298,8 @@ class BacktestEvaluator:
                     action, state = model.predict(obs, state=state, episode_start=episode_start, deterministic=True)
                 else:
                     action, _ = model.predict(obs, deterministic=True)
-                obs, reward, done, trunc, info = env.step(int(action))
-                episode_start = np.array([done], dtype=bool)
+                obs, reward, done, info = vec_env.step(action)
+                episode_start = done
                 step += 1
                 
                 if step % 1000 == 0:
