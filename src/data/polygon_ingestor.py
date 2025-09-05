@@ -70,26 +70,26 @@ class PolygonDataIngestor:
         self.settings = settings
         self.polygon_client = PolygonClient(settings)
 
-        # Configuration
-        self.data_dir = Path(settings.get('data', {}).get('polygon', {}).get('data_dir', self.DEFAULT_DATA_DIR))
+        # Configuration (use nested Settings.get to avoid dict chaining issues)
+        self.data_dir = Path(settings.get('data', 'polygon', 'data_dir', default=self.DEFAULT_DATA_DIR))
         self.metadata_dir = self.data_dir / "metadata"
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
 
         # Performance settings
-        self.max_workers = settings.get('data', {}).get('max_workers', 4)
-        self.batch_size = settings.get('data', {}).get('batch_size', 1000)
-        self.chunk_size = settings.get('data', {}).get('chunk_size', 50000)
+        self.max_workers = settings.get('data', 'max_workers', default=4)
+        self.batch_size = settings.get('data', 'batch_size', default=1000)
+        self.chunk_size = settings.get('data', 'chunk_size', default=50000)
 
         # Rate limiting and retry settings
-        self.retry_attempts = settings.get('data', {}).get('polygon', {}).get('retry', {}).get('attempts', 3)
-        self.retry_backoff = settings.get('data', {}).get('polygon', {}).get('retry', {}).get('backoff_factor', 2.0)
+        self.retry_attempts = settings.get('data', 'polygon', 'retry', 'attempts', default=3)
+        self.retry_backoff = settings.get('data', 'polygon', 'retry', 'backoff_factor', default=2.0)
 
         # Storage settings
-        self.compression = settings.get('data', {}).get('compression', 'snappy')
-        self.row_group_size = settings.get('data', {}).get('row_group_size', 100000)
+        self.compression = settings.get('data', 'compression', default='snappy')
+        self.row_group_size = settings.get('data', 'row_group_size', default=100000)
 
         # Validation settings
-        self.enable_validation = settings.get('data', {}).get('validation', {}).get('enabled', True)
+        self.enable_validation = settings.get('data', 'validation', 'enabled', default=True)
 
         # Metadata cache
         self.metadata_cache: Dict[str, IngestionMetadata] = {}
