@@ -268,40 +268,37 @@ class BacktestEvaluator:
             
             # Initialize environment
             env = self._create_environment(df)
-
-            # Load VecNormalize statistics if available to match training normalization
-            try:
-                from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
-                vn_path = Path(model_path).with_name('vecnormalize.pkl')
-                vec_env = DummyVecEnv([lambda: env])
-                if vn_path.exists():
-                    vec_env = VecNormalize.load(str(vn_path), vec_env)
-                    vec_env.training = False
-                    logger.info(f"Loaded VecNormalize stats from {vn_path}")
-                else:
-                    logger.info("VecNormalize stats not found; proceeding without normalization wrapper")
-            except Exception as e:
-                logger.warning(f"VecNormalize load skipped: {e}")
-                from stable_baselines3.common.vec_env import DummyVecEnv
-                vec_env = DummyVecEnv([lambda: env])
             
             # Run backtest
             logger.info("Running backtest...")
-            obs = vec_env.reset()
-            import numpy as _np
-            done = _np.array([False])
+            # Run episode using raw env (avoids gym/gymnasium VecEnv quirks)
+            obs, _ = env.reset()
+            done = False
             step = 0
-            
             state = None
-            episode_start = np.ones((1,), dtype=bool)
-            while not done.all():
+            episode_start = True
+            action_counts = {"hold": 0, "long": 0, "short": 0}
+            while not done:
                 if use_recurrent:
                     action, state = model.predict(obs, state=state, episode_start=episode_start, deterministic=True)
                 else:
                     action, _ = model.predict(obs, deterministic=True)
-                obs, reward, done, info = vec_env.step(action)
+                # action may be array-like; take first element if so
+                try:
+                    act = int(action[0])
+                except Exception:
+                    act = int(action)
+                # Tally actions (assuming 0=hold,1=long,2=short mapping in wrapper)
+                if act == 0:
+                    action_counts["hold"] += 1
+                elif act == 1:
+                    action_counts["long"] += 1
+                else:
+                    action_counts["short"] += 1
+                obs, reward, done, trunc, info = env.step(act)
                 episode_start = done
                 step += 1
+            logger.info(f"Backtest steps={step}, action_counts={action_counts}")
                 
                 if step % 1000 == 0:
                     logger.info(f"Backtest progress: {step} steps")
