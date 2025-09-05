@@ -269,36 +269,55 @@ class BacktestEvaluator:
             # Initialize environment
             env = self._create_environment(df)
             
-            # Run backtest
+            # Run backtest with VecNormalize if available (normalized obs to match training)
             logger.info("Running backtest...")
-            # Run episode using raw env (avoids gym/gymnasium VecEnv quirks)
-            obs, _ = env.reset()
-            done = False
+            try:
+                from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+                base_env = DummyVecEnv([lambda: env])
+                vn_path = Path(model_path).with_name('vecnormalize.pkl')
+                if vn_path.exists():
+                    vec_env = VecNormalize.load(str(vn_path), base_env)
+                    vec_env.training = False
+                    logger.info(f"Loaded VecNormalize stats from {vn_path}")
+                else:
+                    vec_env = base_env
+                    logger.info("VecNormalize stats not found; proceeding without normalization")
+            except Exception as e:
+                logger.warning(f"VecNormalize setup failed: {e}. Proceeding without it.")
+                from stable_baselines3.common.vec_env import DummyVecEnv
+                vec_env = DummyVecEnv([lambda: env])
+
+            import numpy as _np
+            obs = vec_env.reset()
+            done = _np.zeros((vec_env.num_envs,), dtype=bool)
             step = 0
             state = None
-            episode_start = True
-            action_counts = {"hold": 0, "long": 0, "short": 0}
-            while not done:
+            episode_start = _np.ones((vec_env.num_envs,), dtype=bool)
+            action_counts = {"short": 0, "hold": 0, "long": 0}
+            first_actions = []
+            while not done.all():
                 if use_recurrent:
                     action, state = model.predict(obs, state=state, episode_start=episode_start, deterministic=True)
                 else:
                     action, _ = model.predict(obs, deterministic=True)
-                # action may be array-like; take first element if so
+                # SB3 returns shape (n_env,); tally mapping as per raw IntradayRLEnv: 0=short,1=hold,2=long
                 try:
-                    act = int(action[0])
+                    acts = [int(a) for a in action]
                 except Exception:
-                    act = int(action)
-                # Tally actions (assuming 0=hold,1=long,2=short mapping in wrapper)
-                if act == 0:
-                    action_counts["hold"] += 1
-                elif act == 1:
-                    action_counts["long"] += 1
-                else:
-                    action_counts["short"] += 1
-                obs, reward, done, trunc, info = env.step(act)
+                    acts = [int(action)]
+                if step < 10:
+                    first_actions.extend(acts)
+                for a in acts:
+                    if a == 0:
+                        action_counts["short"] += 1
+                    elif a == 1:
+                        action_counts["hold"] += 1
+                    elif a == 2:
+                        action_counts["long"] += 1
+                obs, reward, done, info = vec_env.step(_np.array(acts))
                 episode_start = done
                 step += 1
-            logger.info(f"Backtest steps={step}, action_counts={action_counts}")
+            logger.info(f"Backtest steps={step}, first_actions={first_actions}, action_counts={action_counts}")
             
             # Extract results
             self._extract_results(env)
