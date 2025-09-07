@@ -63,15 +63,16 @@ Updated: 2025-09-04
 
 ## Phase 6 — Backtest Debugging (In Progress)
 
-- **Status:** The backtest is no longer crashing, but it is still not producing any trades.
+- Status: Backtest functional; trades now occur under deterministic and model-driven loops. Remaining: align model obs/normalization robustly for all saved folds and tune for profitability.
 
-- **Work Done:**
-  - Investigated the backtest module and the data loading process.
-  - Fixed a dependency issue with the `pandas` library.
-  - Fixed a bug in the feature pipeline that was causing a large number of NaNs.
-  - Fixed a bug in the `BacktestEvaluator` that was causing the backtest to fail due to an API mismatch between `gym` and `gymnasium`.
+- Work Done:
+  - Fixed execution/risk wiring: replaced missing `ExecutionSimulator` with `ExecutionEngine` and corrected settings access (no more `TypeError: unhashable type: 'dict'`).
+  - Backtester parity fixes: load saved `VecNormalize` stats when shapes match; fallback gracefully when not; handle both 4- and 5‑tuple step APIs (SB3 vs Gymnasium).
+  - Feature parity: backtester now discovers `model_features.json` or `model.zip_features.json` and aligns columns (add missing=0, drop extras).
+  - Added DEBUG breadcrumbs inside env when opens are skipped (no‑trade window vs risk sizing).
+  - Sanity script `scripts/debug_trade_check.py` confirms trades on SPY and BBVA slices.
 
-- **Pending Tasks:**
-  - [ ] Investigate why the agent is not producing any trades, even though the backtest is running without errors.
-  - [ ] Add more logging to the backtest module to get more insight into the agent's behavior.
-  - [ ] Consider adding a simple baseline agent to the backtest to verify that the backtest module is working correctly.
+- Pending Tasks:
+  - [ ] Add a configurable baseline (e.g., alternating/trend SMA) to `BacktestEvaluator` for smoke tests without SB3.
+  - [ ] Harden VecNormalize restoration across folds with shape guard + auto-disable on mismatch.
+  - [ ] Hyperparam sweep for BBVA 2020‑09→2024‑12; select top folds and ensemble for 2025‑H1.

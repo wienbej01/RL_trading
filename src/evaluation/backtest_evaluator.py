@@ -19,6 +19,12 @@ from scipy.stats import jarque_bera, shapiro, kstest
 
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
+import numpy as _np
+import math as _math
+try:
+    import cloudpickle as _cpkl
+except Exception:
+    import pickle as _cpkl
 from ..utils.metrics import calculate_performance_metrics, calculate_risk_metrics
 from ..sim.env_intraday_rl import IntradayRLEnv
 from ..sim.execution import ExecParams
@@ -226,14 +232,21 @@ class BacktestEvaluator:
             # Try to load feature column metadata saved at training
             self._feature_list = None
             try:
-                meta_path = Path(str(model_path) + "_features.json")
-                if meta_path.exists():
+                # Support both naming conventions: 'model_features.json' and 'model.zip_features.json'
+                candidates = [
+                    Path(model_path).with_name('model_features.json'),
+                    Path(str(model_path) + "_features.json"),
+                ]
+                meta_path = next((p for p in candidates if p.exists()), None)
+                if meta_path is not None and meta_path.exists():
                     with open(meta_path, 'r') as f:
                         meta = json.load(f)
                     feats = meta.get('features')
                     if isinstance(feats, list) and feats:
                         self._feature_list = feats
-                        logger.info(f"Loaded {len(self._feature_list)} training feature columns from metadata")
+                        logger.info(f"Loaded {len(self._feature_list)} training feature columns from {meta_path.name}")
+                else:
+                    logger.info("No saved feature list found; using current pipeline features as-is")
             except Exception as e:
                 logger.warning(f"Feature metadata load skipped: {e}")
             
@@ -269,19 +282,55 @@ class BacktestEvaluator:
             
             # Initialize environment
             env = self._create_environment(df)
-            
-            # Run backtest with VecNormalize if available (normalized obs to match training)
-            logger.info("Running backtest...")
             try:
-                from src.sim.dummy_vec_env import GymnasiumDummyVecEnv
-                vec_env = GymnasiumDummyVecEnv([lambda: env])
-            except Exception as e:
-                logger.warning(f"VecNormalize setup failed: {e}. Proceeding without it.")
-                from src.sim.dummy_vec_env import GymnasiumDummyVecEnv
-                vec_env = GymnasiumDummyVecEnv([lambda: env])
+                logger.info(f"Env obs_dim={env.observation_space.shape} feats={getattr(env, 'features', getattr(env, 'X', None)).shape if hasattr(env, 'features') or hasattr(env, 'X') else 'n/a'} bars={len(getattr(env, 'df', df))}")
+            except Exception:
+                pass
 
-            import numpy as _np
+            # Wrap env and try to restore VecNormalize stats saved alongside the model
+            logger.info("Running backtest...")
+            from src.sim.dummy_vec_env import GymnasiumDummyVecEnv
+            vec_env = GymnasiumDummyVecEnv([lambda: env])
+            # VecNormalize restoration is skipped to ensure Gymnasium-compatible stepping.
+            # If needed, we can add a flag to enable it when using SB3 DummyVecEnv.
+
+            # Optional: load VecNormalize stats and manually normalize obs
+            vn_stats = None
+            try:
+                vn_path = Path(model_path).parent / "vecnormalize.pkl"
+                if vn_path.exists():
+                    vn_obj = _cpkl.load(open(vn_path, 'rb'))
+                    # Expected to be a VecNormalize instance; extract obs_rms
+                    obs_rms = getattr(vn_obj, 'obs_rms', None)
+                    if obs_rms is not None and hasattr(obs_rms, 'mean') and hasattr(obs_rms, 'var'):
+                        vn_stats = {
+                            'mean': _np.array(obs_rms.mean),
+                            'var': _np.array(obs_rms.var),
+                            'clip': float(getattr(vn_obj, 'clip_obs', 10.0) or 10.0)
+                        }
+                        logger.info(f"Loaded VecNormalize stats (manual) with shape={vn_stats['mean'].shape}")
+            except Exception as e:
+                logger.warning(f"VecNormalize manual load skipped: {e}")
+
+            def _norm_obs(obs_arr):
+                if vn_stats is None:
+                    return obs_arr
+                try:
+                    # obs_arr shape (n_env, obs_dim)
+                    mean = vn_stats['mean']; var = vn_stats['var']; clip = vn_stats['clip']
+                    if mean.shape != obs_arr.shape[1:]:
+                        # Shape mismatch: skip normalization
+                        return obs_arr
+                    std = _np.sqrt(_np.maximum(var, 1e-8))
+                    out = (obs_arr - mean) / std
+                    if _np.isfinite(clip) and clip > 0:
+                        out = _np.clip(out, -clip, clip)
+                    return out
+                except Exception:
+                    return obs_arr
+
             obs = vec_env.reset()
+            obs = _norm_obs(obs)
             done = _np.zeros((vec_env.num_envs,), dtype=bool)
             step = 0
             state = None
@@ -307,11 +356,25 @@ class BacktestEvaluator:
                         action_counts["hold"] += 1
                     elif a == 2:
                         action_counts["long"] += 1
-                obs, reward, done, info, truncated = vec_env.step(_np.array(acts))
-                done = _np.array(done)
+                step_out = vec_env.step(_np.array(acts))
+                # Handle both 4-tuple (SB3) and 5-tuple (Gymnasium) step outputs
+                if isinstance(step_out, tuple) and len(step_out) == 5:
+                    obs, reward, terminated, truncated, infos = step_out
+                    done = _np.logical_or(_np.array(terminated), _np.array(truncated))
+                    log_done = _np.array(done)
+                else:
+                    obs, reward, done, infos = step_out
+                    done = _np.array(done)
+                    log_done = done
+                # Normalize next observations if stats are available
+                obs = _norm_obs(obs)
+                if step < 10:
+                    logger.info(f"step={step}, action={acts}, reward={reward}, done={log_done}")
                 episode_start = done
                 step += 1
             logger.info(f"Backtest steps={step}, first_actions={first_actions}, action_counts={action_counts}")
+            if step <= 1:
+                logger.warning("Backtest terminated in <=1 steps; likely a reset/termination mismatch. Check VecNormalize shapes and no-trade windows.")
             
             # Extract results
             self._extract_results(env)
@@ -327,7 +390,7 @@ class BacktestEvaluator:
             return self.backtest_result
             
         except Exception as e:
-            logger.error(f"Error in backtest: {e}")
+            logger.exception(f"Error in backtest: {e}")
             return None
     
     def _create_environment(self, df: pd.DataFrame) -> IntradayRLEnv:
@@ -344,6 +407,11 @@ class BacktestEvaluator:
         features_cfg = self.settings.get('features', default={})
         feature_pipeline = FeaturePipeline(features_cfg if isinstance(features_cfg, dict) else {})
         X = feature_pipeline.transform(df)
+        # Align to price index and fill like training does
+        try:
+            X = X.reindex(df.index).ffill().bfill()
+        except Exception:
+            X = X.reindex(df.index)
 
         # Align features to training feature list if available
         try:
@@ -353,14 +421,26 @@ class BacktestEvaluator:
                 for col in feat_list:
                     if col not in X.columns:
                         X[col] = 0.0
+                # Reorder columns to training order
                 X = X[feat_list]
-                logger.info(f"Aligned features to training list: {len(feat_list)} columns")
+                # Final fill for any residual NaNs (non-critical features)
+                X = X.ffill().bfill().fillna(0.0)
+                logger.info(f"Aligned features to training list: {len(feat_list)} columns; rows={len(X)}")
         except Exception as e:
             logger.warning(f"Feature alignment skipped: {e}")
 
-        # Drop rows with NaNs
-        X.dropna(inplace=True)
-        df = df.loc[X.index]
+        # Avoid overly aggressive dropping; ensure OHLCV is intact
+        # Fill any remaining NaNs in features with zeros; keep df index
+        nan_before = int(X.isna().sum().sum()) if hasattr(X, 'isna') else 0
+        X = X.fillna(0.0)
+        nan_after = int(X.isna().sum().sum()) if hasattr(X, 'isna') else 0
+        if nan_before > 0:
+            logger.info(f"Filled {nan_before - nan_after} NaN feature values after alignment")
+        # Keep df indexed to X (should be same index now); if not, intersect
+        if not X.index.equals(df.index):
+            common_idx = df.index.intersection(X.index)
+            df = df.loc[common_idx]
+            X = X.loc[common_idx]
         
         # Create execution parameters
         exec_params = ExecParams(
@@ -434,6 +514,13 @@ class BacktestEvaluator:
                 equity_df.set_index('timestamp', inplace=True)
             returns = equity_df['equity'].pct_change().dropna()
         
+        # Guard: empty returns (e.g., episode had 0 or 1 step)
+        if len(returns) == 0:
+            logger.warning("Empty returns series during metric calculation; skipping performance/risk metrics")
+            self.performance_metrics = {}
+            self.risk_metrics = {}
+            return
+        
         # Calculate performance metrics
         self.performance_metrics = calculate_performance_metrics(returns)
         
@@ -463,8 +550,12 @@ class BacktestEvaluator:
         
         # Basic performance metrics
         total_return = (equity_df['equity'].iloc[-1] / equity_df['equity'].iloc[0]) - 1
-        annual_return = (1 + returns.mean()) ** 252 - 1
-        annual_volatility = returns.std() * np.sqrt(252)
+        if len(returns) > 0:
+            annual_return = (1 + returns.mean()) ** 252 - 1
+            annual_volatility = returns.std() * np.sqrt(252)
+        else:
+            annual_return = 0.0
+            annual_volatility = 0.0
         
         # Risk-adjusted metrics
         sharpe_ratio = (annual_return - self.config.risk_free_rate) / annual_volatility if annual_volatility > 0 else 0.0
@@ -480,13 +571,21 @@ class BacktestEvaluator:
         calmar_ratio = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0.0
         
         # Value at Risk
-        var_95 = np.percentile(returns, 5)
-        var_99 = np.percentile(returns, 1)
+        if len(returns) > 0:
+            var_95 = np.percentile(returns, 5)
+            var_99 = np.percentile(returns, 1)
+        else:
+            var_95 = 0.0
+            var_99 = 0.0
         
         # Conditional Value at Risk
-        returns_sorted = np.sort(returns)
-        cvar_95 = returns_sorted[returns_sorted <= var_95].mean() if len(returns_sorted[returns_sorted <= var_95]) > 0 else var_95
-        cvar_99 = returns_sorted[returns_sorted <= var_99].mean() if len(returns_sorted[returns_sorted <= var_99]) > 0 else var_99
+        if len(returns) > 0:
+            returns_sorted = np.sort(returns)
+            cvar_95 = returns_sorted[returns_sorted <= var_95].mean() if len(returns_sorted[returns_sorted <= var_95]) > 0 else var_95
+            cvar_99 = returns_sorted[returns_sorted <= var_99].mean() if len(returns_sorted[returns_sorted <= var_99]) > 0 else var_99
+        else:
+            cvar_95 = 0.0
+            cvar_99 = 0.0
         
         # Trade analysis
         total_trades = len(self.trade_history)
@@ -561,8 +660,14 @@ class BacktestEvaluator:
         payoff_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
         
         # Transaction costs
-        total_commission = sum(t.get('commission', 0) for t in self.trade_history)
-        total_slippage = sum(t.get('slippage', 0) for t in self.trade_history)
+        # Support both unified 'commission' and split 'commission_entry/commission_exit'
+        def _comm(t):
+            c = float(t.get('commission', 0) or 0)
+            ce = float(t.get('commission_entry', 0) or 0)
+            cx = float(t.get('commission_exit', 0) or 0)
+            return c if c != 0 else (ce + cx)
+        total_commission = sum(_comm(t) for t in self.trade_history)
+        total_slippage = sum(float(t.get('slippage', 0) or 0) for t in self.trade_history)
         total_transaction_costs = total_commission + total_slippage
         
         # Final metrics

@@ -6,6 +6,19 @@ class GymnasiumDummyVecEnv(DummyVecEnv):
     def __init__(self, env_fns):
         super().__init__(env_fns)
 
+    def reset(self):
+        """Reset gymnasium-style envs and return only observations array.
+        Discards the infos returned by env.reset()."""
+        obs_list = []
+        for env in self.envs:
+            out = env.reset()
+            if isinstance(out, tuple) and len(out) == 2:
+                obs, _info = out
+            else:
+                obs = out
+            obs_list.append(obs)
+        return np.array(obs_list)
+
     def step(self, actions):
         self.step_async(actions)
         return self.step_wait()
