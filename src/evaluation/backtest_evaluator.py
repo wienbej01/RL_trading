@@ -280,19 +280,10 @@ class BacktestEvaluator:
                 logger.warning("No rows after date filtering; using full dataset for backtest")
                 df = df_all
             
-            # Initialize environment
-            env = self._create_environment(df)
-            try:
-                logger.info(f"Env obs_dim={env.observation_space.shape} feats={getattr(env, 'features', getattr(env, 'X', None)).shape if hasattr(env, 'features') or hasattr(env, 'X') else 'n/a'} bars={len(getattr(env, 'df', df))}")
-            except Exception:
-                pass
-
-            # Wrap env and try to restore VecNormalize stats saved alongside the model
-            logger.info("Running backtest...")
-            from src.sim.dummy_vec_env import GymnasiumDummyVecEnv
-            vec_env = GymnasiumDummyVecEnv([lambda: env])
-            # VecNormalize restoration is skipped to ensure Gymnasium-compatible stepping.
-            # If needed, we can add a flag to enable it when using SB3 DummyVecEnv.
+            # Run backtest day-by-day across the evaluation window
+            dates = _np.unique(_np.array([ts.date() for ts in df.index]))
+            equity_entries = []
+            all_trades = []
 
             # Optional: load VecNormalize stats and manually normalize obs
             vn_stats = None
@@ -300,7 +291,6 @@ class BacktestEvaluator:
                 vn_path = Path(model_path).parent / "vecnormalize.pkl"
                 if vn_path.exists():
                     vn_obj = _cpkl.load(open(vn_path, 'rb'))
-                    # Expected to be a VecNormalize instance; extract obs_rms
                     obs_rms = getattr(vn_obj, 'obs_rms', None)
                     if obs_rms is not None and hasattr(obs_rms, 'mean') and hasattr(obs_rms, 'var'):
                         vn_stats = {
@@ -316,10 +306,8 @@ class BacktestEvaluator:
                 if vn_stats is None:
                     return obs_arr
                 try:
-                    # obs_arr shape (n_env, obs_dim)
                     mean = vn_stats['mean']; var = vn_stats['var']; clip = vn_stats['clip']
                     if mean.shape != obs_arr.shape[1:]:
-                        # Shape mismatch: skip normalization
                         return obs_arr
                     std = _np.sqrt(_np.maximum(var, 1e-8))
                     out = (obs_arr - mean) / std
@@ -329,55 +317,77 @@ class BacktestEvaluator:
                 except Exception:
                     return obs_arr
 
-            obs = vec_env.reset()
-            obs = _norm_obs(obs)
-            done = _np.zeros((vec_env.num_envs,), dtype=bool)
-            step = 0
-            state = None
-            episode_start = _np.ones((vec_env.num_envs,), dtype=bool)
-            action_counts = {"short": 0, "hold": 0, "long": 0}
-            first_actions = []
-            while not done.all():
-                if use_recurrent:
-                    action, state = model.predict(obs, state=state, episode_start=episode_start, deterministic=True)
-                else:
-                    action, _ = model.predict(obs, deterministic=True)
-                # SB3 returns shape (n_env,); tally mapping as per raw IntradayRLEnv: 0=short,1=hold,2=long
+            from src.sim.dummy_vec_env import GymnasiumDummyVecEnv
+
+            total_steps = 0
+            total_counts = {"short": 0, "hold": 0, "long": 0}
+            for d in dates:
+                day_df = df.loc[str(d)]
+                if len(day_df) < 100:
+                    continue
+                env = self._create_environment(day_df)
+                vec_env = GymnasiumDummyVecEnv([lambda: env])
+                obs = vec_env.reset(); obs = _norm_obs(obs)
+                done = _np.zeros((vec_env.num_envs,), dtype=bool)
+                step = 0
+                state = None
+                episode_start = _np.ones((vec_env.num_envs,), dtype=bool)
+                counts = {"short": 0, "hold": 0, "long": 0}
+                while not done.all():
+                    if use_recurrent:
+                        action, state = model.predict(obs, state=state, episode_start=episode_start, deterministic=True)
+                    else:
+                        action, _ = model.predict(obs, deterministic=True)
+                    try:
+                        acts = [int(a) for a in action]
+                    except Exception:
+                        acts = [int(action)]
+                    for a in acts:
+                        if a == 0: counts["short"] += 1
+                        elif a == 1: counts["hold"] += 1
+                        elif a == 2: counts["long"] += 1
+                    step_out = vec_env.step(_np.array(acts))
+                    if isinstance(step_out, tuple) and len(step_out) == 5:
+                        obs, reward, terminated, truncated, infos = step_out
+                        done = _np.logical_or(_np.array(terminated), _np.array(truncated))
+                    else:
+                        obs, reward, done, infos = step_out
+                        done = _np.array(done)
+                    obs = _norm_obs(obs)
+                    episode_start = done
+                    step += 1
+                total_steps += step
+                for k in total_counts:
+                    total_counts[k] += counts[k]
                 try:
-                    acts = [int(a) for a in action]
+                    print(f"Day {d} steps={step}, action_counts={counts}")
                 except Exception:
-                    acts = [int(action)]
-                if step < 10:
-                    first_actions.extend(acts)
-                for a in acts:
-                    if a == 0:
-                        action_counts["short"] += 1
-                    elif a == 1:
-                        action_counts["hold"] += 1
-                    elif a == 2:
-                        action_counts["long"] += 1
-                step_out = vec_env.step(_np.array(acts))
-                # Handle both 4-tuple (SB3) and 5-tuple (Gymnasium) step outputs
-                if isinstance(step_out, tuple) and len(step_out) == 5:
-                    obs, reward, terminated, truncated, infos = step_out
-                    done = _np.logical_or(_np.array(terminated), _np.array(truncated))
-                    log_done = _np.array(done)
-                else:
-                    obs, reward, done, infos = step_out
-                    done = _np.array(done)
-                    log_done = done
-                # Normalize next observations if stats are available
-                obs = _norm_obs(obs)
-                if step < 10:
-                    logger.info(f"step={step}, action={acts}, reward={reward}, done={log_done}")
-                episode_start = done
-                step += 1
-            logger.info(f"Backtest steps={step}, first_actions={first_actions}, action_counts={action_counts}")
-            if step <= 1:
-                logger.warning("Backtest terminated in <=1 steps; likely a reset/termination mismatch. Check VecNormalize shapes and no-trade windows.")
-            
-            # Extract results
-            self._extract_results(env)
+                    pass
+                # Collect equity and trades
+                try:
+                    eq = env.get_equity_curve()
+                    if hasattr(eq, 'items'):
+                        for ts, val in eq.items():
+                            equity_entries.append({'timestamp': ts, 'equity': float(val), 'pnl': 0.0})
+                except Exception:
+                    pass
+                try:
+                    if hasattr(env, 'trades') and env.trades:
+                        all_trades.extend(env.trades)
+                    elif hasattr(env, 'trade_history') and env.trade_history:
+                        all_trades.extend(env.trade_history)
+                except Exception:
+                    pass
+
+            logger.info(f"Backtest total_steps={total_steps}, action_counts={total_counts}")
+            try:
+                print(f"Backtest total_steps={total_steps}, action_counts={total_counts}")
+            except Exception:
+                pass
+
+            # Assign accumulated results
+            self.equity_curve = equity_entries
+            self.trade_history = all_trades
             
             # Calculate metrics
             self._calculate_metrics()
