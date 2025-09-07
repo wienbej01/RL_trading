@@ -136,6 +136,20 @@ PYTHONPATH=$(pwd) venv/bin/python scripts/generate_performance_report.py \
 No extra flags required; the script auto‑loads `vecnormalize.pkl` next to the model
 and normalizes observations before `predict()`.
 
+### Reward Modes
+
+The environment supports multiple reward modes (set in `configs/settings.yaml`):
+
+- `pnl`: raw realized PnL with penalties.
+- `dsr`: differential Sharpe update per step.
+- `blend`: weighted mix of DSR and PnL.
+- `directional`: directional shaping on chosen action using bar return.
+- `hybrid` (recommended): DSR + PnL + directional shaping `dir_weight * action * bar_return`.
+
+When facing "hold‑only" policies, switch to `hybrid` and tune:
+- `env.reward.dir_weight` (e.g., 100–200)
+- `env.reward.open_bonus`, `hold_penalty`, and `trade_target_per_day`
+
 ### Output Reports
 
 *   **Console Output:** Detailed episode-by-episode results and overall performance metrics are printed to the console.

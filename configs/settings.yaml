@@ -128,19 +128,29 @@ risk:
 
 env:
   step_seconds: 60
+  reward_scaling: 1.0
   reward:
-    kind: "blend"             # blend of DSR and raw pnl with penalties
+    kind: "hybrid"            # hybrid of DSR, raw pnl and directional shaping
     dd_penalty: 0.1
     eod_inventory_penalty: 0.5
-    alpha: 0.5   # DSR weight
-    beta: 0.5    # raw pnl weight
-    micro_penalty: 0.001
+    alpha: 0.2    # DSR weight
+    beta: 0.3     # raw pnl weight
+    dir_weight: 1500.0   # scales action*bar_return shaping (high for warm-start)
+    micro_penalty: 0.0005
+    # Activity shaping to avoid hold-only policies
+    open_bonus: 0.10
+    trade_target_per_day: 8        # target ~5-10 trades/day
+    trade_activity_bonus: 0.03     # reward when <= target
+    trade_activity_penalty: 0.02   # penalize excessive trades beyond target
+    hold_penalty: 0.10             # discourage persistent holds when flat
   trading:
-    no_trade_open_minutes: 10
-    no_trade_close_minutes: 10
+    episode_day_mode: sequential   # sequential|random episode day starts
+    force_open_epsilon: 0.05       # training-only: flip hold->side with small probability when flat
+    no_trade_open_minutes: 5
+    no_trade_close_minutes: 5
     widen_spread_minutes: 15
-    max_trades_per_hour: 2
-    max_holding_minutes: 45
+    max_trades_per_hour: 6
+    max_holding_minutes: 30
 
 train:
   algo: "ppo_lstm"
@@ -152,7 +162,7 @@ train:
   gae_lambda: 0.97
   clip_range: 0.2
   vf_coef: 0.5
-  ent_coef: 0.01 #0.005
+  ent_coef: 0.02 # encourage exploration early
   n_steps: 1024
   target_kl: 0.03
   lr_schedule: cosine   # none|linear|cosine

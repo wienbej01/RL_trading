@@ -63,16 +63,30 @@ Updated: 2025-09-04
 
 ## Phase 6 — Backtest Debugging (In Progress)
 
-- Status: Backtest functional; trades now occur under deterministic and model-driven loops. Remaining: align model obs/normalization robustly for all saved folds and tune for profitability.
+- Status: Backtest stable and stepping; feature alignment and manual VecNormalize in place. Initial “no trades” solved (env trades under deterministic policies), but trained models tended to “hold-only”.
 
 - Work Done:
-  - Fixed execution/risk wiring: replaced missing `ExecutionSimulator` with `ExecutionEngine` and corrected settings access (no more `TypeError: unhashable type: 'dict'`).
-  - Backtester parity fixes: load saved `VecNormalize` stats when shapes match; fallback gracefully when not; handle both 4- and 5‑tuple step APIs (SB3 vs Gymnasium).
-  - Feature parity: backtester now discovers `model_features.json` or `model.zip_features.json` and aligns columns (add missing=0, drop extras).
-  - Added DEBUG breadcrumbs inside env when opens are skipped (no‑trade window vs risk sizing).
-  - Sanity script `scripts/debug_trade_check.py` confirms trades on SPY and BBVA slices.
+  - Parity & stability:
+    - Feature alignment to training list; robust NaN filling; Gymnasium‑safe DummyVecEnv.
+    - Manual VecNormalize: loads `vecnormalize.pkl` and normalizes obs on reset/step.
+    - Execution/risk wiring fixed; report sums commission correctly.
+  - Reward shaping upgrades:
+    - New `directional` and `hybrid` reward kinds: adds `dir_weight * action_dir * bar_return` to encourage taking a side.
+    - Activity shaping (open_bonus, trade_target_per_day, activity bonuses/penalties, hold_penalty) applied consistently, including hybrid.
+  - Diagnostics: action histogram and first actions logged during backtest.
 
 - Pending Tasks:
-  - [ ] Add a configurable baseline (e.g., alternating/trend SMA) to `BacktestEvaluator` for smoke tests without SB3.
-  - [ ] Harden VecNormalize restoration across folds with shape guard + auto-disable on mismatch.
-  - [ ] Hyperparam sweep for BBVA 2020‑09→2024‑12; select top folds and ensemble for 2025‑H1.
+  - [ ] Tune `dir_weight`, `open_bonus`, `hold_penalty`, and caps to reach ~5–10 trades/day on 2025‑H1.
+  - [ ] Longer retrain (300k–1M) under hybrid reward once trade frequency meets target.
+  - [ ] Optional: training warm‑start to avoid early hold local minima.
+
+## Phase 7 — Profitability Path (Planned)
+
+- Targets:
+  - Trade frequency: 5–10/day; avg duration 5–30m.
+  - OOS Sharpe > 0.3; Max DD < 10%.
+
+- Levers:
+  - Reward: `alpha/beta`, `dir_weight`, activity shaping, microstructure penalty by regime.
+  - Risk: stop/take multiples, 1% risk per trade, time‑stop 30–60m, trade/hour caps.
+  - Training: entropy anneal; lr schedule; embargo; cross‑month folds.

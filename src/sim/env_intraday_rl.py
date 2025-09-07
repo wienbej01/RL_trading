@@ -16,7 +16,7 @@ from gymnasium.spaces import Box, Discrete
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
 from ..utils.metrics import DifferentialSharpe
-from .execution import ExecutionEngine, ExecutionSimulator, estimate_tc, ExecParams
+from .execution import ExecutionEngine, estimate_tc, ExecParams
 from .risk import RiskManager, RiskConfig
 
 logger = get_logger(__name__)
@@ -89,8 +89,9 @@ class IntradayRLEnv(Env):
         self.ohlcv = self.ohlcv.loc[self.features.index]
 
         # Initialize components
-        logger.debug("Initializing ExecutionSimulator with empty Settings()")
-        self.exec_sim = ExecutionSimulator(Settings.from_paths('configs/settings.yaml'))
+        logger.debug("Initializing ExecutionEngine with settings from configs/settings.yaml")
+        # Use ExecutionEngine (there is no separate ExecutionSimulator class)
+        self.exec_sim = ExecutionEngine(settings=Settings.from_paths('configs/settings.yaml'))
         if exec_params:
             logger.debug(f"Processing exec_params: {exec_params}")
             # Handle both dictionary and dataclass ExecParams objects
@@ -158,6 +159,26 @@ class IntradayRLEnv(Env):
         # State tracking
         self.reset_state()
 
+        # Precompute day start indices (first bar at/after 09:30)
+        try:
+            times = self.df.index.time
+            day_mask = (self.df.index.hour == 9) & (self.df.index.minute >= 30)
+            # First index per calendar day at or after 09:30
+            day_keys = [d.date() for d in self.df.index]
+            first_seen = {}
+            self._day_starts = []
+            for idx, (t, is_rth) in enumerate(zip(day_keys, day_mask)):
+                if t not in first_seen and is_rth:
+                    first_seen[t] = idx
+                    self._day_starts.append(idx)
+            # Fallback: if none found, treat the first index as start
+            if not self._day_starts and len(self.df) > 0:
+                self._day_starts = [0]
+            self._day_ptr = -1  # will advance on first reset
+        except Exception:
+            self._day_starts = [0]
+            self._day_ptr = -1
+
         # Action space: -1 (short), 0 (flat), 1 (long)
         self.action_space = Discrete(3)
 
@@ -193,6 +214,8 @@ class IntradayRLEnv(Env):
         # Daily trade tracking for reward shaping
         self._daily_date = None
         self._daily_trade_count = 0
+        self._day_return_sum = 0.0
+        self._day_return_count = 0
         
         # Reset risk manager
         self.risk_manager.reset_daily_metrics()
@@ -212,8 +235,28 @@ class IntradayRLEnv(Env):
         
         # Reset state
         self.reset_state()
-        
-        # Seek first bar within RTH
+
+        # Determine day start mode (sequential or random) for episode starts
+        mode = 'sequential'
+        try:
+            mode = str(self.config.get('env', {}).get('trading', {}).get('episode_day_mode', 'sequential')) if isinstance(self.config, dict) else 'sequential'
+        except Exception:
+            mode = 'sequential'
+        if mode not in ('sequential', 'random'):
+            mode = 'sequential'
+
+        # Choose start index
+        if mode == 'random':
+            try:
+                self.i = int(np.random.choice(self._day_starts))
+            except Exception:
+                self.i = 0
+        else:
+            # sequential: advance pointer day by day
+            self._day_ptr = (self._day_ptr + 1) % max(1, len(self._day_starts))
+            self.i = int(self._day_starts[self._day_ptr])
+
+        # Ensure we land within RTH
         while self.i < len(self.df) and not self._tod(self.df.index[self.i]):
             self.i += 1
         
@@ -232,6 +275,17 @@ class IntradayRLEnv(Env):
         Returns:
             Observation, reward, done, truncated, info
         """
+        # Normalize action to a scalar int (handles numpy types/arrays)
+        try:
+            # Fast path for numpy/int-like
+            if isinstance(action, (np.integer, int)):
+                act = int(action)
+            else:
+                # Flatten arrays/lists to a single scalar
+                act = int(np.asarray(action).astype(int).item())
+        except Exception:
+            act = 1  # default to hold
+
         # Current bar
         ts = self.df.index[self.i]
         # Reset daily counters on date change
@@ -276,7 +330,8 @@ class IntradayRLEnv(Env):
         prev_equity = float(getattr(self, "equity", self.cash))
 
         # Execute action mapping used by this environment (internal actions 0,1,2 map to -1,0,1 dir)
-        desired_dir = {-1: -1, 0: 0, 1: 1}[action - 1] if action in (0, 1, 2) else 0
+        # Robust containment check now that act is an int
+        desired_dir = {-1: -1, 0: 0, 1: 1}[act - 1] if act in (0, 1, 2) else 0
         reward = 0.0
         info: Dict[str, Any] = {}
 
@@ -439,6 +494,33 @@ class IntradayRLEnv(Env):
                       (close_min and session_close - close_min <= minutes_since_midnight < session_close)
 
         # Apply desired action if flat (or change direction after exit) and not in no-trade window
+        # Optional training-time forcing: with small probability, flip a hold into a side to seed exploration
+        try:
+            force_eps = float(self.config.get('env', {}).get('trading', {}).get('force_open_epsilon', 0.0)) if isinstance(self.config, dict) else 0.0
+            force_frac = float(self.config.get('env', {}).get('trading', {}).get('force_warmup_frac', 0.0)) if isinstance(self.config, dict) else 0.0
+        except Exception:
+            force_eps = 0.0
+            force_frac = 0.0
+
+        # Warm-up forcing only in first portion of the session
+        in_warmup = False
+        try:
+            session_open = 9 * 60 + 30
+            session_close = 16 * 60
+            minutes_since_midnight = ts.hour * 60 + ts.minute
+            if session_open <= minutes_since_midnight < session_close and (session_close - session_open) > 0:
+                frac_elapsed = (minutes_since_midnight - session_open) / float(session_close - session_open)
+                in_warmup = (frac_elapsed <= force_frac)
+        except Exception:
+            in_warmup = False
+
+        if self.pos == 0 and desired_dir == 0 and not in_no_trade and force_eps > 0.0 and in_warmup:
+            try:
+                if np.random.rand() < force_eps:
+                    desired_dir = 1 if np.random.rand() < 0.5 else -1
+            except Exception:
+                pass
+
         if desired_dir != 0 and self.pos == 0 and not hit_exit and not in_no_trade:
             # Cap trades per hour
             try:
@@ -474,6 +556,15 @@ class IntradayRLEnv(Env):
                     pass
                 self.entry_index = self.i
                 self.scale_out_done = False
+            else:
+                # Helpful debug breadcrumbs when trades fail to open
+                logger.debug(
+                    "Skip open: contracts=0 (risk sizing) | price=%.4f atr=%.4f equity=%.2f stop_r=%.3f",
+                    price, atr_val, self.equity,
+                    float(getattr(self.risk_manager.risk_config, 'stop_r_multiple', 1.0))
+                )
+        elif desired_dir != 0 and self.pos == 0 and in_no_trade:
+            logger.debug("Skip open: in no-trade window at %s", ts)
 
         # Partial scale-out when in profit (optional)
         try:
@@ -524,6 +615,25 @@ class IntradayRLEnv(Env):
         risk_penalty = max(0.0, float(realised_fraction))  # penalize only when drawdown is present
 
         # --- Reward Calculation ---
+        # Compute bar return for optional directional shaping (de-meaned within day)
+        try:
+            prev_price = float(self.df["close"].iloc[self.i - 1]) if self.i > 0 else price
+            bar_return = (price - prev_price) / max(prev_price, 1e-8)
+        except Exception:
+            bar_return = 0.0
+
+        # Update daily mean return trackers (use previous mean to de-mean current return)
+        try:
+            day_mean_ret = (self._day_return_sum / max(1, self._day_return_count))
+        except Exception:
+            day_mean_ret = 0.0
+        eff_bar_return = float(bar_return - day_mean_ret)
+        # Update running stats after computing eff return
+        try:
+            self._day_return_sum += float(bar_return)
+            self._day_return_count += 1
+        except Exception:
+            pass
         if self.env_config.reward_type == 'pnl':
             reward = pnl
         elif self.env_config.reward_type == 'dsr':
@@ -577,8 +687,54 @@ class IntradayRLEnv(Env):
             except Exception:
                 pass
             reward -= float(drawdown_penalty) + float(risk_penalty)
+        elif self.env_config.reward_type == 'directional':
+            # Pure directional shaping on chosen action (short=-1, hold=0, long=1)
+            # Encourages taking a side even before a position is opened.
+            try:
+                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
+            except Exception:
+                dir_w = 100.0
+            reward = dir_w * float(desired_dir) * float(eff_bar_return)
+            reward -= float(drawdown_penalty) + float(risk_penalty)
+        elif self.env_config.reward_type == 'hybrid':
+            # Hybrid: blend of DSR, PnL, and directional shaping
+            try:
+                alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.2)) if isinstance(self.config, dict) else 0.2
+                beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.3)) if isinstance(self.config, dict) else 0.3
+                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
+            except Exception:
+                alpha, beta, dir_w = 0.2, 0.3, 100.0
+            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+            dsr_val = self.dsr.update(step_return)
+            reward = alpha * dsr_val + beta * pnl + dir_w * float(desired_dir) * float(eff_bar_return)
+            reward -= float(drawdown_penalty) + float(risk_penalty)
         else:  # Default to pnl with penalties
             reward = pnl - float(drawdown_penalty) - float(risk_penalty)
+
+        # Optional hold penalty to discourage persistent inactivity when flat
+        try:
+            hold_pen = float(self.config.get('env', {}).get('reward', {}).get('hold_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+            if hold_pen > 0.0 and desired_dir == 0 and self.pos == 0:
+                reward -= hold_pen
+        except Exception:
+            pass
+
+        # Optional activity shaping toward target trades/day (apply for blend and hybrid too)
+        try:
+            if self.entry_index == self.i:
+                target = int(self.config.get('env', {}).get('reward', {}).get('trade_target_per_day', 2)) if isinstance(self.config, dict) else 2
+                bonus = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
+                penalty = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                if self._daily_trade_count <= target:
+                    reward += bonus
+                else:
+                    reward -= penalty * max(0, int(self._daily_trade_count) - target)
+            else:
+                open_bonus = float(self.config.get('env', {}).get('reward', {}).get('open_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
+                if open_bonus > 0 and getattr(self, 'entry_index', None) == self.i:
+                    reward += open_bonus
+        except Exception:
+            pass
 
         reward *= self.env_config.reward_scaling
         reward = np.clip(reward, -1, 1)
