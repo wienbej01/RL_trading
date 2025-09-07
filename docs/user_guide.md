@@ -119,6 +119,23 @@ PYTHONPATH=$(pwd) python examples/polygon_rl_backtest_example.py \
   --plot
 ```
 
+### Normalized Evaluation (SB3 VecNormalize parity)
+
+If the model was trained with VecNormalize, the backtest report script now loads
+the saved statistics from `vecnormalize.pkl` and applies observation normalization
+manually for Gymnasium‑compatible envs. Just run:
+
+```bash
+PYTHONPATH=$(pwd) venv/bin/python scripts/generate_performance_report.py \
+  --model runs/wf_bbva_debug/fold_179/model.zip \
+  --data data/raw/BBVA_20250101_20250630_1min.parquet \
+  --start 2025-01-01 --end 2025-06-30 \
+  --out reports/BBVA_20250101_20250630_norm.json
+```
+
+No extra flags required; the script auto‑loads `vecnormalize.pkl` next to the model
+and normalizes observations before `predict()`.
+
 ### Output Reports
 
 *   **Console Output:** Detailed episode-by-episode results and overall performance metrics are printed to the console.
@@ -155,6 +172,36 @@ Here are some common issues and their solutions:
 7.  **`WARNING - No config attribute found or config is empty - using default settings`**
     *   **Cause:** The `settings.yaml` file is not being loaded correctly or is empty.
     *   **Fix:** Verify the path to `configs/settings.yaml` in your commands and ensure the file contains valid YAML.
+
+8.  **No trades or 1-row equity curve in backtest**
+    *   **Cause:** Feature collapse due to missing external data (e.g., SPY/QQQ for SMT, VIX), overly aggressive dropna, or VecNormalize mismatch.
+    *   **Fix:**
+        - Ensure data completeness:
+          - SPY 1‑min: `scripts/fetch_polygon_range.py --symbol SPY --start 2020-09-01 --end 2025-06-30 --out data/raw/SPY_1min.parquet`
+          - QQQ 1‑min: similar if needed
+          - VIX: `scripts/download_vix_data.py --start-date 2020-09-01 --end-date 2025-07-01`
+        - The report script now fills features (reindex→ffill/bfill→fillna(0)) and aligns to training feature list.
+        - Observation normalization is applied manually using saved `vecnormalize.pkl`.
+
+## 6. Data Completeness (SMT/VIX)
+
+For SMT features, ensure SPY and QQQ minute data exist for the evaluation period.
+VIX data is required when `features.vix.enabled: true`.
+
+Fetch examples:
+
+- SPY:
+  ```bash
+  export POLYGON_API_KEY=... # required
+  venv/bin/python scripts/fetch_polygon_range.py \
+    --symbol SPY --start 2020-09-01 --end 2025-06-30 \
+    --out data/raw/SPY_1min.parquet
+  ```
+- QQQ: repeat with `--symbol QQQ` if necessary
+- VIX:
+  ```bash
+  venv/bin/python scripts/download_vix_data.py --start-date 2020-09-01 --end-date 2025-07-01
+  ```
 
 ## 6. Repro Tips
 
