@@ -1,3 +1,10 @@
+import logging
+import sys
+import os
+
+logger = logging.getLogger(__name__)
+logger.info(f"Technical indicators module: __name__={__name__}, __package__={__package__}, cwd={os.getcwd()}")
+logger.info(f"Syspath: {sys.path[:3]}")  # first few for context
 """
 Technical indicators for the RL trading system.
 

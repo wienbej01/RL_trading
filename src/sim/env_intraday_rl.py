@@ -659,7 +659,9 @@ class IntradayRLEnv(Env):
             day_mean_ret = (self._day_return_sum / max(1, self._day_return_count))
         except Exception:
             day_mean_ret = 0.0
-        eff_bar_return = float(bar_return - day_mean_ret)
+        # Remove de-meaning bias - use raw bar_return for directional rewards
+        # The de-meaning was penalizing correct directional bets
+        eff_bar_return = float(bar_return)  # Use raw return, not de-meaned
         # Update running stats after computing eff return
         try:
             self._day_return_sum += float(bar_return)

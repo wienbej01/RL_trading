@@ -136,7 +136,7 @@ env:
     alpha: 0.15    # DSR weight
     beta: 0.25     # normalized PnL weight
     pnl_cap: 1.0
-    dir_weight: 300.0    # reduced further to balance long/short symmetry
+    dir_weight: 500.0    # increased to overcome hold penalty and encourage position-taking
     dir_ema_minutes: 30
     micro_penalty: 0.0005
     # Activity shaping to avoid hold-only policies
@@ -144,7 +144,7 @@ env:
     trade_target_per_day: 4        # legacy field; see activity.target_per_day
     trade_activity_bonus: 0.02     # legacy field; see activity.bonus
     trade_activity_penalty: 0.02   # legacy field; see activity.lagrange_eta
-    hold_penalty: 0.1             # increased to discourage excessive holds
+    hold_penalty: 0.02            # reduced to avoid over-penalizing holding when flat
     churn_penalty: 0.005
     dd_accel_penalty: 0.05
     directional_flip_training: true
@@ -152,7 +152,7 @@ env:
       lagrange_eta: 0.01
       lambda_init: 0.0
     activity:
-      target_per_day: 4
+      target_per_day: 8
       bonus: 0.02
       lagrange_eta: 0.01
       lambda_init: 0.0
