@@ -325,7 +325,20 @@ class BacktestEvaluator:
                 day_df = df.loc[str(d)]
                 if len(day_df) < 100:
                     continue
-                env = self._create_environment(day_df)
+                # Disable training-only forcing for evaluation by temporarily overriding settings
+                old_settings = self.settings
+                try:
+                    # Clone config dict and override forcing
+                    cfg_dict = old_settings._cfg.copy() if hasattr(old_settings, '_cfg') else {}
+                    cfg_dict.setdefault('env', {}).setdefault('trading', {})['force_open_epsilon'] = 0.0
+                    # Create a temp Settings with the overridden config
+                    temp = Settings.from_yaml(old_settings.meta.get('config_file')) if hasattr(old_settings, 'meta') else Settings()
+                    # Replace internal cfg with our overridden dict
+                    temp._cfg = cfg_dict
+                    self.settings = temp
+                    env = self._create_environment(day_df)
+                finally:
+                    self.settings = old_settings
                 vec_env = GymnasiumDummyVecEnv([lambda: env])
                 obs = vec_env.reset(); obs = _norm_obs(obs)
                 done = _np.zeros((vec_env.num_envs,), dtype=bool)

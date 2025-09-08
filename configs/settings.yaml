@@ -130,26 +130,45 @@ env:
   step_seconds: 60
   reward_scaling: 1.0
   reward:
-    kind: "hybrid"            # hybrid of DSR, raw pnl and directional shaping
+    kind: "hybrid2"           # advanced hybrid (norm PnL + DSR + drift-neutral directional + soft activity + churn + dd accel)
     dd_penalty: 0.1
     eod_inventory_penalty: 0.5
-    alpha: 0.2    # DSR weight
-    beta: 0.3     # raw pnl weight
-    dir_weight: 1500.0   # scales action*bar_return shaping (high for warm-start)
+    alpha: 0.15    # DSR weight
+    beta: 0.25     # normalized PnL weight
+    pnl_cap: 1.0
+    dir_weight: 500.0    # reduced to avoid directional dominance
+    dir_ema_minutes: 30
     micro_penalty: 0.0005
     # Activity shaping to avoid hold-only policies
-    open_bonus: 0.10
-    trade_target_per_day: 8        # target ~5-10 trades/day
-    trade_activity_bonus: 0.03     # reward when <= target
-    trade_activity_penalty: 0.02   # penalize excessive trades beyond target
-    hold_penalty: 0.10             # discourage persistent holds when flat
+    open_bonus: 0.04
+    trade_target_per_day: 6        # legacy field; see activity.target_per_day
+    trade_activity_bonus: 0.02     # legacy field; see activity.bonus
+    trade_activity_penalty: 0.02   # legacy field; see activity.lagrange_eta
+    hold_penalty: 0.08             # discourage persistent holds when flat
+    churn_penalty: 0.005
+    dd_accel_penalty: 0.05
+    directional_flip_training: true
+    side_balance:
+      lagrange_eta: 0.01
+      lambda_init: 0.0
+    activity:
+      target_per_day: 6
+      bonus: 0.02
+      lagrange_eta: 0.01
+      lambda_init: 0.0
+    regime_weights:
+      vix_low: 15
+      vix_high: 25
+      dir_weight_low: 0.7
+      dir_weight_high: 1.2
   trading:
     episode_day_mode: sequential   # sequential|random episode day starts
     force_open_epsilon: 0.05       # training-only: flip hold->side with small probability when flat
+    force_warmup_frac: 0.2         # apply forcing only in early portion of session
     no_trade_open_minutes: 5
     no_trade_close_minutes: 5
     widen_spread_minutes: 15
-    max_trades_per_hour: 6
+    max_trades_per_hour: 3
     max_holding_minutes: 30
 
 train:
@@ -162,11 +181,11 @@ train:
   gae_lambda: 0.97
   clip_range: 0.2
   vf_coef: 0.5
-  ent_coef: 0.02 # encourage exploration early
+  ent_coef: 0.05 # stronger exploration early
   n_steps: 1024
   target_kl: 0.03
   lr_schedule: cosine   # none|linear|cosine
-  ent_anneal_final: 0.003
+  ent_anneal_final: 0.01
   policy_kwargs:
     lstm_hidden_size: 128
     net_arch_pi: [128, 64]

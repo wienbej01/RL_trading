@@ -1,0 +1,8 @@
+{
+  "tag": "ob0.02_hp0_tt4_ec0.01",
+  "open_bonus": 0.02,
+  "hold_penalty": 0.0,
+  "trade_target_per_day": 4,
+  "ent_coef": 0.01,
+  "total_trades": 0
+}
