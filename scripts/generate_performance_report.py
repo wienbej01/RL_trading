@@ -21,6 +21,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.utils.config_loader import Settings
 from src.evaluation.backtest_evaluator import BacktestEvaluator
+import numpy as np
+from sb3_contrib import RecurrentPPO
+from tqdm import tqdm
 
 
 def main():
@@ -30,6 +33,7 @@ def main():
     parser.add_argument('--out', required=True, help='Output JSON path for report')
     parser.add_argument('--start', help='Override start date (YYYY-MM-DD) for backtest window')
     parser.add_argument('--end', help='Override end date (YYYY-MM-DD) for backtest window')
+    parser.add_argument('--seeds', type=int, default=1, help='Number of seeds for multi-seed validation (default: 1)')
     args = parser.parse_args()
 
     settings = Settings.from_paths('configs/settings.yaml')
@@ -45,9 +49,27 @@ def main():
         settings._cfg = cfg
 
     evaluator = BacktestEvaluator(settings)
-    result = evaluator.run_backtest(model_path=args.model, data_path=args.data)
-    if result is None:
-        raise SystemExit('Backtest failed; check logs')
+    if args.seeds > 1:
+        results = []
+        with tqdm(total=args.seeds, desc="Running backtests") as pbar:
+            for seed in range(args.seeds):
+                np.random.seed(seed)
+                model = RecurrentPPO.load(args.model)
+                result = evaluator.run_backtest(model_path=None, data_path=args.data, model=model, progress_bar=pbar)
+                if result is None:
+                    print(f"Seed {seed} backtest failed; skipping")
+                    continue
+                results.append(result)
+                pbar.update(1)
+        if results:
+            avg_result = {k: np.mean([r[k] for r in results]) for k in results[0].keys()}
+            result = avg_result
+        else:
+            raise SystemExit('All backtests failed; check logs')
+    else:
+        result = evaluator.run_backtest(model_path=args.model, data_path=args.data)
+        if result is None:
+            raise SystemExit('Backtest failed; check logs')
 
     out_path = Path(args.out)
     evaluator.save_backtest_report(str(out_path))

@@ -20,6 +20,7 @@ from .technical_indicators import (
     calculate_williams_r, calculate_returns, calculate_log_returns,
     calculate_vol_of_vol, calculate_sma_slope, calculate_obv
 )
+from ta.trend import ADXIndicator
 from .microstructure_features import (
     calculate_spread, calculate_microprice, calculate_queue_imbalance,
     calculate_order_flow_imbalance, calculate_vwap, calculate_twap,
@@ -392,6 +393,8 @@ class FeaturePipeline:
                 features['macd'] = macd['macd']
                 features['macd_signal'] = macd['signal']
                 features['macd_histogram'] = macd['histogram']
+                # MACD line for trend bias
+                features['macd_line'] = macd['macd'] - macd['signal']
             
             # Calculate Bollinger Bands
             if 'calculate_bollinger_bands' in tech_config and tech_config['calculate_bollinger_bands']:
@@ -416,14 +419,20 @@ class FeaturePipeline:
                 )
                 features['stoch_k'] = stoch['k']
                 features['stoch_d'] = stoch['d']
-            
+
             # Calculate Williams %R
             if 'calculate_williams_r' in tech_config and tech_config['calculate_williams_r']:
                 williams_window = tech_config.get('williams_window', 14)
                 features['williams_r'] = calculate_williams_r(
                     data['high'], data['low'], data['close'], williams_window
                 )
-        
+
+            # Calculate ADX for trend strength
+            if 'calculate_adx' in tech_config and tech_config['calculate_adx']:
+                adx_window = tech_config.get('adx_window', 14)
+                adx_ind = ADXIndicator(data['high'], data['low'], data['close'], window=adx_window)
+                features['adx'] = adx_ind.adx()
+
         # Extract microstructure features
         if 'microstructure' in self.config:
             micro_config = self.config['microstructure']
