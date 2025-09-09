@@ -216,6 +216,16 @@ class IntradayRLEnv(Env):
         self._daily_trade_count = 0
         self._day_return_sum = 0.0
         self._day_return_count = 0
+        # Lagrangian multiplier for activity soft-constraint
+        try:
+            self._lambda_activity = float(self.config.get('env', {}).get('reward', {}).get('activity', {}).get('lambda_init', 0.0)) if isinstance(self.config, dict) else 0.0
+        except Exception:
+            self._lambda_activity = 0.0
+        # Drawdown acceleration tracking (EMA of dd slope)
+        self._prev_dd = 0.0
+        self._dd_slope_ema = 0.0
+        # Last action direction for churn penalty
+        self._last_action_dir = 0
         
         # Reset risk manager
         self.risk_manager.reset_daily_metrics()
@@ -380,6 +390,23 @@ class IntradayRLEnv(Env):
             self.equity_curve.append(self.equity)
             obs = self._obs(ts, price)
             info["equity"] = float(self.equity)
+            # Update Lagrange multipliers at EOD
+            try:
+                tgt = int(self.config.get('env', {}).get('reward', {}).get('activity', {}).get('target_per_day', 0)) if isinstance(self.config, dict) else 0
+                eta = float(self.config.get('env', {}).get('reward', {}).get('activity', {}).get('lagrange_eta', 0.0)) if isinstance(self.config, dict) else 0.0
+                if tgt > 0 and eta > 0.0:
+                    gap = float(self._daily_trade_count - tgt)
+                    self._lambda_activity = max(0.0, float(self._lambda_activity) + eta * gap)
+            except Exception:
+                pass
+            try:
+                side_eta = float(self.config.get('env', {}).get('reward', {}).get('side_balance', {}).get('lagrange_eta', 0.01)) if isinstance(self.config, dict) else 0.01
+                if not hasattr(self, '_lambda_side'):
+                    self._lambda_side = float(self.config.get('env', {}).get('reward', {}).get('side_balance', {}).get('lambda_init', 0.0)) if isinstance(self.config, dict) else 0.0
+                gap_side = abs(int(getattr(self, '_daily_longs_open', 0)) - int(getattr(self, '_daily_shorts_open', 0)))
+                self._lambda_side = max(0.0, float(self._lambda_side) + side_eta * float(gap_side))
+            except Exception:
+                pass
             return obs, float(0.0), True, False, info
 
         # Update realized PnL between bars
@@ -552,6 +579,11 @@ class IntradayRLEnv(Env):
                     self._entry_tc = float(entry_tc)
                     # Increment daily trade count
                     self._daily_trade_count = int(self._daily_trade_count) + 1
+                    # Side-balance counters (opens)
+                    if self.pos > 0:
+                        self._daily_longs_open = int(getattr(self, '_daily_longs_open', 0)) + 1
+                    elif self.pos < 0:
+                        self._daily_shorts_open = int(getattr(self, '_daily_shorts_open', 0)) + 1
                 except Exception:
                     pass
                 self.entry_index = self.i
@@ -627,13 +659,38 @@ class IntradayRLEnv(Env):
             day_mean_ret = (self._day_return_sum / max(1, self._day_return_count))
         except Exception:
             day_mean_ret = 0.0
-        eff_bar_return = float(bar_return - day_mean_ret)
+        # Remove de-meaning bias - use raw bar_return for directional rewards
+        # The de-meaning was penalizing correct directional bets
+        eff_bar_return = float(bar_return)  # Use raw return, not de-meaned
         # Update running stats after computing eff return
         try:
             self._day_return_sum += float(bar_return)
             self._day_return_count += 1
         except Exception:
             pass
+        # Compute normalized PnL using ATR if requested
+        try:
+            pnl_cap = float(self.config.get('env', {}).get('reward', {}).get('pnl_cap', 1.0)) if isinstance(self.config, dict) else 1.0
+        except Exception:
+            pnl_cap = 1.0
+        pnl_norm = 0.0
+        try:
+            denom = max(1e-6, atr_val * float(getattr(self, 'point_value', 1.0)))
+            pnl_norm = float(np.clip(pnl / denom, -pnl_cap, pnl_cap))
+        except Exception:
+            pnl_norm = 0.0
+
+        # Drawdown acceleration penalty (EMA of dd slope)
+        try:
+            dd = (self.equity / max(self.max_equity, 1e-6)) - 1.0
+            dd_slope = float(dd - self._prev_dd)
+            self._prev_dd = float(dd)
+            # EMA update
+            dd_alpha = 0.2
+            self._dd_slope_ema = (1 - dd_alpha) * self._dd_slope_ema + dd_alpha * dd_slope
+        except Exception:
+            dd_slope = 0.0
+
         if self.env_config.reward_type == 'pnl':
             reward = pnl
         elif self.env_config.reward_type == 'dsr':
@@ -708,6 +765,42 @@ class IntradayRLEnv(Env):
             dsr_val = self.dsr.update(step_return)
             reward = alpha * dsr_val + beta * pnl + dir_w * float(desired_dir) * float(eff_bar_return)
             reward -= float(drawdown_penalty) + float(risk_penalty)
+        elif self.env_config.reward_type == 'hybrid2':
+            # Best-practice hybrid: normalized PnL + DSR + drift-neutral directional + activity soft-constraint + churn + dd accel
+            try:
+                alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.15)) if isinstance(self.config, dict) else 0.15
+                beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.25)) if isinstance(self.config, dict) else 0.25
+                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 300.0)) if isinstance(self.config, dict) else 300.0
+                churn_pen = float(self.config.get('env', {}).get('reward', {}).get('churn_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                dd_accel_pen = float(self.config.get('env', {}).get('reward', {}).get('dd_accel_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+            except Exception:
+                alpha, beta, dir_w, churn_pen, dd_accel_pen = 0.15, 0.25, 300.0, 0.0, 0.0
+            # Regime weighting via VIX if available
+            try:
+                vix = float(self.X.loc[ts].get('vix', np.nan))
+                if vix == vix:
+                    vix_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_low', 15.0))
+                    vix_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_high', 25.0))
+                    w_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_low', 0.7))
+                    w_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_high', 1.2))
+                    regime_mult = w_low if vix < vix_low else (w_high if vix > vix_high else 1.0)
+                else:
+                    regime_mult = 1.0
+            except Exception:
+                regime_mult = 1.0
+            # Activity term (apply on opens tracked separately below)
+            activity_term = 0.0
+            # Churn penalty: penalize side flips when flat
+            if self.pos == 0 and desired_dir != 0 and self._last_action_dir != 0 and desired_dir != self._last_action_dir:
+                activity_term -= churn_pen
+            # Drawdown acceleration penalty (only penalize positive slope)
+            if self._dd_slope_ema > 0:
+                activity_term -= dd_accel_pen * float(self._dd_slope_ema)
+            # Core blend
+            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+            dsr_val = self.dsr.update(step_return)
+            reward = alpha * dsr_val + beta * pnl_norm + dir_w * regime_mult * float(desired_dir) * float(eff_bar_return) + activity_term
+            reward -= float(drawdown_penalty) + float(risk_penalty)
         else:  # Default to pnl with penalties
             reward = pnl - float(drawdown_penalty) - float(risk_penalty)
 
@@ -719,16 +812,28 @@ class IntradayRLEnv(Env):
         except Exception:
             pass
 
-        # Optional activity shaping toward target trades/day (apply for blend and hybrid too)
+        # Optional activity shaping toward target trades/day (apply for blend/hybrid/hybrid2)
         try:
             if self.entry_index == self.i:
-                target = int(self.config.get('env', {}).get('reward', {}).get('trade_target_per_day', 2)) if isinstance(self.config, dict) else 2
-                bonus = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
-                penalty = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                # Open just happened this bar
+                target = int(self.config.get('env', {}).get('reward', {}).get('trade_target_per_day',
+                                         self.config.get('env', {}).get('reward', {}).get('activity', {}).get('target_per_day', 2))) if isinstance(self.config, dict) else 2
+                bonus = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_bonus',
+                                         self.config.get('env', {}).get('reward', {}).get('activity', {}).get('bonus', 0.0))) if isinstance(self.config, dict) else 0.0
                 if self._daily_trade_count <= target:
                     reward += bonus
                 else:
-                    reward -= penalty * max(0, int(self._daily_trade_count) - target)
+                    # Lagrangian penalty: penalize each open beyond target by current lambda
+                    reward -= float(self._lambda_activity)
+                # Side-balance penalty: penalize imbalance between long/short opens
+                try:
+                    side_eta = float(self.config.get('env', {}).get('reward', {}).get('side_balance', {}).get('lagrange_eta', 0.01)) if isinstance(self.config, dict) else 0.01
+                    if not hasattr(self, '_lambda_side'):
+                        self._lambda_side = float(self.config.get('env', {}).get('reward', {}).get('side_balance', {}).get('lambda_init', 0.0)) if isinstance(self.config, dict) else 0.0
+                    gap = abs(int(getattr(self, '_daily_longs_open', 0)) - int(getattr(self, '_daily_shorts_open', 0)))
+                    reward -= float(self._lambda_side) * float(gap)
+                except Exception:
+                    pass
             else:
                 open_bonus = float(self.config.get('env', {}).get('reward', {}).get('open_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
                 if open_bonus > 0 and getattr(self, 'entry_index', None) == self.i:
@@ -738,6 +843,11 @@ class IntradayRLEnv(Env):
 
         reward *= self.env_config.reward_scaling
         reward = np.clip(reward, -1, 1)
+        # Track last action dir for churn evaluation next step
+        try:
+            self._last_action_dir = int(np.sign(desired_dir))
+        except Exception:
+            pass
 
         # Daily kill-switch: terminate when realized drawdown exceeds threshold
         done = False

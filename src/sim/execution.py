@@ -63,8 +63,21 @@ class ExecutionEngine:
         else:
             # Use settings for production
             self.settings = settings
-            self.config = settings.get('execution', {}) if settings else {}
-            self.exec_params = ExecParams(**self.config)
+            # Use keyword default to avoid treating the default as a key (unhashable)
+            self.config = settings.get('execution', default={}) if settings else {}
+            # Filter only fields supported by ExecParams; map slippage (fraction) -> slippage_bps when present
+            allowed = {
+                'tick_value', 'spread_ticks', 'impact_bps',
+                'commission_per_contract', 'min_commission', 'slippage_bps', 'liquidity_threshold'
+            }
+            cfg = {k: v for k, v in (self.config or {}).items() if k in allowed}
+            # Map optional 'slippage' fraction to bps
+            if 'slippage' in (self.config or {}):
+                try:
+                    cfg['slippage_bps'] = float(self.config['slippage']) * 100.0
+                except Exception:
+                    pass
+            self.exec_params = ExecParams(**cfg)
         
         # Market microstructure parameters
         self.order_book_depth = self.config.get('order_book_depth', 10) if isinstance(self.config, dict) else 10

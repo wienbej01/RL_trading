@@ -198,7 +198,7 @@ class BacktestEvaluator:
         
         return config
     
-    def run_backtest(self, model_path: str, data_path: str) -> BacktestResult:
+    def run_backtest(self, model_path: str, data_path: str, model: Optional[Any] = None, progress_bar: Optional[Any] = None) -> BacktestResult:
         """
         Run backtest with trained model.
         
@@ -217,17 +217,19 @@ class BacktestEvaluator:
             logger.info("Starting backtest...")
             
             # Load model (support RecurrentPPO and PPO)
-            model = None
-            try:
-                from sb3_contrib import RecurrentPPO
-                model = RecurrentPPO.load(model_path)
-                logger.info("Loaded RecurrentPPO model")
-                use_recurrent = True
-            except Exception:
-                from stable_baselines3 import PPO
-                model = PPO.load(model_path)
-                logger.info("Loaded PPO model")
-                use_recurrent = False
+            if model is None:
+                try:
+                    from sb3_contrib import RecurrentPPO
+                    model = RecurrentPPO.load(model_path)
+                    logger.info("Loaded RecurrentPPO model")
+                    use_recurrent = True
+                except Exception:
+                    from stable_baselines3 import PPO
+                    model = PPO.load(model_path)
+                    logger.info("Loaded PPO model")
+                    use_recurrent = False
+            else:
+                use_recurrent = "RecurrentPPO" in str(type(model))
 
             # Try to load feature column metadata saved at training
             self._feature_list = None
@@ -321,11 +323,30 @@ class BacktestEvaluator:
 
             total_steps = 0
             total_counts = {"short": 0, "hold": 0, "long": 0}
+            if progress_bar is not None:
+                progress_bar.reset(total=len(dates))
+                progress_bar.set_description("Backtesting")
+
             for d in dates:
+                if progress_bar is not None:
+                    progress_bar.update(1)
                 day_df = df.loc[str(d)]
                 if len(day_df) < 100:
                     continue
-                env = self._create_environment(day_df)
+                # Disable training-only forcing for evaluation by temporarily overriding settings
+                old_settings = self.settings
+                try:
+                    # Clone config dict and override forcing
+                    cfg_dict = old_settings._cfg.copy() if hasattr(old_settings, '_cfg') else {}
+                    cfg_dict.setdefault('env', {}).setdefault('trading', {})['force_open_epsilon'] = 0.0
+                    # Create a temp Settings with the overridden config
+                    temp = Settings.from_yaml(old_settings.meta.get('config_file')) if hasattr(old_settings, 'meta') else Settings()
+                    # Replace internal cfg with our overridden dict
+                    temp._cfg = cfg_dict
+                    self.settings = temp
+                    env = self._create_environment(day_df)
+                finally:
+                    self.settings = old_settings
                 vec_env = GymnasiumDummyVecEnv([lambda: env])
                 obs = vec_env.reset(); obs = _norm_obs(obs)
                 done = _np.zeros((vec_env.num_envs,), dtype=bool)

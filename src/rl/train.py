@@ -211,6 +211,7 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
     Returns:
         An initialized IntradayRLEnv ready for training.
     """
+    logger.info("Building environment...")
     import pandas as pd
     import numpy as np
     from ..sim.env_intraday_rl import IntradayRLEnv, EnvConfig
@@ -220,7 +221,9 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
     # ---------------------------
     # 1) Load OHLCV and normalize timestamp/index
     # ---------------------------
+    logger.info("Loading OHLCV data...")
     df = pd.read_parquet(data_path)
+    logger.info("OHLCV data loaded.")
 
     # Accept either a 'timestamp' column or a DatetimeIndex (optionally epoch ms)
     if 'timestamp' in df.columns:
@@ -251,7 +254,9 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
     # ---------------------------
     # 2) Load features and align to OHLCV index
     # ---------------------------
+    logger.info("Loading features...")
     X = pd.read_parquet(features_path)
+    logger.info("Features loaded.")
 
     # Features may carry their own timestamp; normalize similarly
     if 'timestamp' in X.columns:
@@ -273,8 +278,10 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
 
     # Align features to price index, forward/back-fill for small gaps,
     # then drop remaining NaNs in critical OHLCV fields.
+    logger.info("Aligning features...")
     X = X.reindex(df.index).ffill().bfill()
     df = df.dropna(subset=["open", "high", "low", "close"])
+    logger.info("Features aligned.")
 
     # ---------------------------
     # 3) Pull execution/risk/env params from YAML
@@ -313,6 +320,7 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
     # ---------------------------
     # 4) Build environment (single EnvConfig here)
     # ---------------------------
+    logger.info("Initializing IntradayRLEnv...")
     env = IntradayRLEnv(
         ohlcv=df,
         features=X,
@@ -323,6 +331,7 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
         env_config=env_cfg,
         config=settings.to_dict()  # pass full YAML dict for any downstream needs
     )
+    logger.info("IntradayRLEnv initialized.")
 
     return env
 
@@ -352,7 +361,9 @@ def train_ppo_lstm(settings: Settings,
     torch.manual_seed(training_config.seed)
     
     # Build one environment (for single-env fallback)
+    logger.info("Building environment...")
     env = build_env(settings, data_path, features_path)
+    logger.info("Environment built.")
     # Save feature metadata next to model later
     feature_cols = []
     try:
@@ -361,6 +372,7 @@ def train_ppo_lstm(settings: Settings,
         pass
     
     # Create vectorized environment (support multi-env with subprocess workers)
+    logger.info("Creating vectorized environment...")
     from stable_baselines3.common.vec_env import VecNormalize
     n_envs = int(settings.get("train", "n_envs", default=1))
     if n_envs > 1:
@@ -379,6 +391,7 @@ def train_ppo_lstm(settings: Settings,
         vec_env = DummyVecEnv([lambda: env])
         logger.info("Using DummyVecEnv with n_envs=1")
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.)
+    logger.info("Vectorized environment created.")
     
     # Policy configuration
     policy_kwargs = dict(
@@ -500,6 +513,7 @@ def train_ppo_lstm(settings: Settings,
         log_interval=1000,
         progress_bar=True
     )
+    logger.info("Model training complete.")
     
     # Save model
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
@@ -723,11 +737,17 @@ def walk_forward_training(settings: Settings,
         wf_results.append(fold_results)
         
         # Save equity curve
-        equity_curve = test_env.envs[0].get_equity_curve()
+        equity_curve = vec_test_env.envs[0].get_equity_curve()
         equity_curve.to_csv(fold_dir / "equity_curve.csv")
         
-        # Save trades
-        trades = test_env.envs[0].get_trades()
+        # Save trades (if any)
+        try:
+            trades = vec_test_env.envs[0].get_trades()
+            if trades:
+                import pandas as _pd
+                _pd.DataFrame(trades).to_csv(fold_dir / "trades.csv", index=False)
+        except Exception:
+            pass
 
 
 
