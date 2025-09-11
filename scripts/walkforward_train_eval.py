@@ -47,11 +47,12 @@ def main():
 
     # Setup logging
     log_settings = settings.get('logging', default={})
+    file_settings = log_settings.get('file', {})
     setup_logging(
         level=log_settings.get('level', 'INFO'),
-        log_file=log_settings.get('file', 'logs/trading_system.log'),
-        max_bytes=log_settings.get('max_bytes', 10485760),
-        backup_count=log_settings.get('backup_count', 5)
+        log_file=file_settings.get('path', 'logs/walkforward.log'),
+        max_bytes=10485760, # Default 10MB, will fix parsing later
+        backup_count=file_settings.get('backup_count', 5)
     )
 
     training_config = TrainingConfig()

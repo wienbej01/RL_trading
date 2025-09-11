@@ -1077,4 +1077,7 @@ class FeaturePipeline:
                 raise ValueError("Manual selection requires 'selected_features' parameter")
         
         self.logger.info("Selected features: %s", self.selected_features)
-        return features[[col for col in features.columns if col in self.selected_features]]
+        if self.selected_features is not None:
+            return features[[col for col in features.columns if col in self.selected_features]]
+        else:
+            return features

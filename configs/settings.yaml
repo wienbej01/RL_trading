@@ -1,219 +1,426 @@
-project: rl-intraday
-seed: 42
+# Optimized configuration for production deployment
 
+# Data configuration optimized for memory and performance
 data:
-  instrument: BBVA
-  minute_file: data/raw/spy_1min.parquet        # Polygon data for SPY
-  vix_file: data/external/vix.csv
-  cvol_file: data/external/cvol.csv
-  macro_flags_file: data/external/macro_flags.csv
-  session:
-    tz: America/New_York
-    rth_start: "09:30"
-    rth_end: "16:00"
-  lookback_bars: 120            # ~2 hours context for LSTM
-  resample: "1min"
-  drop_na_policy: "forward_fill"
-  provider: auto  # Primary data provider: 'polygon', 'databento', or 'auto'
-  fallback_provider: databento  # Fallback data provider for reliability
-  polygon_timeout: 30  # Request timeout in seconds
-  polygon:
-    api_key: ${POLYGON_API_KEY}
-    base_url: https://api.polygon.io
-    api_version: v2
-    rate_limit:
-      calls_per_minute: 5
-      burst_limit: 10
-    retry:
-      attempts: 3
-      backoff_factor: 2.0
-    cache:
-      directory: data/cache/polygon
-      format: parquet
-      partition_format: "year=%Y/month=%m/day=%d"
-    validation:
-      enabled: true
-      fill_gaps: forward_fill
-      outlier_detection: true
-  databento:
-    api_key: ${DATABENTO_API_KEY}
+  # Use chunked loading for memory efficiency
+  use_chunked_loading: true
+  chunk_size: "1M"
+  
+  # Enable data caching
+  enable_caching: true
+  cache_dir: "data/cache"
+  
+  # Optimize data types
+  data_types:
+    numeric: "float32"
+    categorical: "category"
+  
+  # Multi-ticker configuration
+  multiticker:
+    enabled: true
+    max_tickers: 10
+    min_tickers: 3
+    universe_selection:
+      method: "dynamic"
+      rebalance_freq: "1M"
+      selection_metrics:
+        - "liquidity"
+        - "volatility"
+        - "trend_strength"
+        - "market_cap"
+      min_liquidity_percentile: 70
+      max_volatility_percentile: 90
 
+# Feature configuration optimized for performance
 features:
-  data_source: 'polygon'
+  # Enable feature selection
+  feature_selection:
+    enabled: true
+    method: "k_best"
+    k: 50
+    score_func: "f_regression"
+  
+  # Enable feature caching
+  enable_caching: true
+  cache_dir: "data/cache/features"
+  
+  # Optimize feature groups
   technical:
-    calculate_returns: true
-    calculate_log_returns: true
+    enabled: true
     sma_windows: [5, 10, 20, 50]
     ema_windows: [5, 10, 20, 50]
-    calculate_atr: true
-    atr_window: 10
     calculate_rsi: true
     rsi_window: 14
     calculate_macd: true
     calculate_bollinger_bands: true
-    bollinger_window: 20
-    calculate_stochastic: true
-    calculate_williams_r: true
-    # Additional intraday/VPA-style knobs
-    rvol_window: 390
-    vol_of_vol: { enabled: true, window: 14, vol_window: 14 }
+    calculate_atr: true
     calculate_adx: true
     adx_window: 14
-    sma_slope: { enabled: true, window: 20, slope_window: 5 }
-    obv: { enabled: true }
+  
   microstructure:
+    enabled: true
     calculate_spread: true
     calculate_microprice: true
     calculate_queue_imbalance: true
+    calculate_order_flow_imbalance: true
     calculate_vwap: true
     calculate_twap: true
+    twap_window: 5
     calculate_price_impact: true
-    fvg: { enabled: true }
+  
   time:
+    enabled: true
     extract_time_of_day: true
     extract_day_of_week: true
     extract_session_features: true
-  vix:
-    enabled: true
-    path: data/external/vix.parquet
-    term_structure: false
-  # New feature groups
+  
   vpa:
     enabled: true
-    climax_rvol_threshold: 3.0
-    zscore_window: 100
-    persistence_window: 10
-    direction_ema_span: 10
+    calculate_volume_profile: true
+    calculate_vwap_bands: true
+    calculate_money_flow_index: true
+  
   ict:
     enabled: true
-    opening_range_minutes: 15
-    displacement_k_atr: 1.5
+    detect_fvg: true
+    detect_liquidity_zones: true
+    detect_order_blocks: true
+  
   volatility:
     enabled: true
+    calculate_garch: true
+    calculate_historical_volatility: true
+    calculate_implied_volatility: true
+  
   smt:
     enabled: true
-    momentum_span: 5
-    paths:
-      SPY: data/raw/SPY_1min.parquet
-      QQQ: data/raw/QQQ_1min.parquet
+    calculate_support_resistance: true
+    calculate_trend_lines: true
+    calculate_pivot_points: true
+  
   levels:
     enabled: true
-    pivot: true
-    pivots_from: 'prior_day'   # prior_day|current_day
-    roll_window: 20            # for rolling support/resistance
-    use_atr_norm: true
-  polygon:
-    features:
-      use_vwap_column: true
-    quality_checks:
-      enabled: true
+    detect_key_levels: true
+    detect_breakout_levels: true
 
-regime:
-  vix: true
-  cvol: true
-  macro_flags: true
-
-execution:
-  tick_value: 0.01            # BBVA tick $0.01 (1 cent per share)
-  point_value: 1.0            # $ per point for BBVA stock
-  spread_ticks: 1             # baseline spread consumption
-  impact_bps: 0.5             # temporary impact per 1% ADV (toy)
-  commission_per_contract: 0.0035  # Typical stock commission per share
-
-risk:
-  risk_per_trade_frac: 0.01   # 1% per trade to reduce loss magnitude
-  stop_r_multiple: 1.0
-  tp_r_multiple: 2.0
-  max_daily_loss_r: 3.0       # kill-switch (in R multiples)
-  max_position_size: 1000
-  max_leverage: 1.0
-
-env:
-  step_seconds: 60
-  reward_scaling: 1.0
-  reward:
-    kind: "hybrid2"           # advanced hybrid (norm PnL + DSR + drift-neutral directional + soft activity + churn + dd accel)
-    dd_penalty: 0.1
-    eod_inventory_penalty: 0.5
-    alpha: 0.15    # DSR weight
-    beta: 0.25     # normalized PnL weight
-    pnl_cap: 1.0
-    dir_weight: 500.0    # increased to overcome hold penalty and encourage position-taking
-    dir_ema_minutes: 30
-    micro_penalty: 0.0005
-    # Activity shaping to avoid hold-only policies
-    open_bonus: 0.05
-    trade_target_per_day: 8        # legacy field; see activity.target_per_day
-    trade_activity_bonus: 0.02     # legacy field; see activity.bonus
-    trade_activity_penalty: 0.02   # legacy field; see activity.lagrange_eta
-    hold_penalty: 0.05            # reduced to avoid over-penalizing holding when flat
-    churn_penalty: 0.005
-    dd_accel_penalty: 0.05
-    directional_flip_training: true
-    side_balance:
-      lagrange_eta: 0.01
-      lambda_init: 0.0
-    activity:
-      target_per_day: 8
-      bonus: 0.05
-      lagrange_eta: 0.05
-      lambda_init: 0.0
-    regime_weights:
-      vix_low: 15
-      vix_high: 25
-      dir_weight_low: 0.7
-      dir_weight_high: 1.2
-  trading:
-    episode_day_mode: sequential   # sequential|random episode day starts
-    force_open_epsilon: 0.05       # training-only: flip hold->side with small probability when flat
-    force_warmup_frac: 0.2         # apply forcing only in early portion of session
-    no_trade_open_minutes: 5
-    no_trade_close_minutes: 5
-    widen_spread_minutes: 15
-    max_trades_per_hour: 3
-    max_holding_minutes: 30
-
-train:
-  algo: "ppo_lstm"
-  total_steps: 100000
-  batch_size: 512
-  learning_rate: 1.0e-4
-  n_envs: 1
-  gamma: 0.995
-  gae_lambda: 0.97
+# Training configuration optimized for performance
+training:
+  # Optimized hyperparameters
+  learning_rate: 0.0003
+  batch_size: 32
+  n_steps: 2048
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
   clip_range: 0.2
+  ent_coef: 0.01
   vf_coef: 0.5
-  ent_coef: 0.1 # stronger exploration early
-  n_steps: 1024
-  target_kl: 0.03
-  lr_schedule: cosine   # none|linear|cosine
-  ent_anneal_final: 0.01
-  policy_kwargs:
-    lstm_hidden_size: 64
-    net_arch_pi: [128, 64]
-    net_arch_vf: [128, 64]
-  torch_threads: 8
-  torch_interop_threads: 2
-  device: cpu
-  # Feature selection and pruning
-  feature_selection:
-    correlation_threshold: 0.95
-    min_variance: 1.0e-10
+  max_grad_norm: 0.5
+  
+  # Enable gradient checkpointing
+  gradient_checkpointing: true
+  
+  # Enable mixed precision training
+  mixed_precision: true
+  
+  # Optimize memory usage
+  max_grad_norm: 0.5
+  
+  # Enable early stopping
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+  
+  # Learning rate schedule
+  learning_rate_schedule:
+    enabled: true
+    schedule_type: "cosine"
+    total_timesteps: 1000000
+  
+  # Entropy annealing
+  entropy_annealing:
+    enabled: true
+    initial_ent_coef: 0.01
+    final_ent_coef: 0.001
+    anneal_timesteps: 500000
+  
+  # Curriculum learning
+  curriculum_learning:
+    enabled: true
+    phases:
+      - name: "single_ticker"
+        duration: 100000
+        tickers: ["AAPL"]
+      - name: "few_tickers"
+        duration: 200000
+        max_tickers: 3
+      - name: "full_universe"
+        duration: 700000
+        max_tickers: 10
 
+# Environment configuration optimized for multi-ticker
+environment:
+  # Multi-ticker environment settings
+  multiticker:
+    enabled: true
+    max_positions: 5
+    position_sizing: "risk_parity"
+    max_portfolio_risk: 0.02
+    correlation_threshold: 0.7
+  
+  # Reward configuration
+  reward:
+    type: "hybrid2"
+    regime_weighting: true
+    asymmetric_drawdown_penalty: true
+    lagrangian_activity_shaping: true
+    opportunity_shaping: true
+    potential_based_shaping: true
+    
+    # Reward parameters
+    pnl_weight: 0.4
+    dsr_weight: 0.3
+    sharpe_weight: 0.2
+    directional_weight: 0.1
+    
+    # Drawdown penalty
+    drawdown_penalty_factor: 2.0
+    drawdown_threshold: 0.05
+    
+    # Activity shaping
+    activity:
+      target_per_day: 5
+      lambda_init: 0.1
+      lagrange_eta: 0.01
+    
+    # Opportunity shaping
+    opportunity_weight: 0.2
+    
+    # Potential-based shaping
+    potential_weight: 0.1
+    discount_factor: 0.99
+  
+  # Risk management
+  risk:
+    max_position_size: 0.2
+    max_portfolio_risk: 0.02
+    stop_loss: 0.05
+    take_profit: 0.1
+    correlation_limit: 0.7
+  
+  # Execution
+  execution:
+    slippage_bps: 5
+    commission_bps: 2
+    market_impact_model: "square_root"
+    fill_probability: 0.95
+
+# Walk-forward optimization configuration
 walkforward:
-  train_days: 30
-  test_days: 10
-  embargo_minutes: 60
+  enabled: true
+  n_folds: 5
+  embargo_days: 10
+  test_size: 0.2
+  regime_aware: true
+  aggregation_method: "median"
+  
+  # Fold configuration
+  fold_config:
+    min_train_days: 252  # 1 year
+    min_test_days: 63    # 1 quarter
+    max_train_days: 1260 # 5 years
 
-logging:
-  level: INFO
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: logs/trading_system.log
-  max_bytes: 10485760  # 10MB
-  backup_count: 5
+# Hyperparameter optimization configuration
+hpo:
+  enabled: true
+  n_trials: 100
+  direction: "maximize"
+  metric: "sharpe_ratio"
+  pruner: "median"
+  sampler: "tpe"
+  
+  # Multi-objective optimization
+  multi_objective:
+    enabled: true
+    objectives:
+      - name: "sharpe_ratio"
+        direction: "maximize"
+      - name: "max_drawdown"
+        direction: "minimize"
+      - name: "trade_frequency"
+        direction: "minimize"
+  
+  # Search space
+  search_space:
+    learning_rate:
+      type: "float"
+      low: 0.0001
+      high: 0.001
+      log: true
+    batch_size:
+      type: "categorical"
+      choices: [32, 64, 128]
+    gamma:
+      type: "float"
+      low: 0.9
+      high: 0.999
+    ent_coef:
+      type: "float"
+      low: 0.001
+      high: 0.1
+      log: true
+    clip_range:
+      type: "float"
+      low: 0.1
+      high: 0.3
+  
+  # Parallel execution
+  parallel:
+    enabled: true
+    n_jobs: 4
+    storage: "sqlite:///hpo_results.db"
+    study_name: "multiticker_rl_hpo"
 
+# Population-based training configuration (optional)
+pbt:
+  enabled: false  # Set to true to enable
+  
+  # Population configuration
+  population_size: 8
+  mutation_probability: 0.2
+  crossover_probability: 0.5
+  
+  # Evolution parameters
+  selection_pressure: 0.5
+  elite_size: 2
+  tournament_size: 3
+  
+  # Mutation strategies
+  mutations:
+    - name: "learning_rate"
+      type: "multiply"
+      factor: 0.8
+    - name: "batch_size"
+      type: "categorical"
+      choices: [32, 64, 128]
+    - name: "ent_coef"
+      type: "multiply"
+      factor: 1.2
+  
+  # Reward function evolution
+  reward_evolution:
+    enabled: true
+    mutation_rate: 0.1
+    crossover_rate: 0.3
+
+# Monitoring configuration
 monitoring:
-  enable_prometheus: false
-  prometheus_port: 8000
-  metrics_interval: 60  # seconds
-  alert_file: alerts/alerts.yaml
+  # Real-time monitoring
+  realtime:
+    enabled: true
+    update_interval: 60  # seconds
+    dashboard_port: 8050
+  
+  # Performance tracking
+  performance:
+    enabled: true
+    track_metrics:
+      - "sharpe_ratio"
+      - "sortino_ratio"
+      - "max_drawdown"
+      - "calmar_ratio"
+      - "win_rate"
+      - "profit_factor"
+    update_frequency: "1D"
+  
+  # Alert system
+  alerts:
+    enabled: true
+    alert_channels:
+      - type: "email"
+        recipients: ["trading-team@example.com"]
+      - type: "webhook"
+        url: "https://hooks.slack.com/services/..."
+    
+    # Alert conditions
+    conditions:
+      - metric: "sharpe_ratio"
+        operator: "<"
+        threshold: 1.0
+        duration: "7D"
+      - metric: "max_drawdown"
+        operator: ">"
+        threshold: 0.1
+        duration: "3D"
+      - metric: "win_rate"
+        operator: "<"
+        threshold: 0.4
+        duration: "5D"
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # File logging
+  file:
+    enabled: true
+    path: "logs/multiticker_rl.log"
+    max_size: "100MB"
+    backup_count: 5
+  
+  # Console logging
+  console:
+    enabled: true
+    level: "INFO"
+  
+  # Structured logging
+  structured:
+    enabled: true
+    format: "json"
+    include_timestamp: true
+  
+  # Reward decomposition logging
+  reward_decomposition:
+    enabled: true
+    log_interval: 1000
+    output_dir: "logs/reward_decomposition"
+
+# Optimization configuration
+optimization:
+  # Memory optimization
+  memory:
+    chunked_loading: true
+    chunk_size: "1M"
+    enable_caching: true
+    optimize_data_types: true
+    gradient_checkpointing: true
+  
+  # Computation optimization
+  computation:
+    gpu_enabled: true
+    mixed_precision: true
+    data_parallelism: true
+    optimize_tensor_operations: true
+    optimize_numpy_operations: true
+    optimize_pandas_operations: true
+  
+  # System resource optimization
+  system:
+    high_priority: true
+    memory_limit_gb: 16
+    cpu_threads: "auto"
+
+# Paths configuration
+paths:
+  data_root: "data"
+  cache_dir: "data/cache"
+  models_dir: "models"
+  logs_dir: "logs"
+  results_dir: "results"
+  reports_dir: "reports"
+
+# Secrets configuration
+secrets:
+  polygon_api_key: ""  # Set via environment variable POLYGON_API_KEY

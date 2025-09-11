@@ -10,6 +10,7 @@ import pandas as pd
 from typing import Dict, List, Optional, Union, Tuple, Any
 from dataclasses import dataclass
 import logging
+import time
 from gymnasium import Env, spaces
 from gymnasium.spaces import Box, Discrete
 
@@ -276,6 +277,7 @@ class IntradayRLEnv(Env):
         return obs, {}
     
     def step(self, action: int):
+        step_start_time = time.time()
         """
         Take a step in the environment.
         
@@ -905,6 +907,7 @@ class IntradayRLEnv(Env):
 
         obs = self._obs(next_ts, next_price)
 
+        logger.info("Before returning from step")
         # Diagnostic info
         info = {
             "pnl": float(pnl),
@@ -913,6 +916,7 @@ class IntradayRLEnv(Env):
             "realized_drawdown": float(self.realized_drawdown),
         }
         info["equity"] = float(self.equity)
+        logger.info(f"Total step time: {time.time() - step_start_time:.6f}s")
         return obs, float(reward), bool(done), False, info
     
     def _obs(self, ts, price):

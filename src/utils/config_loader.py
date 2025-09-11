@@ -60,12 +60,12 @@ def _resolve_paths(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, Any]:
         if v:
             paths[k] = v
 
-    # Resolve to absolute paths relative to YAML dir
+    # Resolve to absolute paths relative to project root
     resolved: Dict[str, str] = {}
     for k, v in paths.items():
         p = Path(v)
         if not p.is_absolute():
-            p = (base / p).resolve()
+            p = (project_root / p).resolve()
         resolved[k] = str(p)
 
     cfg["paths"] = resolved
