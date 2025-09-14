@@ -1,0 +1,20 @@
+{
+  "project": "rl-intraday",
+  "status": "in_progress",
+  "updated_by": "codex-agent",
+  "steps": [
+    {
+      "name": "Generate AGENTS.md",
+      "status": "completed",
+      "path": "AGENTS.md",
+      "details": "Contributor guide added with repo-specific commands and conventions."
+    },
+    {
+      "name": "Update state.json",
+      "status": "completed",
+      "path": "state.json",
+      "details": "Initialized progress tracker after AGENTS.md creation."
+    }
+  ]
+}
+
