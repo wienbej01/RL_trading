@@ -551,6 +551,14 @@ class IntradayRLEnv(Env):
                 pass
 
         if desired_dir != 0 and self.pos == 0 and not hit_exit and not in_no_trade:
+            # Daily cap on entries (optional)
+            try:
+                max_epd = int(self.config.get('env', {}).get('trading', {}).get('max_entries_per_day', 0)) if isinstance(self.config, dict) else 0
+            except Exception:
+                max_epd = 0
+            if max_epd and int(getattr(self, '_daily_trade_count', 0)) >= max_epd:
+                logger.debug("Skip open: reached max_entries_per_day=%d (count=%d) on %s", max_epd, int(getattr(self, '_daily_trade_count', 0)), ts)
+                desired_dir = 0
             # Cap trades per hour
             try:
                 max_tph = int(self.config.get('env', {}).get('trading', {}).get('max_trades_per_hour', 0)) if isinstance(self.config, dict) else 0
