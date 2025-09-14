@@ -1,0 +1,14 @@
+{
+  "config_file": "configs/quick_multiticker_autogen.yaml",
+  "train_start": "2024-01-02",
+  "train_end": "2024-01-09",
+  "test_start": "2024-01-10",
+  "test_end": "2024-01-12",
+  "tickers": [
+    "AAPL",
+    "MSFT",
+    "NVDA"
+  ],
+  "output_dir": "results/quick_multi_portfolio_10000",
+  "timestamp": "2025-09-11T15:08:39.996307"
+}

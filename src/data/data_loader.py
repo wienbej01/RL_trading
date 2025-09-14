@@ -64,6 +64,7 @@ def _canonicalize_timestamp(
         # Try datetime index
         if isinstance(df.index, pd.DatetimeIndex):
             tmp = df.reset_index().rename(columns={"index": "timestamp"})
+            df = tmp  # ensure the timestamp column exists on the working frame
             ts_col = "timestamp"
         else:
             # Try index as epoch ms → ns

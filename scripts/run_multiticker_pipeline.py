@@ -30,6 +30,7 @@ from src.utils.config_loader import load_config
 from src.utils.logging import get_logger
 from src.optimization.memory_optimizer import MemoryOptimizer
 from src.optimization.computation_optimizer import ComputationOptimizer
+from src.rl.multiticker_trainer import MultiTickerRLTrainer
 
 # Configure logging
 logging.basicConfig(
@@ -62,6 +63,9 @@ def parse_args():
                         help='List of tickers to trade')
     parser.add_argument('--output-dir', type=str, default='results/multiticker_pipeline',
                         help='Output directory for results')
+    # Backtest behavior
+    parser.add_argument('--strict-test-window', action='store_true',
+                        help='Do not fall back to a different window if the test split is empty')
     parser.add_argument('--skip-download', action='store_true',
                         help='Skip data download step')
     parser.add_argument('--skip-features', action='store_true',
@@ -70,6 +74,21 @@ def parse_args():
                         help='Skip training step')
     parser.add_argument('--skip-backtest', action='store_true',
                         help='Skip backtesting step')
+    parser.add_argument('--portfolio-env', action='store_true',
+                        help='Force portfolio environment for training/backtest')
+    # Portfolio env tuning (affects backtest behavior)
+    parser.add_argument('--min-hold-minutes', type=int, default=None,
+                        help='Minimum holding period in minutes')
+    parser.add_argument('--max-hold-minutes', type=int, default=None,
+                        help='Maximum holding period in minutes')
+    parser.add_argument('--max-entries-per-day', type=int, default=None,
+                        help='Maximum entries/flips per day')
+    parser.add_argument('--position-holding-penalty', type=float, default=None,
+                        help='Penalty per open position per bar (encourages exits)')
+    parser.add_argument('--test-tickers', type=str, nargs='+', default=None,
+                        help='Subset of tickers to trade during backtest (if provided)')
+    parser.add_argument('--load-model', type=str, default=None,
+                        help='Path to a saved SB3 model to load for backtest (skip training)')
     return parser.parse_args()
 
 
@@ -192,11 +211,17 @@ def run_backtest(config, args, model, trainer, test_data, test_features):
     logger.info("Starting backtesting")
     
     # Run backtest
+    # Determine allowed test tickers: prefer provided list, else cap to 3 tickers if desired
+    allowed = args.test_tickers if args.test_tickers else None
+    if allowed is None and len(args.tickers) >= 3:
+        allowed = args.tickers[:3]
+
     backtest_results = trainer.backtest(
         model=model,
         data=test_data,
         features=test_features,
-        output_dir=Path(args.output_dir) / 'backtest'
+        output_dir=Path(args.output_dir) / 'backtest',
+        allowed_tickers=allowed
     )
     
     # Save backtest results
@@ -240,6 +265,18 @@ def main():
     
     # Load configuration
     config = load_config(args.config)
+    # Inject portfolio-env flag into config for trainer
+    if args.portfolio_env:
+        config.setdefault('env', {}).setdefault('portfolio', {})['force'] = True
+    # Apply portfolio env tuning overrides if provided
+    if args.min_hold_minutes is not None:
+        config.setdefault('env', {}).setdefault('portfolio', {})['min_hold_minutes'] = int(args.min_hold_minutes)
+    if args.max_hold_minutes is not None:
+        config.setdefault('env', {}).setdefault('portfolio', {})['max_hold_minutes'] = int(args.max_hold_minutes)
+    if args.max_entries_per_day is not None:
+        config.setdefault('env', {}).setdefault('portfolio', {})['max_entries_per_day'] = int(args.max_entries_per_day)
+    if args.position_holding_penalty is not None:
+        config.setdefault('env', {}).setdefault('portfolio', {})['position_holding_penalty'] = float(args.position_holding_penalty)
     
     # Apply optimizations
     config = ComputationOptimizer.apply_all_optimizations(config)
@@ -277,20 +314,76 @@ def main():
             logger.error(f"Features file not found: {features_file}")
             return
     
-    # Step 3: Train model
+    # Train/test split (make available even if skipping training)
+    train_mask = (data.index >= args.train_start) & (data.index <= args.train_end)
+    test_mask = (data.index >= args.test_start) & (data.index <= args.test_end)
+
+    train_data = data[train_mask]
+    test_data = data[test_mask]
+    train_features = features[train_mask]
+    test_features = features[test_mask]
+
+    # Guard: empty test split would make portfolio env construction fail
+    if test_data.empty:
+        logger.warning("Test split is empty for requested window; falling back to last available slice.")
+        if args.strict_test_window:
+            logger.error("Strict test window enforced and test split is empty. Aborting backtest.")
+            return
+        try:
+            # Use the last 2 calendar days of available data as a minimal backtest window
+            last_ts = data.index.max()
+            fallback_start = (last_ts - pd.Timedelta(days=2)).normalize()
+            fallback_mask = (data.index >= fallback_start) & (data.index <= last_ts)
+            fb_data = data[fallback_mask]
+            fb_feat = features[fallback_mask]
+            if fb_data.empty:
+                # As an extra fallback, take the last 1,000 rows if present
+                fb_data = data.tail(1000)
+                fb_feat = features.loc[fb_data.index] if not fb_data.empty else fb_data
+            if not fb_data.empty:
+                test_data = fb_data
+                test_features = fb_feat
+                # Update args to reflect the actual backtest window for filenames/logging
+                args.test_start = str(pd.to_datetime(test_data.index.min()).date())
+                args.test_end = str(pd.to_datetime(test_data.index.max()).date())
+                logger.info(f"Using fallback backtest window: {args.test_start} to {args.test_end} ({len(test_data)} rows)")
+            else:
+                logger.error("No data available at all for backtesting after fallback attempts; skipping backtest.")
+                args.skip_backtest = True
+        except Exception as e:
+            logger.error(f"Failed to construct fallback backtest window: {e}")
+            args.skip_backtest = True
+
+    # Step 3: Train model (unless loading)
     model = None
-    trainer = None
-    train_data = None
-    test_data = None
-    train_features = None
-    test_features = None
-    if not args.skip_training and data is not None and features is not None:
-        model, trainer, train_data, test_data, train_features, test_features = train_model(config, args, data, features)
+    trainer = MultiTickerRLTrainer(config)
+    if args.load_model:
+        from sb3_contrib import RecurrentPPO
+        logger.info(f"Loading model from {args.load_model}")
+        try:
+            model = RecurrentPPO.load(args.load_model)
+            # Hint to trainer about training tickers to preserve obs shape
+            try:
+                trainer._train_tickers = sorted(list(pd.unique(train_data['ticker'])))
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            return
+    elif not args.skip_training:
+        model, trainer, _, _, _, _ = train_model(config, args, data, features)
     
     # Step 4: Run backtest
     backtest_results = None
     if not args.skip_backtest and model is not None and trainer is not None:
-        backtest_results = run_backtest(config, args, model, trainer, test_data, test_features)
+        try:
+            backtest_results = run_backtest(config, args, model, trainer, test_data, test_features)
+        except Exception as e:
+            logger.error(f"Backtest failed: {e}")
+            # Provide a clear hint for the common cause (empty/unaligned test split)
+            if test_data.empty:
+                logger.error("Backtest received an empty test dataset. Ensure the test window overlaps available data or let the script choose a fallback window.")
+            return
     
     # Log memory usage
     MemoryOptimizer.log_memory_usage("at end")

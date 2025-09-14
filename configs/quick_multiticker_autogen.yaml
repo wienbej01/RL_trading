@@ -1,0 +1,55 @@
+data:
+  enable_caching: true
+  cache_dir: data/cache
+  resample:
+    apply: false
+  prune:
+    min_minutes_per_day: 0
+  multiticker:
+    enabled: true
+    max_tickers: 3
+features:
+  technical:
+    enabled: true
+    sma_windows:
+    - 5
+    - 10
+    ema_windows:
+    - 5
+    calculate_rsi: true
+    rsi_window: 14
+  microstructure:
+    enabled: true
+    calculate_spread: true
+    calculate_vwap: true
+    calculate_twap: false
+  time:
+    enabled: true
+    extract_time_of_day: true
+train:
+  total_steps: 200000
+  learning_rate: 0.0003
+  batch_size: 64
+  n_steps: 512
+  device: cpu
+training:
+  total_timesteps: 200000
+  learning_rate: 0.0003
+  batch_size: 64
+  n_steps: 512
+  device: cpu
+env:
+  max_steps: 390
+  reward_scaling: 0.1
+  reward:
+    kind: dsr
+execution:
+  tick_value: 0.01
+  spread_ticks: 1
+  impact_bps: 0.5
+  commission_per_contract: 0.0035
+risk:
+  risk_per_trade_frac: 0.02
+  stop_r_multiple: 1.0
+  tp_r_multiple: 1.5
+  max_daily_loss_r: 3.0

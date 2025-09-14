@@ -5,6 +5,14 @@
 **Status:** In Progress
 **Orchestrator:** Active
 
+## Upcoming Work (Portfolio & Sizing)
+
+- Portfolio Environment: Implemented minimal multi‑ticker portfolio env with per‑ticker actions and portfolio PnL reward; integrated into trainer/evaluator.
+- ATR‑Based Sizing (Planned): Introduce risk‑normalized position sizing per ticker using ATR.
+  - units_k = floor((risk_budget_per_ticker) / (ATR_k * point_value))
+  - Configurable risk budget, max units, gross/net exposure caps, and turnover penalties.
+  - Add reporting: exposure, turnover, drawdown, and portfolio equity metrics.
+
 ## Project Overview
 
 This project aims to replace the current Databento data source with Polygon API while maintaining full compatibility with the existing RL trading system architecture.

@@ -208,8 +208,13 @@ class PolygonDataIngestor:
         """
         try:
             if data_type == 'ohlcv':
-                # Fetch OHLCV data (minute bars)
-                df = self.polygon_client.get_minute_bars(symbol, start_date, end_date)
+                # Fetch OHLCV data (minute bars) without nested event-loop issues
+                try:
+                    # Prefer async path to avoid asyncio.run() inside a running loop
+                    df = await self.polygon_client._get_aggregates(symbol, start_date, end_date, 1, 'minute')
+                except Exception:
+                    # Fallback to sync helper (may raise if loop is running)
+                    df = self.polygon_client.get_minute_bars(symbol, start_date, end_date)
 
             elif data_type == 'quotes':
                 # Fetch quote data

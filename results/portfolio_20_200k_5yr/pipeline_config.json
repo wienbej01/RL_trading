@@ -1,0 +1,31 @@
+{
+  "config_file": "configs/quick_multiticker_autogen.yaml",
+  "train_start": "2020-09-01",
+  "train_end": "2024-12-31",
+  "test_start": "2020-09-30",
+  "test_end": "2020-10-02",
+  "tickers": [
+    "CRWD",
+    "DDOG",
+    "DOCU",
+    "ENPH",
+    "ETSY",
+    "FSLR",
+    "LYFT",
+    "MDB",
+    "NET",
+    "OKTA",
+    "PINS",
+    "PLUG",
+    "ROKU",
+    "RUN",
+    "SNAP",
+    "SQ",
+    "TWLO",
+    "UAL",
+    "UBER",
+    "ZM"
+  ],
+  "output_dir": "results/portfolio_20_200k_5yr",
+  "timestamp": "2025-09-13T08:57:31.924297"
+}

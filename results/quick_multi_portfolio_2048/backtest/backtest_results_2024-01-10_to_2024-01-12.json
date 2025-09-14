@@ -1,0 +1,23 @@
+{
+  "tickers": [
+    "AAPL",
+    "MSFT",
+    "NVDA"
+  ],
+  "portfolio_metrics": {
+    "mean_reward": 85.0191003701184,
+    "std_reward": 0.0,
+    "mean_length": 780.0,
+    "std_length": 0.0,
+    "max_reward": 85.0191003701184,
+    "min_reward": 85.0191003701184,
+    "total_return": 0.0007985309999976016,
+    "annual_return": 0.00025791900988880734,
+    "annual_volatility": 5.947791469815417e-05,
+    "sharpe_ratio": 4.3358248002930955,
+    "max_drawdown": -3.524065693372158e-05,
+    "calmar_ratio": 7.3178512799030555,
+    "win_rate": 0.6410256410256411,
+    "profit_factor": 2.7187782152214717
+  }
+}

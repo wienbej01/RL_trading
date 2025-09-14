@@ -91,6 +91,25 @@ Feature generation prints a summary so you can verify VIX/SMT/ICT/VPA coverage.
 - `scripts/prepare_context_with_fallback.py` — orchestrates SPY/QQQ/VIX context with fallbacks
 - `scripts/audit_data_inventory.py` — inventory report of available data, features, and models
 
+## 🚀 Quick Commands (Makefile + Scripts)
+
+Use the provided Makefile targets or call the scripts directly.
+
+- Generate features (example for SPY):
+  - `make gen_features DATA=data/cache/SPY_20240101_20240701_ohlcv_1min.parquet FEATURES=results/oos_eval_demo/spy_features.parquet`
+- Train a small RL model:
+  - `make rl_train DATA=data/cache/SPY_20240101_20240701_ohlcv_1min.parquet FEATURES=results/oos_eval_demo/spy_features.parquet MODEL=results/oos_eval_demo/model`
+- OOS evaluation (held-out windows/tickers):
+  - `make backtest_oos DATA=data/cache/SPY_20240101_20240701_ohlcv_1min.parquet FEATURES=results/oos_eval_demo/spy_features.parquet MODEL=results/oos_eval_demo/model OOS_OUT=results/oos_eval_demo TICKERS="SPY"`
+- Small tuning sweep over PPO hyperparams:
+  - `make tune DATA=data/cache/SPY_20240101_20240701_ohlcv_1min.parquet FEATURES=results/oos_eval_demo/spy_features.parquet`
+
+Direct scripts (if you prefer):
+- OOS evaluator: `PYTHONPATH=. venv/bin/python scripts/oos_eval.py --config configs/settings.yaml --data <parquet> --features <parquet> --model <sb3_model> --test-tickers SPY AAPL --output results/oos_eval_demo`
+- Tuning orchestrator: `PYTHONPATH=. venv/bin/python scripts/tune_orchestrator.py --config configs/settings.yaml --data <parquet> --features <parquet> --output results/tuning_run --test-tickers SPY --trials 4 --total-steps 5000`
+
+See `docs/FULL_RUNBOOK.md` for an end‑to‑end sequence and `docs/DRY_RUNS.md` for lightweight sanity runs.
+
 ## 🕒 DatetimeIndex Fix and Data Pipeline Enhancements
 
 ### Issue Summary

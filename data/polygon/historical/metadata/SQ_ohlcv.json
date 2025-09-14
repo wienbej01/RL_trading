@@ -1,0 +1,11 @@
+{
+  "symbol": "SQ",
+  "data_type": "ohlcv",
+  "last_update": null,
+  "date_range_start": null,
+  "date_range_end": null,
+  "total_records": 0,
+  "last_successful_fetch": null,
+  "error_count": 1,
+  "last_error": "asyncio.run() cannot be called from a running event loop"
+}

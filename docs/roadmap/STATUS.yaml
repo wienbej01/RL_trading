@@ -124,6 +124,24 @@ phases:
           - name: "WFO testing and validation"
             status: "pending"
             progress_percentage: 0
+      - name: "ATR-Based Portfolio Sizing"
+        start_date: "2025-03-05"
+        target_completion: "2025-03-12"
+        status: "planned"
+        progress_percentage: 0
+        subtasks:
+          - name: "ATR feature alignment in portfolio env"
+            status: "planned"
+            progress_percentage: 0
+          - name: "ATR sizing rule + risk budgets"
+            status: "planned"
+            progress_percentage: 0
+          - name: "Exposure/turnover constraints"
+            status: "planned"
+            progress_percentage: 0
+          - name: "Portfolio metrics & reporting"
+            status: "planned"
+            progress_percentage: 0
       - name: "Optuna Hyperparameter Optimization"
         start_date: "2025-02-26"
         target_completion: "2025-03-04"

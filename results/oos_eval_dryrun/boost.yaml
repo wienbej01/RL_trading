@@ -1,0 +1,13 @@
+env:
+  trading:
+    force_open_epsilon: 0.1
+    force_warmup_frac: 0.2
+    max_trades_per_hour: 5
+  reward:
+    hold_penalty: 0.001
+    activity:
+      target_per_day: 3
+      lambda_init: 0.1
+      lagrange_eta: 0.01
+train:
+  device: cpu
