@@ -113,6 +113,8 @@ class FeaturePipeline:
         self.ict_config = config.get('ict', {})
         self.vol_config = config.get('volatility', {})
         self.smt_config = config.get('smt', {})
+        # Optional: regime tags (rolling, leak‑safe)
+        self.regime_config = config.get('regime', {})
 
         # Data source detection and column mapping
         self.data_source = config.get('data_source', 'auto')
@@ -274,18 +276,40 @@ class FeaturePipeline:
         Returns:
             Self
         """
-        # Map columns to standard format
-        data = self._map_columns(data, 'ohlcv')  # Assume OHLCV for fitting
-
-        # Apply data quality checks for Polygon data
-        data_source = self._detect_data_source(data)
-        if data_source == 'polygon' and self.polygon_quality_checks:
-            data = self._validate_polygon_data_quality(data)
-
-        features = self._extract_features(data)
+        # Multi-ticker aware fitting: if a 'ticker' column is present, compute features per ticker
+        features: pd.DataFrame
+        if 'ticker' in data.columns or (
+            isinstance(data.index, pd.MultiIndex) and 'ticker' in data.index.names
+        ):
+            parts = []
+            if 'ticker' in data.columns:
+                grouped = data.groupby('ticker')
+            else:
+                grouped = data.groupby(level='ticker')
+            for t, df in grouped:
+                df_local = df.copy()
+                # Map columns and validate per group
+                df_local = self._map_columns(df_local, 'ohlcv')
+                if self._detect_data_source(df_local) == 'polygon' and self.polygon_quality_checks:
+                    df_local = self._validate_polygon_data_quality(df_local)
+                f_local = self._extract_features(df_local)
+                f_local['ticker'] = t
+                parts.append(f_local)
+            if parts:
+                features = pd.concat(parts, axis=0)
+            else:
+                features = pd.DataFrame(index=data.index)
+        else:
+            # Single-ticker path (original behavior)
+            data = self._map_columns(data, 'ohlcv')  # Assume OHLCV for fitting
+            data_source = self._detect_data_source(data)
+            if data_source == 'polygon' and self.polygon_quality_checks:
+                data = self._validate_polygon_data_quality(data)
+            features = self._extract_features(data)
 
         # Apply normalization if configured
         if self.normalization_config:
+            # Do not normalize non-numeric/ticker label
             features = self._normalize_features(features)
 
         # Apply feature selection if configured
@@ -310,15 +334,30 @@ class FeaturePipeline:
             self.logger.warning("Pipeline not fitted, fitting on transform data")
             self.fit(data)
 
-        # Map columns to standard format
-        data = self._map_columns(data, 'ohlcv')  # Assume OHLCV for transformation
-
-        # Apply data quality checks for Polygon data
-        data_source = self._detect_data_source(data)
-        if data_source == 'polygon' and self.polygon_quality_checks:
-            data = self._validate_polygon_data_quality(data)
-
-        features = self._extract_features(data)
+        # Multi-ticker aware transform
+        if 'ticker' in data.columns or (
+            isinstance(data.index, pd.MultiIndex) and 'ticker' in data.index.names
+        ):
+            parts = []
+            if 'ticker' in data.columns:
+                grouped = data.groupby('ticker')
+            else:
+                grouped = data.groupby(level='ticker')
+            for t, df in grouped:
+                df_local = df.copy()
+                df_local = self._map_columns(df_local, 'ohlcv')
+                if self._detect_data_source(df_local) == 'polygon' and self.polygon_quality_checks:
+                    df_local = self._validate_polygon_data_quality(df_local)
+                f_local = self._extract_features(df_local)
+                f_local['ticker'] = t
+                parts.append(f_local)
+            features = pd.concat(parts, axis=0) if parts else pd.DataFrame(index=data.index)
+        else:
+            data = self._map_columns(data, 'ohlcv')
+            data_source = self._detect_data_source(data)
+            if data_source == 'polygon' and self.polygon_quality_checks:
+                data = self._validate_polygon_data_quality(data)
+            features = self._extract_features(data)
 
         # Apply normalization if configured
         if self.normalization_config:
@@ -931,6 +970,28 @@ class FeaturePipeline:
 
         self.logger.info("Extracted %d features", len(features.columns))
 
+        # Optional regime features (low-cost tags; causal rolling, t-1)
+        try:
+            if isinstance(self.regime_config, dict) and self.regime_config.get('enabled', False):
+                vol_win = int(self.regime_config.get('vol_window', 60))
+                trend_win = int(self.regime_config.get('trend_window', 60))
+                # Rolling volatility on close returns
+                r = data['close'].pct_change().fillna(0.0)
+                vol = r.rolling(vol_win, min_periods=max(5, vol_win//5)).std().shift(1)
+                features['regime_vol'] = vol.astype(float)
+                # Tercile buckets (0,1,2) using expanding quantiles (causal)
+                q1 = vol.expanding(min_periods=10).quantile(1/3)
+                q2 = vol.expanding(min_periods=10).quantile(2/3)
+                bucket = (vol > q2).astype(int) * 2 + ((vol > q1) & (vol <= q2)).astype(int)
+                features['regime_vol_bucket'] = bucket.fillna(0).astype(int)
+                # Trend slope via rolling linear regression proxy: EMA of returns
+                trend = r.ewm(span=max(3, trend_win//6), adjust=False).mean().shift(1)
+                features['regime_trend'] = trend.astype(float)
+                features['regime_trend_sign'] = np.sign(trend).fillna(0).astype(int)
+        except Exception:
+            # Never break the pipeline on optional tags
+            pass
+
         # Note: Warmup bars are kept to maintain alignment with OHLCV data
         # The training process will handle any necessary warmup period
         # max_lb = 120
@@ -1078,6 +1139,10 @@ class FeaturePipeline:
         
         self.logger.info("Selected features: %s", self.selected_features)
         if self.selected_features is not None:
-            return features[[col for col in features.columns if col in self.selected_features]]
+            keep_cols = [col for col in features.columns if col in self.selected_features]
+            # Always preserve 'ticker' label if present for multi-ticker flows
+            if 'ticker' in features.columns and 'ticker' not in keep_cols:
+                keep_cols.append('ticker')
+            return features[keep_cols]
         else:
             return features
