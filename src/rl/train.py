@@ -447,26 +447,71 @@ def train_ppo_lstm(settings: Settings,
 
     lr_param = make_lr_schedule(training_config.learning_rate)
 
-    model = RecurrentPPO(
-        'MlpLstmPolicy',
-        vec_env,
-        learning_rate=lr_param,
-        n_steps=training_config.n_steps,
-        batch_size=training_config.batch_size,
-        gamma=training_config.gamma,
-        gae_lambda=training_config.gae_lambda,
-        clip_range=training_config.clip_range,
-        vf_coef=training_config.vf_coef,
-        ent_coef=training_config.ent_coef,
-        max_grad_norm=training_config.max_grad_norm,
-        n_epochs=training_config.n_epochs,
-        target_kl=training_config.target_kl,
-        tensorboard_log=training_config.tensorboard_log,
-        policy_kwargs=policy_kwargs,
-        device=effective_device,
-        verbose=training_config.verbose,
-        seed=training_config.seed
-    )
+    # Optional: Behavior Cloning warm-start (load prior checkpoint)
+    bc_enabled = False
+    bc_path = None
+    aux_enabled = False
+    try:
+        bc_enabled = bool(settings.get('train', 'bc', 'enabled', default=False))
+        bc_path = settings.get('train', 'bc', 'init_from', default=None)
+        aux_enabled = bool(settings.get('train', 'aux_head', 'enabled', default=False))
+    except Exception:
+        pass
+
+    model: RecurrentPPO
+    if bc_enabled and bc_path:
+        try:
+            logger.info(f"BC warm-start enabled; attempting to load checkpoint from: {bc_path}")
+            model = RecurrentPPO.load(bc_path, env=vec_env, device=effective_device, print_system_info=False)
+            # Ensure verbosity and seed reflect current training config
+            model.verbose = training_config.verbose
+            logger.info("Warm-start successful; continuing PPO training from loaded policy.")
+        except Exception as e:
+            logger.warning(f"Failed to warm-start from '{bc_path}' ({e}); initializing fresh PPO model.")
+            model = RecurrentPPO(
+                'MlpLstmPolicy',
+                vec_env,
+                learning_rate=lr_param,
+                n_steps=training_config.n_steps,
+                batch_size=training_config.batch_size,
+                gamma=training_config.gamma,
+                gae_lambda=training_config.gae_lambda,
+                clip_range=training_config.clip_range,
+                vf_coef=training_config.vf_coef,
+                ent_coef=training_config.ent_coef,
+                max_grad_norm=training_config.max_grad_norm,
+                n_epochs=training_config.n_epochs,
+                target_kl=training_config.target_kl,
+                tensorboard_log=training_config.tensorboard_log,
+                policy_kwargs=policy_kwargs,
+                device=effective_device,
+                verbose=training_config.verbose,
+                seed=training_config.seed
+            )
+    else:
+        model = RecurrentPPO(
+            'MlpLstmPolicy',
+            vec_env,
+            learning_rate=lr_param,
+            n_steps=training_config.n_steps,
+            batch_size=training_config.batch_size,
+            gamma=training_config.gamma,
+            gae_lambda=training_config.gae_lambda,
+            clip_range=training_config.clip_range,
+            vf_coef=training_config.vf_coef,
+            ent_coef=training_config.ent_coef,
+            max_grad_norm=training_config.max_grad_norm,
+            n_epochs=training_config.n_epochs,
+            target_kl=training_config.target_kl,
+            tensorboard_log=training_config.tensorboard_log,
+            policy_kwargs=policy_kwargs,
+            device=effective_device,
+            verbose=training_config.verbose,
+            seed=training_config.seed
+        )
+
+    if aux_enabled:
+        logger.info("Auxiliary head is enabled in config (placeholder). No-op in current phase.")
     
     # Hint to PyTorch threading; respect config if provided, otherwise keep library defaults
     try:
@@ -558,26 +603,67 @@ def evaluate_model(model: RecurrentPPO, env: DummyVecEnv, num_episodes: int = 5)
     episode_lengths = []
     equity_curves = []
     
-    for episode in range(num_episodes):
-        obs = env.reset()
-        state = None
-        episode_start = np.ones((env.num_envs,), dtype=bool)
-        done = np.array([False])
-        episode_reward = 0.0
-        episode_length = 0
+    # Robust vectorized evaluation: count episode completions per env and stop
+    # when total completed episodes reaches num_episodes * n_envs.
+    obs = env.reset()
+    # Sanitize observations to avoid NaNs/Infs reaching the policy
+    try:
+        import numpy as _np
+        if isinstance(obs, (list, tuple)):
+            obs = [_np.nan_to_num(o, nan=0.0, posinf=0.0, neginf=0.0) for o in obs]
+        else:
+            obs = _np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        pass
+    state = None
+    n_envs = int(getattr(env, 'num_envs', 1))
+    episode_start = np.ones((n_envs,), dtype=bool)
+    # Track per-env accumulators until each completes one episode, then reset counters
+    ep_rewards = np.zeros((n_envs,), dtype=float)
+    ep_lengths = np.zeros((n_envs,), dtype=int)
+    completed = 0
+    target = max(1, num_episodes) * n_envs
 
-        while not done.all():
-            action, state = model.predict(
-                obs, state=state, episode_start=episode_start, deterministic=True
-            )
-            obs, reward, done, info = env.step(action)
-            episode_start = done
-            episode_reward += float(np.array(reward).sum())
-            episode_length += 1
-
-        episode_rewards.append(episode_reward)
-        episode_lengths.append(episode_length)
-        equity_curves.append(env.envs[0].get_equity_curve())
+    while completed < target:
+        action, state = model.predict(
+            obs, state=state, episode_start=episode_start, deterministic=True
+        )
+        obs, reward, done, info = env.step(action)
+        try:
+            if isinstance(obs, (list, tuple)):
+                obs = [np.nan_to_num(o, nan=0.0, posinf=0.0, neginf=0.0) for o in obs]
+            else:
+                obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        except Exception:
+            pass
+        # Convert to numpy arrays
+        r = np.asarray(reward, dtype=float).reshape(-1)
+        d = np.asarray(done).reshape(-1)
+        ep_rewards += r
+        ep_lengths += 1
+        # Handle each env completion independently
+        for i in range(n_envs):
+            if d[i]:
+                episode_rewards.append(float(ep_rewards[i]))
+                episode_lengths.append(int(ep_lengths[i]))
+                # Reset per-env counters after completion; DummyVecEnv auto-resets obs
+                ep_rewards[i] = 0.0
+                ep_lengths[i] = 0
+                completed += 1
+        episode_start = d
+    # Best-effort equity curve from the first env or _last_equity_curve snapshot
+    try:
+        if hasattr(env.envs[0], '_last_equity_curve') and env.envs[0]._last_equity_curve is not None:
+            import pandas as _pd
+            ec = env.envs[0]._last_equity_curve
+            if isinstance(ec, _pd.Series):
+                equity_curves.append(ec)
+            else:
+                equity_curves.append(_pd.Series(ec))
+        else:
+            equity_curves.append(env.envs[0].get_equity_curve())
+    except Exception:
+        pass
     
     # Calculate metrics
     metrics = {
