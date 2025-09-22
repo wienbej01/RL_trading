@@ -24,6 +24,7 @@ import pandas as pd
 
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import VecNormalize
 
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
@@ -121,24 +122,24 @@ def _slice_by_ticker(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 @dataclass
 class _HP:
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     n_steps: int = 2048
-    batch_size: int = 64
+    batch_size: int = 4096
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    vf_coef: float = 0.5
-    ent_coef: float = 0.0
+    vf_coef: float = 0.7
+    ent_coef: float = 0.015
     max_grad_norm: float = 0.5
     n_epochs: int = 10
-    target_kl: float = 0.016
+    target_kl: float = 0.075
     device: str = "auto"
     seed: int = 42
     total_steps: int = 100_000
 
 
 def _read_hparams(cfg: Dict[str, Any]) -> _HP:
-    # Map from either 'train' or 'training' blocks; prefer 'train' if present.
+    # Map from either 'ppo', 'train' or 'training' blocks; prefer 'ppo'.
     def G(*keys, default=None):
         cur = cfg
         for k in keys:
@@ -147,21 +148,21 @@ def _read_hparams(cfg: Dict[str, Any]) -> _HP:
             else:
                 return default
         return cur
-    blk = cfg.get('train', cfg.get('training', {})) or {}
+    blk = cfg.get('ppo', cfg.get('train', cfg.get('training', {}))) or {}
     def get_k(k, dv):
         return blk.get(k, dv)
     hp = _HP(
-        learning_rate=float(get_k('learning_rate', 3e-4)),
+        learning_rate=float(get_k('learning_rate', 1e-4)),
         n_steps=int(get_k('n_steps', 2048)),
-        batch_size=int(get_k('batch_size', 64)),
+        batch_size=int(get_k('batch_size', 4096)),
         gamma=float(get_k('gamma', 0.99)),
         gae_lambda=float(get_k('gae_lambda', 0.95)),
         clip_range=float(get_k('clip_range', 0.2)),
-        vf_coef=float(get_k('vf_coef', 0.5)),
-        ent_coef=float(get_k('ent_coef', 0.0)),
+        vf_coef=float(get_k('vf_coef', 0.7)),
+        ent_coef=float(get_k('ent_coef', 0.015)),
         max_grad_norm=float(get_k('max_grad_norm', 0.5)),
         n_epochs=int(get_k('n_epochs', 10)),
-        target_kl=float(get_k('target_kl', 0.016)),
+        target_kl=float(get_k('target_kl', 0.075)),
         device=str(get_k('device', 'auto')),
         seed=int(get_k('seed', 42)),
         total_steps=int(get_k('total_timesteps', get_k('total_steps', 100_000))),
@@ -274,6 +275,11 @@ class MultiTickerRLTrainer:
         policy_kwargs = dict(
             # Keep defaults; advanced policy (multi-ticker LSTM) can be wired later
         )
+        # Optional normalization config
+        norm_cfg = (self.cfg.get('normalize', {}) if isinstance(self.cfg, dict) else {}) or {}
+        norm_obs = bool(norm_cfg.get('obs', False))
+        norm_rew = bool(norm_cfg.get('reward', False))
+
         self.model = RecurrentPPO(
             'MlpLstmPolicy',
             vec_env,
@@ -293,14 +299,31 @@ class MultiTickerRLTrainer:
             verbose=1,
             seed=self.hp.seed,
         )
+        # Wrap with VecNormalize if requested
+        if norm_obs or norm_rew:
+            vec_env = VecNormalize(vec_env, norm_obs=norm_obs, norm_reward=norm_rew, clip_obs=10.0, clip_reward=10.0)
+            self.model.set_env(vec_env)
         self.model.learn(total_timesteps=int(self.hp.total_steps), progress_bar=True)
 
         # Save artifacts
         (output_dir).mkdir(parents=True, exist_ok=True)
         model_path = output_dir / 'model'
-        self.model.save(str(model_path))
+        # Robust save: handle environments where gym lacks __version__ attribute (SB3 system info)
         try:
-            vec_env.save(str(output_dir / 'vecnormalize.pkl'))
+            self.model.save(str(model_path))
+        except AttributeError as e:
+            # SB3 get_system_info may access gym.__version__; patch it if missing and retry once
+            try:
+                import gym as _gym  # type: ignore
+                if not hasattr(_gym, "__version__"):
+                    setattr(_gym, "__version__", "0.0.0")
+                    logger.warning("Patched gym.__version__='0.0.0' for SB3 save compatibility")
+                self.model.save(str(model_path))
+            except Exception:
+                raise e
+        try:
+            if isinstance(self.model.get_env(), VecNormalize):
+                self.model.get_env().save(str(output_dir / 'vecnormalize.pkl'))
         except Exception:
             pass
         logger.info("Saved multi-ticker model to %s", model_path)
