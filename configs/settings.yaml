@@ -424,3 +424,45 @@ paths:
 # Secrets configuration
 secrets:
   polygon_api_key: ""  # Set via environment variable POLYGON_API_KEY
+# PPO/VecNormalize overrides for stability
+ppo:
+  total_timesteps: 100000
+  learning_rate: 1.0e-4
+  n_steps: 512
+  batch_size: 1024
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  vf_coef: 0.7
+  ent_coef: 0.03
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  clip_range_vf: 0.2
+
+normalize:
+  obs: true
+  reward: true
+  per_ticker: true
+  reward_scale: 0.5
+
+# Minimal env block for IntradayRLEnv compatibility and shaping
+env:
+  max_steps: 390
+  reward_scaling: 0.1
+  reward:
+    kind: hybrid2
+    alpha: 0.15
+    beta: 0.25
+    dir_weight: 300.0
+    hold_penalty: 0.001
+    noise_std: 1.0e-4
+    activity:
+      target_per_day: 2
+      bonus: 0.02
+      lagrange_eta: 0.01
+      lambda_init: 0.0
+  trading:
+    force_open_epsilon: 0.05
+    force_warmup_frac: 0.25
+    max_entries_per_day: 10
+    max_trades_per_hour: 3

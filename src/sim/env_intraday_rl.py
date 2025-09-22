@@ -267,10 +267,23 @@ class IntradayRLEnv(Env):
             self._day_ptr = (self._day_ptr + 1) % max(1, len(self._day_starts))
             self.i = int(self._day_starts[self._day_ptr])
 
-        # Ensure we land within RTH
+        # Ensure we land within RTH; guard against running past the end
         while self.i < len(self.df) and not self._tod(self.df.index[self.i]):
             self.i += 1
-        
+
+        # If we advanced past the end (e.g., malformed day start), fall back to the
+        # last available RTH bar; if none exist, use the final bar safely.
+        if self.i >= len(self.df):
+            fallback_idx = None
+            try:
+                for idx in range(len(self.df) - 1, -1, -1):
+                    if self._tod(self.df.index[idx]):
+                        fallback_idx = idx
+                        break
+            except Exception:
+                fallback_idx = None
+            self.i = int(fallback_idx) if fallback_idx is not None else max(0, len(self.df) - 1)
+
         ts = self.df.index[self.i]
         obs = self._obs(ts, float(self.df["close"].iloc[self.i]))
         
@@ -578,11 +591,15 @@ class IntradayRLEnv(Env):
                 entry_tc = estimate_tc(self.pos, price, self.exec_sim)
                 self.cash -= entry_tc
                 try:
+                    direction = 'long' if self.pos > 0 else 'short'
+                    qty = int(abs(self.pos))
                     self.trades.append({
                         'ts': ts,
                         'pos': int(self.pos),
                         'price': float(price),
-                        'action': 'open'
+                        'action': 'open',
+                        'direction': direction,
+                        'quantity': qty
                     })
                     # Track open trade context for close logging
                     self._open_ts = ts
@@ -850,6 +867,17 @@ class IntradayRLEnv(Env):
                     reward += open_bonus
         except Exception:
             pass
+
+        # Optional small stochastic reward to break zero-variance targets early in training
+        try:
+            noise_std = float(self.config.get('env', {}).get('reward', {}).get('noise_std', 0.0)) if isinstance(self.config, dict) else 0.0
+        except Exception:
+            noise_std = 0.0
+        if noise_std > 0.0:
+            try:
+                reward += float(np.random.normal(0.0, noise_std))
+            except Exception:
+                pass
 
         reward *= self.env_config.reward_scaling
         reward = np.clip(reward, -1, 1)
