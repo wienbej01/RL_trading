@@ -61,6 +61,96 @@ Performance (CPU‑only):
 
 See `docs/rl_improvement_plan.md` for the staged roadmap.
 
+## 🧪 Stability & Normalization (Multi‑Ticker)
+
+We added a stability pass for multi‑ticker PPO training:
+
+- PPO tuning: lr=1e-4, batch_size=4096, vf_coef=0.7, ent_coef=0.015, target_kl=0.075, n_steps=2048
+- Normalization: `normalize:` block enables VecNormalize (obs+reward); stats are saved with the model
+- Data hygiene pre‑features: strict de‑dup by (timestamp,ticker), bounded ffill (≤2 bars), drop tiny islands; aligned masks for train/test
+- Evaluation: always emits `trades.csv` and expanded trade stats in `evaluation_results.json`
+
+Quick run with local partitioned data:
+
+```
+PYTHONPATH=. venv/bin/python scripts/run_multiticker_pipeline.py \
+  --config configs/settings.yaml \
+  --train-start 2024-06-01 --train-end 2024-08-31 \
+  --test-start  2024-09-23 --test-end  2024-09-30 \
+  --tickers "LYFT RUN SNAP PLUG SQ UBER ROKU ENPH CRWD DDOG OKTA ETSY NET SPY" \
+  --test-tickers "GOOGL CHPT UAL DOCU CROX FSLR PINS ZM TWLO RBLX SOFI" \
+--output-dir results/local_multi_norm
+```
+
+## ✅ Profitability Improvements Applied
+
+- Per‑ticker features: pipeline preserves `ticker` and computes features per name.
+- Normalization: VecNormalize enabled for observations and rewards.
+- PPO tuning: n_steps=1536, batch_size=3072, ent_coef=0.005, target_kl=0.04, total_timesteps=300k.
+- Portfolio controls: min_hold_minutes=10, max_entries_per_day=2, small holding penalty.
+- Regime/ticker conditioning: lightweight regime tags and optional ticker identity columns.
+
+### Train/Test (clean OOS split)
+
+Train (Apr → mid‑Aug), Test (mid‑Aug → Sep) on a core, liquid cluster:
+
+```
+PYTHONPATH=. python scripts/run_multiticker_pipeline.py \
+  --config configs/settings.yaml \
+  --tickers SPY AAPL MSFT NVDA \
+  --train-start 2024-04-01 --train-end 2024-08-15 \
+  --test-start  2024-08-16 --test-end  2024-09-30 \
+  --output-dir results/mt_cluster_core \
+  --portfolio-env --skip-download
+```
+
+OOS evaluation across rolling windows:
+
+```
+PYTHONPATH=. python scripts/oos_eval.py \
+  --config configs/settings.yaml \
+  --data     results/mt_cluster_core/data/multiticker_data_2024-04-01_to_2024-09-30.parquet \
+  --features results/mt_cluster_core/features/multiticker_features_2024-04-01_to_2024-09-30.parquet \
+  --model    results/mt_cluster_core/models/model \
+  --test-tickers SPY AAPL MSFT NVDA \
+  --windows 3 \
+  --output results/oos_eval/mt_cluster_core
+```
+
+### Optional: External VIX as a Feature
+
+- Polygon (5 calls/min):
+
+```
+export POLYGON_API_KEY=...
+PYTHONPATH=. python scripts/download_vix_polygon.py --start 2024-01-01 --end 2024-09-30 --symbol I:VIX
+```
+
+- Configure Features: `configs/settings.yaml`
+
+```
+features:
+  volatility:
+    external_vix_path: data/external/vix.parquet
+  regime:
+    enabled: true
+  ticker_identity:
+    enabled: true
+```
+
+The feature pipeline will merge `vix` and `vix_z` (z‑score) lagged by 1 bar to avoid lookahead.
+
+Bulk Polygon ingest (partitioned parquet):
+
+```
+export POLYGON_API_KEY=... 
+PYTHONPATH=. venv/bin/python scripts/polygon_bulk_ingest.py \
+  --config configs/settings.yaml \
+  --tickers SPY,QQQ \
+  --start 2022-01-01 --end 2024-12-31 \
+  --cpm 60
+```
+
 ## 🧠 Feature Engineering Highlights
 
 - ICT: prior‑day levels and equilibrium (PDM), opening‑range (OR) distances, displacement bars (+ density), fair‑value gaps (+ density), equal highs/lows proximity.
@@ -582,6 +672,47 @@ python scripts/run_paper_trading.py --config configs/paper_trading.yaml
 - Follow PEP 8 style guidelines
 - Document all public APIs
 - Run full test suite before committing
+
+## 🧺 Portfolio Environment (Multi‑Ticker)
+
+A minimal portfolio RL environment with per‑ticker actions and ATR‑based unit sizing is available at `src/sim/portfolio_env.py`.
+
+Quick start:
+```python
+from src.sim.portfolio_env import PortfolioRLEnv, PortfolioEnvConfig
+
+# Prepare aligned OHLCV/feature maps keyed by ticker (minute bars, America/New_York tz)
+ohlcv_map = {
+    'SPY': spy_df,  # columns: open, high, low, close, volume, vwap (optional)
+    'QQQ': qqq_df,
+}
+features_map = {
+    'SPY': spy_features,  # numeric columns only
+    'QQQ': qqq_features,
+}
+
+env = PortfolioRLEnv(
+    ohlcv_map=ohlcv_map,
+    features_map=features_map,
+    env_cfg=PortfolioEnvConfig(
+        units_per_ticker=100,
+        risk_budget_per_ticker=1000.0,  # used with ATR for unit sizing
+        max_gross_exposure=1.0,         # cap as fraction of equity
+        turnover_penalty=0.0,
+        position_holding_penalty=0.0,
+        fixed_tickers=['SPY', 'QQQ'],   # fixes obs/action order
+    )
+)
+
+obs, _ = env.reset()
+action = [1, 2]  # MultiDiscrete per‑ticker: 0→short, 1→flat, 2→long
+obs, reward, terminated, truncated, info = env.step(action)
+```
+
+Notes:
+- Per‑ticker ATR determines unit magnitude: units ≈ risk_budget / (ATR * point_value), capped by `units_per_ticker`.
+- Gross exposure is capped by `max_gross_exposure * equity`; units are scaled down if exceeded.
+- EOD flatten: positions are closed at session boundaries.
 
 ## 📜 License
 

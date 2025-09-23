@@ -197,12 +197,69 @@ class FeaturePipeline:
         # Ensure timestamp is the index if it's a column
         if 'timestamp' in mapped_data.columns:
             if not isinstance(mapped_data.index, pd.DatetimeIndex):
-                # Convert timestamp to datetime index
-                mapped_data['timestamp'] = pd.to_datetime(mapped_data['timestamp'], unit='ms' if data_source == 'polygon' else 'ns')
+                # Convert timestamp to datetime index (Polygon aggregates: ms; quotes/trades: ns)
+                if data_source == 'polygon':
+                    unit = 'ns' if data_type in ('quotes', 'trades') else 'ms'
+                else:
+                    unit = 'ns'
+                mapped_data['timestamp'] = pd.to_datetime(mapped_data['timestamp'], unit=unit)
                 mapped_data.set_index('timestamp', inplace=True)
                 self.logger.debug("Set timestamp as DatetimeIndex")
 
         return mapped_data
+
+    def _merge_external_vix(self, features: pd.DataFrame) -> pd.DataFrame:
+        """
+        Optionally merge an external VIX series as a feature if configured.
+
+        Expects a parquet/csv at path with a DatetimeIndex and a column named one of
+        ['vix', 'close', 'VIX']. Produces columns 'vix' and 'vix_z' aligned to
+        features' index (America/New_York), forward-filled and lagged by 1 bar to
+        avoid lookahead.
+        """
+        try:
+            ext = self.vol_config.get('external_vix_path') if isinstance(self.vol_config, dict) else None
+            if not ext:
+                return features
+            import pandas as _pd
+            p = str(ext)
+            if p.lower().endswith('.parquet'):
+                v = _pd.read_parquet(p)
+            else:
+                v = _pd.read_csv(p)
+            # Normalize index
+            if 'timestamp' in v.columns:
+                v['timestamp'] = _pd.to_datetime(v['timestamp'], utc=True, errors='coerce')
+                v = v.loc[v['timestamp'].notna()].set_index('timestamp')
+            if not isinstance(v.index, _pd.DatetimeIndex):
+                v.index = _pd.to_datetime(v.index, utc=True, errors='coerce')
+            if v.index.tz is None:
+                v.index = v.index.tz_localize('UTC')
+            v = v.sort_index().tz_convert('America/New_York')
+            # Choose a usable column
+            col = None
+            for c in ['vix', 'VIX', 'close', 'Close']:
+                if c in v.columns:
+                    col = c
+                    break
+            if col is None and v.shape[1] >= 1:
+                col = v.columns[0]
+            if col is None:
+                return features
+            ser = _pd.to_numeric(v[col], errors='coerce').rename('vix')
+            # Align to feature index, ffill, and lag by 1 bar
+            aligned = ser.reindex(features.index).ffill().shift(1)
+            out = features.copy()
+            out['vix'] = aligned.astype(float)
+            try:
+                z = (aligned - aligned.rolling(60, min_periods=10).mean()) / (aligned.rolling(60, min_periods=10).std() + 1e-6)
+                out['vix_z'] = z.astype(float)
+            except Exception:
+                pass
+            return out
+        except Exception:
+            # Never break pipeline on optional external data
+            return features
 
     def _validate_polygon_data_quality(self, data: pd.DataFrame) -> pd.DataFrame:
         """
@@ -312,11 +369,26 @@ class FeaturePipeline:
             # Do not normalize non-numeric/ticker label
             features = self._normalize_features(features)
 
-        # Apply feature selection if configured
-        if self.feature_selection_config and 'method' in self.feature_selection_config:
+        # Apply feature selection if configured (support both 'method' and 'selection_method')
+        if self.feature_selection_config and (
+            'method' in self.feature_selection_config or 'selection_method' in self.feature_selection_config
+        ):
             features = self._select_features(features)
 
+        # If input carried a 'timestamp' column (Polygon-style) and did not use it as index,
+        # restore a simple RangeIndex so external comparisons by position align.
+        if 'timestamp' in data.columns and not isinstance(data.index, pd.DatetimeIndex):
+            try:
+                features = features.reset_index(drop=True)
+            except Exception:
+                pass
+
         self.is_fitted = True
+        # Optionally merge external VIX features
+        try:
+            features = self._merge_external_vix(features)
+        except Exception:
+            pass
         return self
     
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -334,6 +406,9 @@ class FeaturePipeline:
             self.logger.warning("Pipeline not fitted, fitting on transform data")
             self.fit(data)
 
+        # Track original timestamp-column presence before mapping
+        _orig_ts_col_present = ('timestamp' in data.columns)
+        _orig_index_is_dt = isinstance(data.index, pd.DatetimeIndex)
         # Multi-ticker aware transform
         if 'ticker' in data.columns or (
             isinstance(data.index, pd.MultiIndex) and 'ticker' in data.index.names
@@ -363,10 +438,17 @@ class FeaturePipeline:
         if self.normalization_config:
             features = self._normalize_features(features)
 
-        # Apply feature selection if configured
-        if self.feature_selection_config and 'method' in self.feature_selection_config:
+        # Apply feature selection if configured (also recognize 'selection_method')
+        if self.feature_selection_config and (
+            'method' in self.feature_selection_config or 'selection_method' in self.feature_selection_config
+        ):
             features = self._select_features(features)
-
+        # If original input had a 'timestamp' column and was not indexed by it, restore RangeIndex
+        if _orig_ts_col_present and not _orig_index_is_dt:
+            try:
+                features = features.reset_index(drop=True)
+            except Exception:
+                pass
         return features
     
     def fit_transform(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -423,41 +505,62 @@ class FeaturePipeline:
             # Calculate MACD
             if 'calculate_macd' in tech_config and tech_config['calculate_macd']:
                 macd_config = tech_config.get('macd_config', {})
-                macd = calculate_macd(
+                macd_res = calculate_macd(
                     data['close'],
                     fast_period=macd_config.get('fast_period', 12),
                     slow_period=macd_config.get('slow_period', 26),
                     signal_period=macd_config.get('signal_period', 9)
                 )
-                features['macd'] = macd['macd']
-                features['macd_signal'] = macd['signal']
-                features['macd_histogram'] = macd['histogram']
-                # MACD line for trend bias
-                features['macd_line'] = macd['macd'] - macd['signal']
+                try:
+                    macd_line, signal_line, histogram = macd_res  # tuple form
+                except Exception:
+                    # dict form fallback
+                    macd_line = macd_res['macd']
+                    signal_line = macd_res['signal']
+                    histogram = macd_res['histogram']
+                features['macd'] = macd_line
+                features['macd_signal'] = signal_line
+                features['macd_histogram'] = histogram
+                features['macd_line'] = macd_line - signal_line
             
             # Calculate Bollinger Bands
             if 'calculate_bollinger_bands' in tech_config and tech_config['calculate_bollinger_bands']:
                 bb_config = tech_config.get('bollinger_config', {})
-                bb = calculate_bollinger_bands(
+                bb_res = calculate_bollinger_bands(
                     data['close'],
                     window=bb_config.get('window', 20),
                     num_std=bb_config.get('num_std', 2)
                 )
-                features['bb_upper'] = bb['upper']
-                features['bb_middle'] = bb['middle']
-                features['bb_lower'] = bb['lower']
-                features['bb_width'] = bb['width']
+                try:
+                    upper_band, middle_band, lower_band = bb_res  # tuple form
+                except Exception:
+                    upper_band = bb_res['upper']
+                    middle_band = bb_res['middle']
+                    lower_band = bb_res['lower']
+                features['bb_upper'] = upper_band
+                features['bb_middle'] = middle_band
+                features['bb_lower'] = lower_band
+                # width derived if needed
+                try:
+                    features['bb_width'] = (upper_band - lower_band) / (middle_band.replace(0, np.nan))
+                except Exception:
+                    pass
             
             # Calculate Stochastic Oscillator
             if 'calculate_stochastic' in tech_config and tech_config['calculate_stochastic']:
                 stoch_config = tech_config.get('stochastic_config', {})
-                stoch = calculate_stochastic_oscillator(
+                stoch_res = calculate_stochastic_oscillator(
                     data['high'], data['low'], data['close'],
                     k_period=stoch_config.get('k_period', 14),
                     d_period=stoch_config.get('d_period', 3)
                 )
-                features['stoch_k'] = stoch['k']
-                features['stoch_d'] = stoch['d']
+                try:
+                    k_ser, d_ser = stoch_res
+                except Exception:
+                    k_ser = stoch_res['k']
+                    d_ser = stoch_res['d']
+                features['stoch_k'] = k_ser
+                features['stoch_d'] = d_ser
 
             # Calculate Williams %R
             if 'calculate_williams_r' in tech_config and tech_config['calculate_williams_r']:
@@ -480,7 +583,7 @@ class FeaturePipeline:
             if 'calculate_spread' in micro_config and micro_config['calculate_spread']:
                 # Check if we have bid/ask columns or use high/low as fallback
                 if 'bid_price' in data.columns and 'ask_price' in data.columns:
-                    features['spread'] = calculate_spread(data['ask_price'], data['bid_price'])
+                    features['spread'] = calculate_spread(data['bid_price'], data['ask_price'])
                 else:
                     features['spread'] = calculate_spread(data['high'], data['low'])
             
@@ -712,7 +815,7 @@ class FeaturePipeline:
 
         # VPA enhancements
         try:
-            if self.vpa_config.get('enabled', True):
+            if self.vpa_config.get('enabled', False):
                 # Climax volume flag via RVOL threshold
                 if 'rvol' in features.columns:
                     thr = float(self.vpa_config.get('climax_rvol_threshold', 3.0))
@@ -1094,11 +1197,18 @@ class FeaturePipeline:
         Returns:
             Selected features
         """
+        # Backward-compat: map alternate keys
+        if 'selection_method' in self.feature_selection_config and 'method' not in self.feature_selection_config:
+            self.feature_selection_config['method'] = self.feature_selection_config['selection_method']
+        if 'max_features' in self.feature_selection_config and 'k' not in self.feature_selection_config:
+            # unify to k for univariate and variance-based selection
+            self.feature_selection_config['k'] = int(self.feature_selection_config['max_features'])
         method = self.feature_selection_config.get('method', 'univariate')
         
-        if method == 'univariate':
+        if method in ('univariate', 'k_best'):
             if self.feature_selector is None:
-                self.feature_selector = SelectKBest(score_func=f_regression, k=10)
+                k = int(self.feature_selection_config.get('k', 10))
+                self.feature_selector = SelectKBest(score_func=f_regression, k=k)
             
             # Calculate returns if not already present
             if 'returns' not in features.columns:
@@ -1130,6 +1240,16 @@ class FeaturePipeline:
                 # If no valid data, select all features
                 self.selected_features = features.columns.tolist()
             
+        elif method == 'variance':
+            # Select top-k features by variance (drop non-numeric)
+            k = int(self.feature_selection_config.get('k', 10))
+            num = features.select_dtypes(include=[np.number])
+            if num.empty:
+                self.selected_features = features.columns.tolist()
+            else:
+                vars_ = num.var(axis=0).sort_values(ascending=False)
+                top = vars_.index[:k].tolist()
+                self.selected_features = top
         elif method == 'manual':
             if 'selected_features' in self.feature_selection_config:
                 self.selected_features = self.feature_selection_config['selected_features']

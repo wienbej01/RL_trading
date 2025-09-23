@@ -153,12 +153,41 @@ def download_data(config, args):
 def generate_features(config, args, data):
     """Generate features from the downloaded data."""
     logger.info("Starting feature generation")
+    # Data hygiene: strict dedup by (timestamp,ticker), small ffill within session, drop tiny islands
+    def _preclean(df: pd.DataFrame) -> pd.DataFrame:
+        base = df
+        if 'ticker' in base.columns:
+            dedup = base.reset_index().drop_duplicates(subset=['index','ticker'], keep='last').set_index('index')
+        else:
+            dedup = base[~base.index.duplicated(keep='last')]
+        def _ff(group: pd.DataFrame) -> pd.DataFrame:
+            return group.sort_index().ffill(limit=2)
+        if 'ticker' in dedup.columns:
+            dedup = dedup.groupby('ticker', group_keys=False).apply(_ff)
+            # drop islands < 5 bars
+            keep_idx = []
+            for t, g in dedup.groupby('ticker'):
+                if len(g) >= 5:
+                    keep_idx.append(g.index)
+            if keep_idx:
+                import numpy as _np
+                mask = dedup.index.isin(_np.concatenate(keep_idx))
+                dedup = dedup.loc[mask]
+        else:
+            dedup = _ff(dedup)
+        return dedup
+    try:
+        data = _preclean(data)
+    except Exception as e:
+        logger.warning(f"Pre-clean failed (continuing): {e}")
     
     # Initialize feature pipeline
     from src.features.pipeline import FeaturePipeline
     feature_pipeline = FeaturePipeline(config['features'])
     
     # Generate features
+    # Preserve ticker column so FeaturePipeline can compute per‑ticker features correctly.
+    # The pipeline will group by 'ticker' when present and attach it back to the output.
     features = feature_pipeline.fit_transform(data)
     
     # Save features
@@ -178,14 +207,16 @@ def train_model(config, args, data, features):
     logger.info("Starting model training")
     
     # Split data into training and testing sets
-    train_mask = (data.index >= args.train_start) & (data.index <= args.train_end)
-    test_mask = (data.index >= args.test_start) & (data.index <= args.test_end)
-    
-    train_data = data[train_mask]
-    test_data = data[test_mask]
-    
-    train_features = features[train_mask]
-    test_features = features[test_mask]
+    # Build masks on each frame's own index to handle cleaning/row drops
+    train_mask_d = (data.index >= args.train_start) & (data.index <= args.train_end)
+    test_mask_d = (data.index >= args.test_start) & (data.index <= args.test_end)
+    train_mask_f = (features.index >= args.train_start) & (features.index <= args.train_end)
+    test_mask_f = (features.index >= args.test_start) & (features.index <= args.test_end)
+
+    train_data = data[train_mask_d]
+    test_data = data[test_mask_d]
+    train_features = features[train_mask_f]
+    test_features = features[test_mask_f]
     
     logger.info(f"Training data shape: {train_data.shape}")
     logger.info(f"Testing data shape: {test_data.shape}")
@@ -315,13 +346,16 @@ def main():
             return
     
     # Train/test split (make available even if skipping training)
-    train_mask = (data.index >= args.train_start) & (data.index <= args.train_end)
-    test_mask = (data.index >= args.test_start) & (data.index <= args.test_end)
+    # Build masks on each frame to handle cleaning/dedup differences
+    train_mask_d = (data.index >= args.train_start) & (data.index <= args.train_end)
+    test_mask_d = (data.index >= args.test_start) & (data.index <= args.test_end)
+    train_mask_f = (features.index >= args.train_start) & (features.index <= args.train_end)
+    test_mask_f = (features.index >= args.test_start) & (features.index <= args.test_end)
 
-    train_data = data[train_mask]
-    test_data = data[test_mask]
-    train_features = features[train_mask]
-    test_features = features[test_mask]
+    train_data = data[train_mask_d]
+    test_data = data[test_mask_d]
+    train_features = features[train_mask_f]
+    test_features = features[test_mask_f]
 
     # Guard: empty test split would make portfolio env construction fail
     if test_data.empty:
@@ -333,9 +367,10 @@ def main():
             # Use the last 2 calendar days of available data as a minimal backtest window
             last_ts = data.index.max()
             fallback_start = (last_ts - pd.Timedelta(days=2)).normalize()
-            fallback_mask = (data.index >= fallback_start) & (data.index <= last_ts)
-            fb_data = data[fallback_mask]
-            fb_feat = features[fallback_mask]
+            fallback_mask_d = (data.index >= fallback_start) & (data.index <= last_ts)
+            fallback_mask_f = (features.index >= fallback_start) & (features.index <= last_ts)
+            fb_data = data[fallback_mask_d]
+            fb_feat = features[fallback_mask_f]
             if fb_data.empty:
                 # As an extra fallback, take the last 1,000 rows if present
                 fb_data = data.tail(1000)

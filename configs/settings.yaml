@@ -91,6 +91,8 @@ features:
     calculate_garch: true
     calculate_historical_volatility: true
     calculate_implied_volatility: true
+    # Optional external VIX parquet/csv to merge as features 'vix' and 'vix_z'
+    external_vix_path: "data/external/vix.parquet"
   
   smt:
     enabled: true
@@ -102,6 +104,13 @@ features:
     enabled: true
     detect_key_levels: true
     detect_breakout_levels: true
+  # Lightweight regime tags and ticker identity for multi‑ticker conditioning
+  regime:
+    enabled: true
+    vol_window: 60
+    trend_window: 60
+  ticker_identity:
+    enabled: true
 
 # Training configuration optimized for performance
 training:
@@ -426,17 +435,17 @@ secrets:
   polygon_api_key: ""  # Set via environment variable POLYGON_API_KEY
 # PPO/VecNormalize overrides for stability
 ppo:
-  total_timesteps: 100000
+  total_timesteps: 300000
   learning_rate: 1.0e-4
-  n_steps: 512
-  batch_size: 1024
+  n_steps: 1536
+  batch_size: 3072
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
   vf_coef: 0.7
-  ent_coef: 0.03
+  ent_coef: 0.005
   max_grad_norm: 0.5
-  target_kl: 0.05
+  target_kl: 0.04
   clip_range_vf: 0.2
 
 normalize:
@@ -464,5 +473,10 @@ env:
   trading:
     force_open_epsilon: 0.05
     force_warmup_frac: 0.25
-    max_entries_per_day: 10
+    max_entries_per_day: 2
     max_trades_per_hour: 3
+  portfolio:
+    force: true
+    min_hold_minutes: 10
+    max_entries_per_day: 2
+    position_holding_penalty: 0.001
