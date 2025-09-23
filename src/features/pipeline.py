@@ -449,6 +449,11 @@ class FeaturePipeline:
                 features = features.reset_index(drop=True)
             except Exception:
                 pass
+        # Optionally merge external VIX features after selection to ensure retention
+        try:
+            features = self._merge_external_vix(features)
+        except Exception:
+            pass
         return features
     
     def fit_transform(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -1222,7 +1227,10 @@ class FeaturePipeline:
             
             if len(features_clean) > 0:
                 # Prepare features and target for selection
+                # Drop the synthetic target and restrict to numeric columns only for selector
                 X = features_clean.drop(columns=['returns'])
+                # Ensure non-numeric labels like 'ticker' are excluded from selector input
+                X = X.select_dtypes(include=[np.number])
                 y = features_clean['returns'].shift(-1).ffill()
                 
                 # Remove any remaining NaN values
