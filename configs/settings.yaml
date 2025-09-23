@@ -433,6 +433,40 @@ paths:
 # Secrets configuration
 secrets:
   polygon_api_key: ""  # Set via environment variable POLYGON_API_KEY
+
+# Reinforcement learning settings (new consolidated block)
+rl:
+  algo: ppo
+  seed: 123
+  n_envs: 8
+  vecnormalize:
+    norm_obs: true
+    norm_reward: true
+    clip_obs: 10.0
+    clip_reward: 10.0
+  ppo:
+    n_steps: 2048
+    batch_size: 4096
+    n_epochs: 10
+    gamma: 0.99
+    gae_lambda: 0.95
+    ent_coef: 0.02
+    vf_coef: 0.7
+    max_grad_norm: 0.5
+    target_kl: 0.01
+    lr_schedule: linear  # 3e-4 -> 1e-5
+    clip_schedule: linear # 0.2 -> 0.1
+    policy_kwargs:
+      net_arch:
+        pi: [256, 256]
+        vf: [256, 256]
+      activation_fn: ReLU
+      ortho_init: true
+  eval:
+    eval_freq: 100000
+    n_eval_episodes: 10
+    save_best: true
+    deterministic: true
 # PPO/VecNormalize overrides for stability
 ppo:
   total_timesteps: 300000

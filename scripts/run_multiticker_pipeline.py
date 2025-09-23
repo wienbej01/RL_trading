@@ -63,6 +63,10 @@ def parse_args():
                         help='List of tickers to trade')
     parser.add_argument('--output-dir', type=str, default='results/multiticker_pipeline',
                         help='Output directory for results')
+    parser.add_argument('--max-steps', type=int, default=None,
+                        help='Override total training timesteps')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducibility')
     # Backtest behavior
     parser.add_argument('--strict-test-window', action='store_true',
                         help='Do not fall back to a different window if the test split is empty')
@@ -309,6 +313,17 @@ def main():
     if args.position_holding_penalty is not None:
         config.setdefault('env', {}).setdefault('portfolio', {})['position_holding_penalty'] = float(args.position_holding_penalty)
     
+    # Thread seed and max steps into RL config without breaking legacy readers
+    if args.seed is not None:
+        config.setdefault('rl', {}).setdefault('seed', int(args.seed))
+        # keep legacy path
+        config.setdefault('ppo', {}).setdefault('seed', int(args.seed))
+    if args.max_steps is not None:
+        config.setdefault('rl', {}).setdefault('ppo', {}).setdefault('total_timesteps', int(args.max_steps))
+        # legacy mirrors
+        config.setdefault('ppo', {})['total_timesteps'] = int(args.max_steps)
+        config.setdefault('training', {})['total_timesteps'] = int(args.max_steps)
+
     # Apply optimizations
     config = ComputationOptimizer.apply_all_optimizations(config)
     
