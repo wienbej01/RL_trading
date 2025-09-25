@@ -41,6 +41,109 @@ from .train import evaluate_model  # reuse existing evaluator
 
 logger = get_logger(__name__)
 
+def _set_global_seeds(seed: int) -> None:
+    try:
+        import numpy as _np
+        import random as _rd
+        import torch as _torch
+        _rd.seed(seed)
+        _np.random.seed(seed)
+        _torch.manual_seed(seed)
+        if _torch.cuda.is_available():
+            _torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
+
+def linear_schedule(start: float, end: float):
+    """Return a callable for SB3 that maps progress_remaining (1->0) to value."""
+    start = float(start)
+    end = float(end)
+    def fn(progress_remaining: float) -> float:
+        return end + (start - end) * float(progress_remaining)
+    return fn
+
+
+class EvalAndLrCallback(BaseCallback):
+    """Periodic evaluation + LR/clip heartbeat + optional LR reduce on plateau.
+
+    - Runs evaluation every eval_freq steps on provided eval_env
+    - Saves best model by mean reward
+    - Halves LR if no improvement for `patience` evals
+    """
+    def __init__(self, eval_env, eval_freq: int, n_eval_episodes: int, out_dir: Path,
+                 min_lr: float = 1e-5, patience: int = 3, verbose: int = 1):
+        super().__init__(verbose=verbose)
+        self.eval_env = eval_env
+        self.eval_freq = int(max(1, eval_freq))
+        self.n_eval_episodes = int(max(1, n_eval_episodes))
+        self.best_mean_reward = -float('inf')
+        self.no_improve = 0
+        self.min_lr = float(min_lr)
+        self.patience = int(max(1, patience))
+        self.out_dir = Path(out_dir)
+        (self.out_dir / 'checkpoints').mkdir(parents=True, exist_ok=True)
+
+    def _on_step(self) -> bool:
+        step = int(self.num_timesteps)
+        if step % self.eval_freq != 0:
+            return True
+        try:
+            mean_r, std_r = evaluate_policy(self.model, self.eval_env, n_eval_episodes=self.n_eval_episodes,
+                                            deterministic=True, return_episode_rewards=False)
+        except Exception:
+            return True
+        # Heartbeat: lr and clip_range if callable
+        try:
+            lr = float(self.model.lr_schedule(1.0)) if callable(self.model.lr_schedule) else float(self.model.learning_rate)
+        except Exception:
+            lr = float(getattr(self.model, 'learning_rate', 0.0))
+        try:
+            cr = float(self.model.clip_range(1.0)) if callable(self.model.clip_range) else float(self.model.clip_range)
+        except Exception:
+            cr = float(getattr(self.model, 'clip_range', 0.0))
+        self.logger.record("eval/mean_reward", mean_r)
+        self.logger.record("train/lr", lr)
+        self.logger.record("train/clip_range", cr)
+        if self.verbose:
+            print(f"[eval] step={step} meanR={mean_r:.3f} lr={lr:.2e} clip={cr:.3f}")
+
+        # Save best
+        if mean_r > self.best_mean_reward:
+            self.best_mean_reward = mean_r
+            try:
+                self.model.save(str(self.out_dir / 'checkpoints' / 'best_model'))
+                # persist vecnorm if present
+                try:
+                    env = self.model.get_env()
+                    if isinstance(env, VecNormalize):
+                        env.save(str(self.out_dir / 'checkpoints' / 'vecnorm.pkl'))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self.no_improve = 0
+        else:
+            self.no_improve += 1
+            # Reduce LR on plateau
+            if self.no_improve >= self.patience:
+                try:
+                    current_lr = float(self.model.lr_schedule(1.0)) if callable(self.model.lr_schedule) else float(self.model.learning_rate)
+                except Exception:
+                    current_lr = float(getattr(self.model, 'learning_rate', 0.0))
+                new_lr = max(self.min_lr, current_lr * 0.5)
+                try:
+                    # Update optimizer and schedule base
+                    for pg in self.model.policy.optimizer.param_groups:
+                        pg['lr'] = new_lr
+                    # Replace schedule to a flat at new_lr from now on
+                    self.model.lr_schedule = linear_schedule(new_lr, new_lr)
+                    if self.verbose:
+                        print(f"[eval] plateau detected → lr halved to {new_lr:.2e}")
+                except Exception:
+                    pass
+                self.no_improve = 0
+        return True
 
 def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure a tz-aware DatetimeIndex in America/New_York order."""
@@ -554,110 +657,25 @@ class MultiTickerRLTrainer:
                     # Create with expected columns for consistency
                     tdf = _pd.DataFrame(columns=[
                         'ticker','direction','entry_time','exit_time','entry_price','exit_price','units','duration_bars','duration_minutes','pnl'
-def _set_global_seeds(seed: int) -> None:
-    try:
-        import numpy as _np
-        import random as _rd
-        import torch as _torch
-        _rd.seed(seed)
-        _np.random.seed(seed)
-        _torch.manual_seed(seed)
-        if _torch.cuda.is_available():
-            _torch.cuda.manual_seed_all(seed)
-    except Exception:
-        pass
-
-
-def linear_schedule(start: float, end: float):
-    """Return a callable for SB3 that maps progress_remaining (1->0) to value."""
-    start = float(start)
-    end = float(end)
-    def fn(progress_remaining: float) -> float:
-        return end + (start - end) * float(progress_remaining)
-    return fn
-
-
-class EvalAndLrCallback(BaseCallback):
-    """Periodic evaluation + LR/clip heartbeat + optional LR reduce on plateau.
-
-    - Runs evaluation every eval_freq steps on provided eval_env
-    - Saves best model by mean reward
-    - Halves LR if no improvement for `patience` evals and EV proxy is weak
-    """
-    def __init__(self, eval_env, eval_freq: int, n_eval_episodes: int, out_dir: Path,
-                 min_lr: float = 1e-5, patience: int = 3, verbose: int = 1):
-        super().__init__(verbose=verbose)
-        self.eval_env = eval_env
-        self.eval_freq = int(max(1, eval_freq))
-        self.n_eval_episodes = int(max(1, n_eval_episodes))
-        self.best_mean_reward = -float('inf')
-        self.no_improve = 0
-        self.min_lr = float(min_lr)
-        self.patience = int(max(1, patience))
-        self.out_dir = Path(out_dir)
-        (self.out_dir / 'checkpoints').mkdir(parents=True, exist_ok=True)
-
-    def _on_step(self) -> bool:
-        step = int(self.num_timesteps)
-        if step % self.eval_freq != 0:
-            return True
-        try:
-            mean_r, std_r = evaluate_policy(self.model, self.eval_env, n_eval_episodes=self.n_eval_episodes,
-                                            deterministic=True, return_episode_rewards=False)
-        except Exception:
-            return True
-        # Heartbeat: lr and clip_range if callable
-        try:
-            lr = float(self.model.lr_schedule(1.0)) if callable(self.model.lr_schedule) else float(self.model.learning_rate)
-        except Exception:
-            lr = float(getattr(self.model, 'learning_rate', 0.0))
-        try:
-            cr = float(self.model.clip_range(1.0)) if callable(self.model.clip_range) else float(self.model.clip_range)
-        except Exception:
-            cr = float(getattr(self.model, 'clip_range', 0.0))
-        self.logger.record("eval/mean_reward", mean_r)
-        self.logger.record("train/lr", lr)
-        self.logger.record("train/clip_range", cr)
-        if self.verbose:
-            print(f"[eval] step={step} meanR={mean_r:.3f} lr={lr:.2e} clip={cr:.3f}")
-
-        # Save best
-        if mean_r > self.best_mean_reward:
-            self.best_mean_reward = mean_r
-            try:
-                self.model.save(str(self.out_dir / 'checkpoints' / 'best_model'))
-                # persist vecnorm if present
-                try:
-                    env = self.model.get_env()
-                    if isinstance(env, VecNormalize):
-                        env.save(str(self.out_dir / 'checkpoints' / 'vecnorm.pkl'))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            self.no_improve = 0
-        else:
-            self.no_improve += 1
-            # Reduce LR on plateau
-            if self.no_improve >= self.patience:
-                try:
-                    current_lr = float(self.model.lr_schedule(1.0)) if callable(self.model.lr_schedule) else float(self.model.learning_rate)
-                except Exception:
-                    current_lr = float(getattr(self.model, 'learning_rate', 0.0))
-                new_lr = max(self.min_lr, current_lr * 0.5)
-                try:
-                    # Update optimizer and schedule base
-                    for pg in self.model.policy.optimizer.param_groups:
-                        pg['lr'] = new_lr
-                    # Replace schedule to a flat at new_lr from now on
-                    self.model.lr_schedule = linear_schedule(new_lr, new_lr)
-                    if self.verbose:
-                        print(f"[eval] plateau detected → lr halved to {new_lr:.2e}")
-                except Exception:
-                    pass
-                self.no_improve = 0
-        return True
                     ])
+                # Enrich with computed fields and run metadata
+                try:
+                    tdf = tdf.copy()
+                    tdf['trade_id'] = _pd.RangeIndex(start=1, stop=len(tdf)+1)
+                    # PnL percent relative to notional at entry (per-trade)
+                    eps = 1e-9
+                    notional = (_pd.to_numeric(tdf.get('entry_price', _pd.Series(dtype=float))) * _pd.to_numeric(tdf.get('units', _pd.Series(dtype=float))).abs()).replace(0, _pd.NA)
+                    tdf['return_pct'] = _pd.to_numeric(tdf.get('pnl', _pd.Series(dtype=float))) / (notional.replace(_pd.NA, eps) + eps)
+                    # Metadata columns
+                    tdf['run_seed'] = seed if 'seed' in locals() else getattr(self.hp, 'seed', 0)
+                    try:
+                        # Derive window from data index used for backtest
+                        tdf['window_start'] = _pd.Timestamp(data.index.min()).isoformat()
+                        tdf['window_end'] = _pd.Timestamp(data.index.max()).isoformat()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
                 tdf.to_csv(output_dir / 'trades.csv', index=False)
                 # Aggregate trade stats (zeros if none)
                 total_trades = int(len(tdf))
@@ -680,10 +698,12 @@ class EvalAndLrCallback(BaseCallback):
                 metrics.update(trade_stats)
             except Exception as e:
                 logger.warning(f"Portfolio metrics export failed: {e}")
+            # Build summary for portfolio evaluation
             summary = {
                 'tickers': list(o_map.keys()),
                 'portfolio_metrics': metrics,
             }
+
         else:
             # Single-ticker evaluation
             single_env = DummyVecEnv([lambda: _build_env_from_frames(self.settings, data, features)])
