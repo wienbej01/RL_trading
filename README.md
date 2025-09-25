@@ -140,6 +140,35 @@ features:
 
 The feature pipeline will merge `vix` and `vix_z` (z‑score) lagged by 1 bar to avoid lookahead.
 
+## 📊 Backtest Reports & Trades
+
+When a backtest completes, the following artifacts are written under `<run>/backtest/`:
+
+- summary.json: portfolio summary with total_return, drawdown, Sharpe-like metrics, win_rate, profit_factor.
+- portfolio_history.csv: per-bar portfolio equity, open positions, turnover, and per-ticker units.
+- daily_report.csv: compact day-level PnL with a proxy daily Sharpe and intraday max drawdown.
+- trades.csv: one row per closed trade with enriched fields:
+  - ticker, direction, entry_time, exit_time
+  - entry_price, exit_price, units, duration_bars, duration_minutes, pnl
+  - mfe, mae: max favorable/adverse excursion in PnL terms
+  - commission, spread_cost, slippage_cost, impact_cost, total_cost_est
+  - return_pct: pnl / |entry_price * units|
+  - trade_id, run_seed, window_start, window_end
+
+Flags & tips:
+- Use `--strict-test-window` to avoid fallback to a different test slice when the requested window is empty.
+- Limit evaluation to tickers with coverage via `--test-tickers`.
+
+## 🧪 PPO Stabilization (Obs/Reward Norm + Schedules)
+
+Stabilization changes are configurable under `rl:` in `configs/settings.yaml` and include:
+
+- VecNormalize (obs+reward) with persistent stats (`checkpoints/vecnorm.pkl`).
+- SubprocVecEnv for de-correlated rollouts (`rl.n_envs`).
+- Linear schedules for learning rate (3e-4 → 1e-5) and clip range (0.2 → 0.1).
+- Evaluation callback saving `best_model.zip` and halving LR on plateau.
+- TB logging under `models/logs/tensorboard/` and `metrics/training_summary.json`.
+
 Bulk Polygon ingest (partitioned parquet):
 
 ```

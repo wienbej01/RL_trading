@@ -14,7 +14,90 @@
       "status": "completed",
       "path": "state.json",
       "details": "Initialized progress tracker after AGENTS.md creation."
+    },
+    {
+      "name": "Enhance IntradayRLEnv",
+      "status": "completed",
+      "path": "src/sim/env_intraday_rl.py",
+      "details": "Expanded env with triple-barrier exits, daily resets, reward shaping, exec/risk wiring, robust NaN/Inf handling."
+    },
+    {
+      "name": "Add PPO-LSTM training",
+      "status": "completed",
+      "path": "src/rl/train.py",
+      "details": "Training pipeline incl. walk-forward, evaluation, VecNormalize, entropy anneal, device selection."
+    },
+    {
+      "name": "Implement PortfolioRLEnv with ATR sizing",
+      "status": "completed",
+      "path": "src/sim/portfolio_env.py",
+      "details": "Multi-ticker env with per-ticker actions, ATR-based units, exposure caps, turnover/holding penalties, EOD flatten."
+    },
+    {
+      "name": "Update PROJECT_STATUS.md",
+      "status": "completed",
+      "path": "PROJECT_STATUS.md",
+      "details": "Marked Phase 3 complete, added portfolio env entry, outlined tests/docs next steps."
+    },
+    {
+      "name": "Docs: portfolio usage snippet",
+      "status": "pending",
+      "path": "README.md",
+      "details": "Add short section on PortfolioRLEnv usage and config."
+    },
+    {
+      "name": "Tests: portfolio smoke tests",
+      "status": "completed",
+      "path": "tests/",
+      "details": "Added tests/test_portfolio_env.py covering obs shape, action mapping, ATR sizing cap, and EOD flatten behavior."
+    },
+    {
+      "name": "PPO stability tuning + normalization",
+      "status": "completed",
+      "path": "src/rl/multiticker_trainer.py",
+      "details": "Read PPO block from config; lr=1e-4, batch=4096, vf_coef=0.7, ent_coef=0.015, target_kl=0.075; added VecNormalize (obs+reward) with persisted stats."
+    },
+    {
+      "name": "Data hygiene before features",
+      "status": "completed",
+      "path": "scripts/run_multiticker_pipeline.py",
+      "details": "Strict de-dup (timestamp,ticker), bounded ffill (\u22642 bars), drop tiny islands; fixed masking alignment for train/test."
+    },
+    {
+      "name": "Bulk Polygon downloader",
+      "status": "completed",
+      "path": "scripts/polygon_bulk_ingest.py",
+      "details": "Monthly-sliced ingest with rate limiting (5\u201360 cpm) to partitioned parquet under data/polygon/historical/."
+    },
+    {
+      "name": "Evaluation trade exports",
+      "status": "completed",
+      "path": "src/rl/evaluate.py",
+      "details": "Always write trades.csv; expanded trade stats in evaluation_results.json (win/loss, durations, PF, PnL aggregates)."
+    },
+    {
+      "name": "Docs: stability & normalization",
+      "status": "completed",
+      "path": "docs/training_stability.md",
+      "details": "Documented PPO tuning, normalization toggles, and data hygiene; added usage examples."
+    },
+    {
+      "name": "Stabilize PPO training",
+      "status": "completed",
+      "path": "src/rl/multiticker_trainer.py",
+      "details": "Added SubprocVecEnv, VecNormalize persistence, linear LR/clip schedules, eval callback with LR halving, TB logging, and seed threading."
+    },
+    {
+      "name": "Backtest reporting & trades",
+      "status": "completed",
+      "path": "src/sim/portfolio_env.py",
+      "details": "Enriched trades.csv with MFE/MAE, cost estimates, return_pct, and run metadata; added daily_report.csv and fixed summary.json write."
+    },
+    {
+      "name": "Update documentation",
+      "status": "completed",
+      "path": "README.md",
+      "details": "Documented PPO stabilization, VIX merge, and backtest reports/trades."
     }
   ]
 }
-

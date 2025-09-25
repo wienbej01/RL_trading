@@ -5,13 +5,11 @@
 **Status:** In Progress
 **Orchestrator:** Active
 
-## Upcoming Work (Portfolio & Sizing)
+## Upcoming Work (Tests & Docs)
 
-- Portfolio Environment: Implemented minimal multi‑ticker portfolio env with per‑ticker actions and portfolio PnL reward; integrated into trainer/evaluator.
-- ATR‑Based Sizing (Planned): Introduce risk‑normalized position sizing per ticker using ATR.
-  - units_k = floor((risk_budget_per_ticker) / (ATR_k * point_value))
-  - Configurable risk budget, max units, gross/net exposure caps, and turnover penalties.
-  - Add reporting: exposure, turnover, drawdown, and portfolio equity metrics.
+- Unit Tests: Add smoke tests for `PortfolioRLEnv` observation shape, action mapping, ATR sizing, and EOD flatten behavior.
+- Integration Tests: Minimal walk-forward run to validate env/training wiring on a tiny sample.
+- Documentation: Short README section for portfolio training and config knobs; example scripts updates where applicable.
 
 ## Project Overview
 
@@ -54,28 +52,50 @@ This project aims to replace the current Databento data source with Polygon API 
   - Completed: 2025-08-30T10:19:13.273Z
 
 ### Phase 3: RL System Updates
-- [ ] **3.1 Environment Modifications** - `src/sim/env_intraday_rl.py`
-  - Status: Pending
+- [x] **3.1 Environment Modifications** - `src/sim/env_intraday_rl.py`
+  - Status: Completed ✅
   - Assigned: Code Mode
   - Priority: High
-- [ ] **3.2 Training Infrastructure** - `src/rl/train.py`
-  - Status: Pending
+  - Notes: IntradayRLEnv enhanced with realistic execution, triple-barrier exits, daily resets, reward shaping, and robust NaN/Inf handling.
+- [x] **3.2 Training Infrastructure** - `src/rl/train.py`
+  - Status: Completed ✅
   - Assigned: Code Mode
   - Priority: Medium
+  - Notes: PPO-LSTM training pipeline, walk-forward training, evaluation utilities, device selection, entropy annealing, and VecNormalize save/load.
+- [x] **3.3 Portfolio Environment (ATR Sizing)** - `src/sim/portfolio_env.py`
+  - Status: Completed ✅
+  - Assigned: Code Mode
+  - Priority: High
+  - Notes: Multi-ticker portfolio env with per-ticker actions, ATR-based unit sizing, exposure caps, turnover/holding penalties, and EOD flatten.
 
 ### Phase 4: Migration and Testing
 - [ ] **4.1 Migration Guide**
   - Status: Pending
   - Assigned: Code Mode
   - Priority: Low
+
+### Phase 5: Stability & Normalization (Multi‑Ticker PPO)
+- [x] 5.1 PPO stabilization
+  - SubprocVecEnv for single-ticker parallelism (`rl.n_envs`), TB logging
+  - Linear schedules: LR 3e‑4→1e‑5; clip range 0.2→0.1; target_kl=0.01
+  - Policy MLP ReLU [256,256] (pi & vf), ortho_init
+- [x] 5.2 VecNormalize (obs+reward)
+  - Config‑driven; persists `checkpoints/vecnorm.pkl`
+- [x] 5.3 Data hygiene pre‑features
+  - De‑dup (timestamp,ticker), ffill≤2 bars, drop tiny islands; aligned masks
+- [x] 5.4 Evaluation + callbacks
+  - Periodic eval; save `best_model.zip`; ReduceLROnPlateau‑style LR halving
+- [x] 5.5 Backtest reporting & trades
+  - Enriched trades (MFE/MAE, costs, return_pct, seed/window); daily_report.csv; fixed portfolio summary write
+- [x] 5.6 Bulk Polygon downloader
+  - scripts/polygon_bulk_ingest.py (monthly slices, rate limiting)
 - [ ] **4.2 Integration Testing**
   - Status: Pending
   - Assigned: Debug Mode
   - Priority: High
-- [ ] **4.3 Documentation Updates** - `README.md`
-  - Status: Pending
-  - Assigned: Code Mode
-  - Priority: Low
+- [x] **4.3 Documentation Updates** - `README.md`, `CHANGELOG.md`
+  - Status: Completed
+  - Notes: Stabilization instructions, VIX merge, backtest reports & trades
 
 ## Active Tasks
 
@@ -106,6 +126,8 @@ This project aims to replace the current Databento data source with Polygon API 
 2. Code mode to implement async HTTP client with rate limiting
 3. Debug mode to validate API integration
 4. Update status file after each task completion
+5. KL/EV callback logs + figs + training summary
+6. 100k‑step normalized multi‑ticker run; certify EV/KL targets
 
 ## DatetimeIndex Fix Implementation
 
