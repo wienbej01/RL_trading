@@ -169,6 +169,43 @@ Stabilization changes are configurable under `rl:` in `configs/settings.yaml` an
 - Evaluation callback saving `best_model.zip` and halving LR on plateau.
 - TB logging under `models/logs/tensorboard/` and `metrics/training_summary.json`.
 
+### KL Guards, Adaptive LR, and Live LR Bump
+
+- Healthy ranges during training:
+  - approx_kl ≈ 0.003–0.010
+  - clip_fraction ≈ 3–8%
+  - explained_variance ≥ 0.8 (later in training)
+- Callbacks wired into PPO learn:
+  - KLStopCallback (early stops an update when KL > target)
+  - AdaptiveLRByKL (nudges LR up/down based on KL)
+  - LiveLRBump (touch a flag file to multiply LR once without restart)
+- Nudge LR mid‑run:
+
+```
+./scripts/lr_bump.sh /path/to/run_dir   # creates /path/to/run_dir/.lr_bump
+```
+
+## 🧰 Low‑Price ($10–$20) Universe Runner
+
+We include a static low‑price ticker universe and a convenience script to collect, aggregate, train, and backtest a portfolio.
+
+- Universe: `scripts/universe_lowpx_10_20.txt` (edit as needed)
+- Runner: `scripts/run_lowpx_portfolio.sh`
+
+Run (requires `POLYGON_API_KEY`):
+
+```
+export POLYGON_API_KEY=... \
+UNIVERSE_FILE=scripts/universe_lowpx_10_20.txt \
+OUT_DIR=results/mt_lowpx_core \
+MAX_STEPS=3000000 SEED=123 \
+bash scripts/run_lowpx_portfolio.sh
+```
+
+Notes:
+- Strict test window is enforced by the runner (ingest first to avoid fallback).
+- Artifacts: `${OUT_DIR}/models/{checkpoints,logs,metrics}` and `${OUT_DIR}/backtest/{summary.json,portfolio_history.csv,daily_report.csv,trades.csv}`.
+
 Bulk Polygon ingest (partitioned parquet):
 
 ```

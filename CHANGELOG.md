@@ -8,4 +8,6 @@
 - Policy net arch set to ReLU MLP with [256,256] for both actor and critic
 - TensorBoard logging enabled under `logs/tensorboard/`
 - Configurable block `rl:` introduced in configs/settings.yaml
-
+- Added KLStopCallback, AdaptiveLRByKL, and LiveLRBump callbacks; wired into trainer
+- New script `scripts/lr_bump.sh` to nudge LR mid‑run without restart
+- Static low‑price universe runner `scripts/run_lowpx_portfolio.sh` and universe list

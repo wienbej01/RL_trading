@@ -96,6 +96,7 @@ This project aims to replace the current Databento data source with Polygon API 
 - [x] **4.3 Documentation Updates** - `README.md`, `CHANGELOG.md`
   - Status: Completed
   - Notes: Stabilization instructions, VIX merge, backtest reports & trades
+  - Extras: KL/Adaptive LR/Live LR bump docs, low-price universe runner usage
 
 ## Active Tasks
 

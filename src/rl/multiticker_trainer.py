@@ -27,7 +27,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.utils import explained_variance
 
 from ..utils.config_loader import Settings
@@ -37,6 +37,7 @@ from ..sim.portfolio_env import PortfolioRLEnv, PortfolioEnvConfig
 from ..sim.execution import ExecParams
 from ..sim.risk import RiskConfig
 from .train import evaluate_model  # reuse existing evaluator
+from .callbacks import KLStopCallback, AdaptiveLRByKL, LiveLRBump
 
 
 logger = get_logger(__name__)
@@ -479,7 +480,16 @@ class MultiTickerRLTrainer:
             eval_cb = None
 
         total_steps = int(self.hp.total_steps)
-        self.model.learn(total_timesteps=total_steps, progress_bar=True, callback=eval_cb)
+        # Compose callbacks: KL early stop, adaptive LR by KL, live LR bump flag, and eval callback (if any)
+        cb_list = [
+            KLStopCallback(target_kl=float(ppo_cfg.get('target_kl', 0.01)) if isinstance(ppo_cfg, dict) else 0.01),
+            AdaptiveLRByKL(low=0.003, high=float(ppo_cfg.get('target_kl', 0.01)) if isinstance(ppo_cfg, dict) else 0.01,
+                           up=1.15, down=0.7, min_lr=2e-5, max_lr=2e-4),
+            LiveLRBump(run_dir=str(output_dir.resolve()), bump_factor=1.25),
+        ]
+        if eval_cb is not None:
+            cb_list.append(eval_cb)
+        self.model.learn(total_timesteps=total_steps, progress_bar=True, callback=CallbackList(cb_list))
 
         # Save artifacts
         (output_dir).mkdir(parents=True, exist_ok=True)
