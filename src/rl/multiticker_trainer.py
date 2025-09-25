@@ -414,9 +414,20 @@ class MultiTickerRLTrainer:
         seed = int(self.cfg.get('rl', {}).get('seed', getattr(self.hp, 'seed', 42))) if isinstance(self.cfg, dict) else getattr(self.hp, 'seed', 42)
         _set_global_seeds(seed)
 
-        # Schedules
-        lr_sched = linear_schedule(3e-4, 1e-5) if str(self.cfg.get('rl', {}).get('ppo', {}).get('lr_schedule', '')).startswith('linear') else self.hp.learning_rate
-        clip_sched = linear_schedule(0.2, 0.1) if str(self.cfg.get('rl', {}).get('ppo', {}).get('clip_schedule', '')).startswith('linear') else self.hp.clip_range
+        # Schedules (read from rl.ppo)
+        ppo_cfg = (self.cfg.get('rl', {}).get('ppo', {}) if isinstance(self.cfg, dict) else {}) or {}
+        if str(ppo_cfg.get('lr_schedule', '')).startswith('linear'):
+            lr_start = float(ppo_cfg.get('lr_start', 1.5e-4))
+            lr_end = float(ppo_cfg.get('lr_end', 1.0e-5))
+            lr_sched = linear_schedule(lr_start, lr_end)
+        else:
+            lr_sched = self.hp.learning_rate
+        if str(ppo_cfg.get('clip_schedule', '')).startswith('linear'):
+            clip_start = float(ppo_cfg.get('clip_start', 0.15))
+            clip_end = float(ppo_cfg.get('clip_end', 0.12))
+            clip_sched = linear_schedule(clip_start, clip_end)
+        else:
+            clip_sched = self.hp.clip_range
 
         self.model = RecurrentPPO(
             'MlpLstmPolicy',
@@ -431,7 +442,8 @@ class MultiTickerRLTrainer:
             ent_coef=float(self.cfg.get('rl', {}).get('ppo', {}).get('ent_coef', self.hp.ent_coef)) if isinstance(self.cfg, dict) else self.hp.ent_coef,
             max_grad_norm=self.hp.max_grad_norm,
             n_epochs=self.hp.n_epochs,
-            target_kl=float(self.cfg.get('rl', {}).get('ppo', {}).get('target_kl', self.hp.target_kl)) if isinstance(self.cfg, dict) else self.hp.target_kl,
+            target_kl=float(ppo_cfg.get('target_kl', self.hp.target_kl)) if isinstance(self.cfg, dict) else self.hp.target_kl,
+            clip_range_vf=float(ppo_cfg.get('clip_range_vf', 0.0)) if 'clip_range_vf' in ppo_cfg else None,
             policy_kwargs=policy_kwargs,
             device=self.hp.device,
             verbose=1,
@@ -696,6 +708,29 @@ class MultiTickerRLTrainer:
                 }
                 # Expose under metrics and summary
                 metrics.update(trade_stats)
+                # Daily performance report (compact)
+                try:
+                    import pandas as _pd
+                    if not hist.empty and 'equity' in hist.columns:
+                        hdf = hist.copy()
+                        eq = _pd.to_numeric(hdf['equity'], errors='coerce')
+                        eq = eq.dropna()
+                        daily = eq.groupby(_pd.to_datetime(hdf.index).date).apply(lambda s: s.iloc[-1] - s.iloc[0])
+                        daily = daily.rename('daily_pnl').to_frame()
+                        daily['num_trades'] = int(total_trades)
+                        # daily returns for sharpe-like
+                        dr = (eq.resample('1D').last().pct_change()).dropna()
+                        if not dr.empty:
+                            daily_sharpe = float((dr.mean() / (dr.std() + 1e-12)) * (252 ** 0.5))
+                        else:
+                            daily_sharpe = 0.0
+                        # max drawdown on intraday equity
+                        dd = float(((eq / eq.cummax()) - 1).min()) if len(eq) > 1 else 0.0
+                        daily.to_csv(output_dir / 'daily_report.csv')
+                        metrics['daily_sharpe_proxy'] = daily_sharpe
+                        metrics['intraday_max_drawdown'] = dd
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning(f"Portfolio metrics export failed: {e}")
             # Build summary for portfolio evaluation
