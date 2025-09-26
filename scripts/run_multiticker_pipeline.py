@@ -67,6 +67,11 @@ def parse_args():
                         help='Override total training timesteps')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility')
+    # Feature selection
+    parser.add_argument('--feature-pack', nargs='+', default=None,
+                        help='One or more feature pack names (see src/features/packs.py)')
+    parser.add_argument('--feature-list-path', type=str, default=None,
+                        help='Path to a newline-delimited list of feature names to keep')
     # Backtest behavior
     parser.add_argument('--strict-test-window', action='store_true',
                         help='Do not fall back to a different window if the test split is empty')
@@ -193,6 +198,31 @@ def generate_features(config, args, data):
     # Preserve ticker column so FeaturePipeline can compute per‑ticker features correctly.
     # The pipeline will group by 'ticker' when present and attach it back to the output.
     features = feature_pipeline.fit_transform(data)
+    # Optional: restrict to selected features (packs or explicit list)
+    try:
+        from src.features.packs import get_features_for_pack  # type: ignore
+        available = [c for c in features.columns if c != 'ticker']
+        selected: list[str] | None = None
+        if args.feature_list_path:
+            import pathlib
+            p = pathlib.Path(args.feature_list_path)
+            if p.exists():
+                txt = p.read_text().splitlines()
+                selected = [t.strip() for t in txt if t.strip()]
+        elif args.feature_pack:
+            selected = get_features_for_pack(available, args.feature_pack)
+        else:
+            # Config-driven default packs
+            fp_cfg = (config.get('features', {}) if isinstance(config, dict) else {}) or {}
+            if bool(fp_cfg.get('use_pack', False)):
+                packs = fp_cfg.get('packs', []) or []
+                selected = get_features_for_pack(available, packs)
+        if selected:
+            keep = [c for c in features.columns if (c in selected or c == 'ticker')]
+            features = features[keep]
+            logger.info(f"Feature screening applied; kept {len(keep)-('ticker' in keep)} features")
+    except Exception:
+        pass
     
     # Save features
     features_path = Path(args.output_dir) / 'features'

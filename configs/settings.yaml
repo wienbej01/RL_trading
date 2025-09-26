@@ -104,6 +104,11 @@ features:
     enabled: true
     detect_key_levels: true
     detect_breakout_levels: true
+  # Feature pack selection (optional)
+  use_pack: true
+  packs: ["price_vol", "microstructure", "context", "crosssec"]
+  curated_top_n: 40
+  override_list_path: null
   # Lightweight regime tags and ticker identity for multi‑ticker conditioning
   regime:
     enabled: true

@@ -296,6 +296,28 @@ Notes:
 - Uses the repo’s FeaturePipeline (no duplication). Normalization is fit on TRAIN folds only by virtue of the split and re‑fit per slice.
 - Costs/slippage are read from `configs/settings.yaml` execution block to compute net‑of‑cost labels.
 
+## 🧪 RL Ablations (Feature Packs)
+
+Quickly compare feature subsets using the same PPO wiring and callbacks. Packs are defined in `src/features/packs.py` and can be combined or derived from screened consensus.
+
+Run:
+
+```
+PYTHONPATH=. python scripts/rl_ablate.py \
+  --config configs/settings.yaml \
+  --run-name ablate_mt_core \
+  --feature-pack curated \
+  --timesteps 300000 \
+  --seed 123
+```
+
+Variants:
+- `curated` — top‑N from `results/features/<run_name>/consensus_importance.parquet` (N from config: features.curated_top_n)
+- `curated_minus:microstructure` — drop a pack from curated set
+- Or pass raw pack names to the training pipeline via `--feature-pack` on run_multiticker_pipeline
+
+Outputs under `results/ablations/<run_name>/<variant>/summary.json` alongside usual model/backtest artifacts.
+
 ## 🚀 Quick Commands (Makefile + Scripts)
 
 Use the provided Makefile targets or call the scripts directly.
