@@ -246,6 +246,25 @@ Feature generation prints a summary so you can verify VIX/SMT/ICT/VPA coverage.
 - `scripts/ingest_external_vix.py` — ingest Databento/FRED/CBOE VIX files into unified parquet
 - `scripts/prepare_context_with_fallback.py` — orchestrates SPY/QQQ/VIX context with fallbacks
 - `scripts/audit_data_inventory.py` — inventory report of available data, features, and models
+- `scripts/audit_collect.py` — read‑only audit of a run directory; writes JSON + Markdown reports
+- `scripts/audit_collect.sh` — wrapper to run the audit easily
+
+## 🧾 Audit
+
+Quickly gather all relevant facts about a run to judge stability and correctness.
+
+Run:
+
+```
+./scripts/audit_collect.sh results/mt_lowpx_core configs/settings.yaml
+```
+
+Outputs are written to `results/audits/<run_basename>_<timestamp>/`:
+
+- `audit_report.json` — structured facts (data/splits, features, normalization, execution, PPO params, callbacks, backtest metrics, derived heuristics)
+- `audit_report.md` — human‑readable Markdown summary
+
+Paste `audit_report.json` in review threads for fast triage.
 
 ## 🚀 Quick Commands (Makefile + Scripts)
 
