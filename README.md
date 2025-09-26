@@ -266,6 +266,36 @@ Outputs are written to `results/audits/<run_basename>_<timestamp>/`:
 
 Paste `audit_report.json` in review threads for fast triage.
 
+## 🔍 Feature Screening (Leak‑Proof)
+
+Screen features OOS using purged, embargoed, expanding walk‑forward CV and cheap baselines (Ridge, RF). Labels are net‑of‑cost returns over a horizon.
+
+Run:
+
+```
+PYTHONPATH=. python scripts/feature_screen.py \
+  --config configs/settings.yaml \
+  --run-name feature_screen_mt_core \
+  --horizon-min 10 \
+  --embargo-min 15 \
+  --n_slices 6 \
+  --rf-n 200 \
+  --rf-depth 7 \
+  --ridge-alpha 5.0 \
+  --seed 123
+```
+
+Outputs under `results/features/<run_name>/`:
+
+- `screen_config.json` — parameters used
+- `importance_slice<N>_ridge.parquet`, `importance_slice<N>_rf.parquet` — OOS permutation importance per slice/model
+- `consensus_importance.parquet` — aggregated consensus score across slices/models
+- `summary.md` — human‑readable recap with top 50 features
+
+Notes:
+- Uses the repo’s FeaturePipeline (no duplication). Normalization is fit on TRAIN folds only by virtue of the split and re‑fit per slice.
+- Costs/slippage are read from `configs/settings.yaml` execution block to compute net‑of‑cost labels.
+
 ## 🚀 Quick Commands (Makefile + Scripts)
 
 Use the provided Makefile targets or call the scripts directly.
