@@ -560,8 +560,14 @@ def train_ppo_lstm(settings: Settings,
     )
     logger.info("Model training complete.")
     
-    # Save model
+    # Save model (work around SB3 gym version probe in some environments)
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import gym as _gym  # type: ignore
+        if not hasattr(_gym, "__version__"):
+            setattr(_gym, "__version__", "0.0.0")
+    except Exception:
+        pass
     model.save(model_path)
     logger.info(f"Model saved to {model_path}")
 

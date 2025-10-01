@@ -80,6 +80,10 @@ class AdaptiveLRByKL(BaseCallback):
             except Exception:
                 pass
 
+    def _on_step(self) -> bool:  # type: ignore[override]
+        # No per-step action; required to satisfy abstract interface
+        return True
+
 
 class LiveLRBump(BaseCallback):
     """One-shot LR bump when a flag file is present in run_dir.
@@ -113,3 +117,6 @@ class LiveLRBump(BaseCallback):
         except OSError:
             pass
 
+    def _on_step(self) -> bool:  # type: ignore[override]
+        # No per-step action; required to satisfy abstract interface
+        return True

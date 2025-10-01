@@ -70,26 +70,37 @@ class PolygonDataIngestor:
         self.settings = settings
         self.polygon_client = PolygonClient(settings)
 
+        # Helper to be compatible with mocked Settings.get signatures in tests
+        def _sget(*keys, default=None):
+            try:
+                return settings.get(*keys, default=default)
+            except TypeError:
+                try:
+                    # Some mocks don't accept keyword 'default'
+                    return settings.get(*keys, default)
+                except Exception:
+                    return default
+
         # Configuration (use nested Settings.get to avoid dict chaining issues)
-        self.data_dir = Path(settings.get('data', 'polygon', 'data_dir', default=self.DEFAULT_DATA_DIR))
+        self.data_dir = Path(_sget('data', 'polygon', 'data_dir', default=self.DEFAULT_DATA_DIR))
         self.metadata_dir = self.data_dir / "metadata"
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
 
         # Performance settings
-        self.max_workers = settings.get('data', 'max_workers', default=4)
-        self.batch_size = settings.get('data', 'batch_size', default=1000)
-        self.chunk_size = settings.get('data', 'chunk_size', default=50000)
+        self.max_workers = _sget('data', 'max_workers', default=2)
+        self.batch_size = _sget('data', 'batch_size', default=1000)
+        self.chunk_size = _sget('data', 'chunk_size', default=50000)
 
         # Rate limiting and retry settings
-        self.retry_attempts = settings.get('data', 'polygon', 'retry', 'attempts', default=3)
-        self.retry_backoff = settings.get('data', 'polygon', 'retry', 'backoff_factor', default=2.0)
+        self.retry_attempts = _sget('data', 'polygon', 'retry', 'attempts', default=1)
+        self.retry_backoff = _sget('data', 'polygon', 'retry', 'backoff_factor', default=2.0)
 
         # Storage settings
-        self.compression = settings.get('data', 'compression', default='snappy')
-        self.row_group_size = settings.get('data', 'row_group_size', default=100000)
+        self.compression = _sget('data', 'compression', default='snappy')
+        self.row_group_size = _sget('data', 'row_group_size', default=100000)
 
         # Validation settings
-        self.enable_validation = settings.get('data', 'validation', 'enabled', default=True)
+        self.enable_validation = _sget('data', 'validation', 'enabled', default=True)
 
         # Metadata cache
         self.metadata_cache: Dict[str, IngestionMetadata] = {}

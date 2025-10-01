@@ -133,11 +133,18 @@ class PolygonClient:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Resolve API key from config or environment (support multiple placements)
-        api_key = (
-            settings.get('data', 'polygon', 'api_key')
-            or settings.get('data', 'polygon_api_key')
-            or os.getenv('POLYGON_API_KEY')
-        )
+        # Tolerant lookup across potential locations
+        try:
+            api_key = settings.get('data', 'polygon', 'api_key', default=None)
+        except Exception:
+            api_key = None
+        if not api_key:
+            try:
+                api_key = settings.get('data', 'polygon_api_key', default=None)
+            except Exception:
+                api_key = None
+        if not api_key:
+            api_key = os.getenv('POLYGON_API_KEY')
         # If YAML contains a placeholder like ${POLYGON_API_KEY}, resolve it
         if isinstance(api_key, str) and api_key.strip().startswith('${') and api_key.strip().endswith('}'):
             env_name = api_key.strip()[2:-1]

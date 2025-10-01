@@ -7,11 +7,13 @@ Supports both Polygon and Databento data formats with automatic column mapping.
 """
 import numpy as np
 import pandas as pd
+pd.set_option('future.no_silent_downcasting', True)
 from typing import Dict, List, Optional, Union, Any
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.feature_selection import SelectKBest, f_regression
 import logging
 import os
+from pathlib import Path
 
 # Import technical indicator functions
 from .technical_indicators import (
@@ -24,15 +26,23 @@ from ta.trend import ADXIndicator
 from .microstructure_features import (
     calculate_spread, calculate_microprice, calculate_queue_imbalance,
     calculate_order_flow_imbalance, calculate_vwap, calculate_twap,
-    calculate_price_impact, calculate_fvg
+    calculate_price_impact, calculate_fvg,
+    calculate_ofi_best, compute_bar_imbalance, compute_signed_vol_delta,
+    compute_spread_bps, compute_quote_intensity,
 )
 from .time_features import (
     extract_time_of_day_features, extract_day_of_week_features,
     extract_session_features, is_market_hours, get_time_from_open,
     get_time_to_close
 )
+try:
+    from .microstructure_ohlcv import OHLCV_MICRO  # preferred shim path
+except Exception:
+    from .microstructure import OHLCV_MICRO  # fallback
 
 from ..utils.logging import get_logger
+from ..utils.feat_cache import feature_cache_path, save_features, load_features, augment_cfg_hash
+from .packs import resolve_feature_pack, LAST_CURATED_CACHE_TOKEN
 
 
 class FeaturePipeline:
@@ -423,7 +433,78 @@ class FeaturePipeline:
                 df_local = self._map_columns(df_local, 'ohlcv')
                 if self._detect_data_source(df_local) == 'polygon' and self.polygon_quality_checks:
                     df_local = self._validate_polygon_data_quality(df_local)
-                f_local = self._extract_features(df_local)
+                # Optional cache: attempt HIT before computing
+                f_local = None
+                try:
+                    if bool(self.config.get('enable_caching', False)):
+                        run_name = str(self.config.get('cache_run', 'default'))
+                        # Window keys
+                        idx = df_local.index if isinstance(df_local.index, pd.DatetimeIndex) else pd.to_datetime(df_local.index, errors='coerce')
+                        start = pd.Timestamp(idx.min()) if len(idx) else pd.Timestamp(0, unit='s')
+                        end = pd.Timestamp(idx.max()) if len(idx) else pd.Timestamp(0, unit='s')
+                        # Approximate pack identifiers
+                        feature_pack = ','.join(self.config.get('packs', [])) if bool(self.config.get('use_pack', False)) else 'manual'
+                        feature_screen_run = str(self.config.get('feature_screen_run', self.config.get('override_list_path', 'NA')))
+                        base_hash = f"{feature_pack}|{feature_screen_run}|{t}|{start}|{end}"
+                        # If user provided a manual selected_features list, we can use it for hash
+                        final_hint = None
+                        try:
+                            sel = self.feature_selection_config.get('selected_features', None)
+                            if isinstance(sel, (list, tuple)):
+                                final_hint = [str(x) for x in sel]
+                        except Exception:
+                            pass
+                        cfg_hash = augment_cfg_hash(
+                            base_hash,
+                            run_name=run_name,
+                            features=final_hint,
+                            micro_module_path=Path('src/features/microstructure_ohlcv.py'),
+                            curated_token=LAST_CURATED_CACHE_TOKEN,
+                        )
+                        cache_path = feature_cache_path(
+                            run_name=run_name,
+                            ticker=str(t),
+                            split=f"{start:%Y-%m-%d}_{end:%Y-%m-%d}",
+                            cfg_hash=cfg_hash,
+                        )
+                        if cache_path.exists():
+                            try:
+                                self.logger.info(f"Feature cache HIT -> {cache_path}")
+                            except Exception:
+                                pass
+                            f_local = load_features(cache_path)
+                except Exception:
+                    f_local = None
+                if f_local is None:
+                    f_local = self._extract_features(df_local)
+                    # Save to cache if enabled
+                    try:
+                        if bool(self.config.get('enable_caching', False)):
+                            # Build hash with the actual resolved features list to tie data to key
+                            run_name = str(self.config.get('cache_run', 'default'))
+                            idx = df_local.index if isinstance(df_local.index, pd.DatetimeIndex) else pd.to_datetime(df_local.index, errors='coerce')
+                            start = pd.Timestamp(idx.min()) if len(idx) else pd.Timestamp(0, unit='s')
+                            end = pd.Timestamp(idx.max()) if len(idx) else pd.Timestamp(0, unit='s')
+                            feature_pack = ','.join(self.config.get('packs', [])) if bool(self.config.get('use_pack', False)) else 'manual'
+                            feature_screen_run = str(self.config.get('feature_screen_run', self.config.get('override_list_path', 'NA')))
+                            base_hash = f"{feature_pack}|{feature_screen_run}|{t}|{start}|{end}"
+                            final_cols = [str(c) for c in f_local.columns]
+                            cfg_hash = augment_cfg_hash(
+                                base_hash,
+                                run_name=run_name,
+                                features=final_cols,
+                                micro_module_path=Path('src/features/microstructure_ohlcv.py'),
+                                curated_token=LAST_CURATED_CACHE_TOKEN,
+                            )
+                            cache_path = feature_cache_path(
+                                run_name=run_name,
+                                ticker=str(t),
+                                split=f"{start:%Y-%m-%d}_{end:%Y-%m-%d}",
+                                cfg_hash=cfg_hash,
+                            )
+                            save_features(f_local, cache_path)
+                    except Exception:
+                        pass
                 f_local['ticker'] = t
                 parts.append(f_local)
             features = pd.concat(parts, axis=0) if parts else pd.DataFrame(index=data.index)
@@ -432,7 +513,76 @@ class FeaturePipeline:
             data_source = self._detect_data_source(data)
             if data_source == 'polygon' and self.polygon_quality_checks:
                 data = self._validate_polygon_data_quality(data)
-            features = self._extract_features(data)
+            # Optional cache HIT before compute (single-ticker or unlabeled)
+            features = None
+            try:
+                if bool(self.config.get('enable_caching', False)):
+                    run_name = str(self.config.get('cache_run', 'default'))
+                    idx = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, errors='coerce')
+                    start = pd.Timestamp(idx.min()) if len(idx) else pd.Timestamp(0, unit='s')
+                    end = pd.Timestamp(idx.max()) if len(idx) else pd.Timestamp(0, unit='s')
+                    t = str(self.config.get('single_ticker', 'UNKNOWN'))
+                    feature_pack = ','.join(self.config.get('packs', [])) if bool(self.config.get('use_pack', False)) else 'manual'
+                    feature_screen_run = str(self.config.get('feature_screen_run', self.config.get('override_list_path', 'NA')))
+                    base_hash = f"{feature_pack}|{feature_screen_run}|{t}|{start}|{end}"
+                    final_hint = None
+                    try:
+                        sel = self.feature_selection_config.get('selected_features', None)
+                        if isinstance(sel, (list, tuple)):
+                            final_hint = [str(x) for x in sel]
+                    except Exception:
+                        pass
+                    cfg_hash = augment_cfg_hash(
+                        base_hash,
+                        run_name=run_name,
+                        features=final_hint,
+                        micro_module_path=Path('src/features/microstructure_ohlcv.py'),
+                        curated_token=LAST_CURATED_CACHE_TOKEN,
+                    )
+                    cache_path = feature_cache_path(
+                        run_name=run_name,
+                        ticker=str(t),
+                        split=f"{start:%Y-%m-%d}_{end:%Y-%m-%d}",
+                        cfg_hash=cfg_hash,
+                    )
+                    if cache_path.exists():
+                        try:
+                            self.logger.info(f"Feature cache HIT -> {cache_path}")
+                        except Exception:
+                            pass
+                        features = load_features(cache_path)
+            except Exception:
+                features = None
+            if features is None:
+                features = self._extract_features(data)
+                # Save to cache if enabled
+                try:
+                    if bool(self.config.get('enable_caching', False)):
+                        run_name = str(self.config.get('cache_run', 'default'))
+                        idx = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, errors='coerce')
+                        start = pd.Timestamp(idx.min()) if len(idx) else pd.Timestamp(0, unit='s')
+                        end = pd.Timestamp(idx.max()) if len(idx) else pd.Timestamp(0, unit='s')
+                        t = str(self.config.get('single_ticker', 'UNKNOWN'))
+                        feature_pack = ','.join(self.config.get('packs', [])) if bool(self.config.get('use_pack', False)) else 'manual'
+                        feature_screen_run = str(self.config.get('feature_screen_run', self.config.get('override_list_path', 'NA')))
+                        base_hash = f"{feature_pack}|{feature_screen_run}|{t}|{start}|{end}"
+                        final_cols = [str(c) for c in features.columns]
+                        cfg_hash = augment_cfg_hash(
+                            base_hash,
+                            run_name=run_name,
+                            features=final_cols,
+                            micro_module_path=Path('src/features/microstructure_ohlcv.py'),
+                            curated_token=LAST_CURATED_CACHE_TOKEN,
+                        )
+                        cache_path = feature_cache_path(
+                            run_name=run_name,
+                            ticker=str(t),
+                            split=f"{start:%Y-%m-%d}_{end:%Y-%m-%d}",
+                            cfg_hash=cfg_hash,
+                        )
+                        save_features(features, cache_path)
+                except Exception:
+                    pass
 
         # Apply normalization if configured
         if self.normalization_config:
@@ -471,6 +621,43 @@ class FeaturePipeline:
     def _extract_features(self, data: pd.DataFrame) -> pd.DataFrame:
         """Extract features based on configuration."""
         features = pd.DataFrame(index=data.index)
+
+        # Optional: resolve requested features list for this extraction
+        resolved: List[str] | None = None
+        try:
+            # Use curated resolved list if present
+            from .packs import LAST_CURATED_RESOLVED  # local import
+            if LAST_CURATED_RESOLVED:
+                resolved = list(LAST_CURATED_RESOLVED)
+        except Exception:
+            pass
+        # Manual selected_features override
+        try:
+            sel = self.feature_selection_config.get('selected_features', None)
+            if isinstance(sel, (list, tuple)) and sel:
+                resolved = list(sel)
+        except Exception:
+            pass
+        # microstructure.names fallback for proxies
+        try:
+            names = (self.config.get('microstructure', {}) or {}).get('names', None)
+            if isinstance(names, (list, tuple)) and names:
+                resolved = list(dict.fromkeys(list(resolved or []) + list(names)))
+        except Exception:
+            pass
+        # If L1 quotes are absent, remap L1 names in resolved to OHLCV proxies
+        try:
+            HAS_L1 = all(c in data.columns for c in ("bid_price", "ask_price", "bid_size", "ask_size"))
+            if resolved is not None and not HAS_L1:
+                L1_TO_OHLCV = {
+                    "ofi_best": "ofi_proxy",
+                    "spread_bps": "spread_bps_hl",
+                    "quote_intensity": "quote_intensity_proxy",
+                    "queue_imbalance": "queue_imbalance_proxy",
+                }
+                resolved = [L1_TO_OHLCV.get(str(f), str(f)) for f in resolved]
+        except Exception:
+            pass
         
         # Extract technical indicators
         if 'technical' in self.config:
@@ -614,14 +801,23 @@ class FeaturePipeline:
                         data['bid_size'], data['ask_size']
                     )
             
-            # Calculate order flow imbalance
+            # Calculate order flow imbalance (z-scored) and ofi_best (raw best-level proxy)
             if 'calculate_order_flow_imbalance' in micro_config and micro_config['calculate_order_flow_imbalance']:
-                if 'bid_price' in data.columns and 'bid_size' in data.columns and \
-                   'ask_price' in data.columns and 'ask_size' in data.columns:
+                need = {'bid_price','bid_size','ask_price','ask_size'}
+                if need.issubset(set(data.columns)):
                     features['order_flow_imbalance'] = calculate_order_flow_imbalance(
                         data['bid_price'], data['bid_size'], 
                         data['ask_price'], data['ask_size']
                     )
+                    try:
+                        features['ofi_best'] = calculate_ofi_best(
+                            data['bid_price'], data['bid_size'], data['ask_price'], data['ask_size']
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to compute ofi_best: {e}")
+                else:
+                    missing = sorted(list(need.difference(set(data.columns))))
+                    self.logger.warning(f"Cannot compute ofi_best/OFI: missing raw fields {missing}")
             
             # Calculate VWAP
             if 'calculate_vwap' in micro_config and micro_config['calculate_vwap']:
@@ -630,6 +826,30 @@ class FeaturePipeline:
                 if self.use_polygon_vwap and 'vwap' in data.columns:
                     polygon_vwap = data['vwap']
                 features['vwap'] = calculate_vwap(data['close'], data['volume'], polygon_vwap)
+
+            # Additional microstructure/features by name when possible
+            try:
+                # bar_imbalance, signed_vol_delta
+                if 'open' in data.columns and 'close' in data.columns and 'volume' in data.columns:
+                    features['bar_imbalance'] = compute_bar_imbalance(data['open'], data['close'], data['volume'])
+                    features['signed_vol_delta'] = compute_signed_vol_delta(data['close'], data['volume'])
+                # spread_bps from quotes or OHLC
+                if {'bid_price','ask_price'}.issubset(data.columns):
+                    features['spread_bps'] = compute_spread_bps(bid=data['bid_price'], ask=data['ask_price'])
+                elif {'high','low','close'}.issubset(data.columns):
+                    try:
+                        self.logger.warning("Using HL proxy for spread_bps (quotes unavailable)")
+                    except Exception:
+                        pass
+                    features['spread_bps'] = compute_spread_bps(high=data['high'], low=data['low'], close=data['close'])
+                else:
+                    self.logger.warning("Cannot compute spread_bps: missing both bid/ask and high/low/close for fallback")
+                # quote_intensity
+                if 'transactions' in data.columns or 'volume' in data.columns:
+                    features['quote_intensity'] = compute_quote_intensity(data.get('transactions'), data.get('volume'))
+                # queue_imbalance already computed above when bid/ask sizes present
+            except Exception:
+                pass
             
             # Calculate TWAP
             if 'calculate_twap' in micro_config and micro_config['calculate_twap']:
@@ -647,6 +867,65 @@ class FeaturePipeline:
                     else:
                         # Fallback: simple price impact approximation using close vs open
                         features['price_impact'] = (data['close'] - data['open']) / data['open']
+
+            # Resolve and compute explicit OHLCV microstructure names if requested
+            try:
+                requested_names = micro_config.get('names', None)
+                # Also allow computing OHLCV proxies if present in resolved list
+                if 'resolved' in locals() and resolved is not None:
+                    extra = [n for n in resolved if isinstance(n, str) and n in OHLCV_MICRO]
+                    if extra:
+                        if requested_names is None:
+                            requested_names = list(extra)
+                        else:
+                            requested_names = list(dict.fromkeys(list(requested_names) + extra))
+                if requested_names is not None:
+                    if not isinstance(requested_names, (list, tuple)):
+                        raise ValueError("microstructure.names must be a list of feature names")
+                    known = set(OHLCV_MICRO.keys())
+                    unknown = [n for n in requested_names if n not in known]
+                    if unknown:
+                        raise ValueError(
+                            f"Unknown microstructure feature name(s): {unknown}. "
+                            f"Known OHLCV-only names: {sorted(known)}"
+                        )
+                    # Compute each requested OHLCV-only micro feature without relying on bid/ask
+                    # Use only standard OHLCV columns; functions will validate required fields.
+                    df_ohlcv = data.copy()
+                    for name in requested_names:
+                        func = OHLCV_MICRO[name]
+                        try:
+                            ser = func(df_ohlcv)
+                            # Attach with the exact requested name (override if exists)
+                            features[name] = ser
+                        except Exception as e:
+                            raise ValueError(f"Failed to compute microstructure feature '{name}': {e}")
+            except Exception as e:
+                # Surface configuration/unknown-name errors clearly
+                if isinstance(e, ValueError):
+                    raise
+                # Non-fatal runtime errors should not kill the whole pipeline
+                self.logger.warning(f"microstructure.names computation skipped: {e}")
+
+        # If we have a resolved list and proxies are requested (and L1 may be absent), compute them
+        try:
+            if 'resolved' in locals() and resolved is not None:
+                for name in resolved:
+                    if isinstance(name, str) and name in OHLCV_MICRO and name not in features.columns:
+                        try:
+                            features[name] = OHLCV_MICRO[name](data)
+                        except Exception:
+                            pass
+                # Assert required proxies if they were requested
+                required = [f for f in ("ofi_proxy", "signed_vol_delta") if f in resolved]
+                missing = [f for f in required if f not in features.columns]
+                if missing:
+                    raise AssertionError(f"Requested micro proxies missing from features: {missing}")
+        except Exception as e:
+            try:
+                self.logger.warning(str(e))
+            except Exception:
+                pass
         
         # Extract time features
         if 'time' in self.config:
@@ -829,7 +1108,10 @@ class FeaturePipeline:
                 # Churn index and z-score
                 tr = (data['high'] - data['low']).abs()
                 churn = (data['volume'] / (tr.replace(0, pd.NA)))
-                features['churn'] = churn.ffill().fillna(0.0).astype(float)
+                churn = churn.ffill().fillna(0.0)
+                # Opt in to future behavior explicitly to avoid downcasting warning
+                churn = churn.infer_objects(copy=False)
+                features['churn'] = churn.astype(float)
                 zwin = int(self.vpa_config.get('zscore_window', 100))
                 mu = features['churn'].rolling(zwin, min_periods=10).mean()
                 sd = features['churn'].rolling(zwin, min_periods=10).std()

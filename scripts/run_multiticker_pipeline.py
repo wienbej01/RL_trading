@@ -469,6 +469,61 @@ def main():
     MemoryOptimizer.log_memory_usage("at end")
     
     logger.info("Multi-Ticker RL Trading System Pipeline completed successfully")
+
+    # Write summary.json with selected_features and portfolio_metrics
+    try:
+        out_dir = Path(args.output_dir)
+        selected_features = [c for c in (features.columns.tolist() if features is not None else []) if c != 'ticker']
+        pm = {}
+        # Pull metrics from backtest summary file if present
+        bt_summary_path = out_dir / 'backtest' / 'summary.json'
+        if bt_summary_path.exists():
+            with bt_summary_path.open('r') as f:
+                btj = json.load(f)
+                if isinstance(btj, dict) and btj.get('portfolio_metrics'):
+                    pm = btj['portfolio_metrics']
+        # Fallback to returned backtest_results
+        if not pm and isinstance(backtest_results, dict) and backtest_results.get('portfolio_metrics'):
+            pm = backtest_results['portfolio_metrics']
+        top_summary = {
+            'selected_features': selected_features,
+            'portfolio_metrics': pm,
+        }
+        with (out_dir / 'summary.json').open('w') as f:
+            json.dump(top_summary, f, indent=2, default=str)
+        # Append row to registry
+        try:
+            import csv, time
+            reg_dir = Path('results/_registry')
+            reg_dir.mkdir(parents=True, exist_ok=True)
+            reg_csv = reg_dir / 'runs.csv'
+            row = {
+                'run_name': Path(args.output_dir).name,
+                'variant': ','.join(args.feature_pack) if args.feature_pack else 'default',
+                'seed': int(config.get('ppo', {}).get('seed', config.get('rl', {}).get('seed', 0))) if isinstance(config, dict) else 0,
+                'timesteps': int(config.get('ppo', {}).get('total_timesteps', config.get('training', {}).get('total_timesteps', 0))) if isinstance(config, dict) else 0,
+                'sharpe': float(pm.get('sharpe_ratio', 0.0)) if isinstance(pm, dict) else 0.0,
+                'pf': float(pm.get('profit_factor', 0.0)) if isinstance(pm, dict) else 0.0,
+                'ret': float(pm.get('total_return', 0.0)) if isinstance(pm, dict) else 0.0,
+                'maxDD': float(pm.get('max_drawdown', 0.0)) if isinstance(pm, dict) else 0.0,
+                'trades': int(pm.get('total_trades', 0)) if isinstance(pm, dict) else 0,
+                'long': int(pm.get('long_trades', 0)) if isinstance(pm, dict) else 0,
+                'short': int(pm.get('short_trades', 0)) if isinstance(pm, dict) else 0,
+                'flips': int(pm.get('flips', 0)) if isinstance(pm, dict) else 0,
+                'tx_costs_total': float(pm.get('tx_costs_total', 0.0)) if isinstance(pm, dict) else 0.0,
+                'timestamp': int(time.time()),
+            }
+            header = list(row.keys())
+            write_header = not reg_csv.exists()
+            with reg_csv.open('a', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=header)
+                if write_header:
+                    w.writeheader()
+                w.writerow(row)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"Failed to write run summary/registry: {e}")
     
     # Save pipeline configuration
     pipeline_config = {

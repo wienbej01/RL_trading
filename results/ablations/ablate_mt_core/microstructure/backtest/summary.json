@@ -1,0 +1,42 @@
+{
+  "tickers": [
+    "SPY"
+  ],
+  "portfolio_metrics": {
+    "mean_reward": 2394.945422969293,
+    "std_reward": 0.0,
+    "mean_length": 14256.0,
+    "std_length": 0.0,
+    "max_reward": 2394.945422969293,
+    "min_reward": 2394.945422969293,
+    "total_return": 0.023949449999973293,
+    "annual_return": 0.0004238409107231167,
+    "annual_volatility": 0.0032859254014727863,
+    "sharpe_ratio": 0.12895955263779613,
+    "max_drawdown": -0.020341389242134134,
+    "calmar_ratio": 0.020831982849260515,
+    "win_rate": 0.5166666666666667,
+    "profit_factor": 0.909058415294665,
+    "sortino_ratio": 0.17506438232443317,
+    "total_trades": 60,
+    "long_trades": 60,
+    "short_trades": 0,
+    "avg_duration_minutes": 203.58333333333334,
+    "avg_duration_minutes_long": 203.58333333333334,
+    "avg_duration_minutes_short": 0.0,
+    "avg_pnl": -8.86266666666605,
+    "avg_pnl_long": -8.86266666666605,
+    "avg_pnl_short": 0.0,
+    "daily_sharpe_proxy": 2.2601711867720153,
+    "intraday_max_drawdown": -0.020341389242134134
+  },
+  "diagnostics": {
+    "action_counts": {
+      "long": 60,
+      "short": 0,
+      "flat": 0
+    },
+    "trades": 60,
+    "avg_duration_minutes": 203.58333333333334
+  }
+}

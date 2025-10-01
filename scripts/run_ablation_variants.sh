@@ -35,11 +35,11 @@ for V in "${VARIANTS[@]}"; do
   echo "[abl] $V"
   PYTHONPATH=. python scripts/rl_ablate.py \
     --config "$CFG" \
-    --run-name "$SCREEN_RUN" \
+    --run-name "$ABLAT_RUN" \
+    --screen-run "$SCREEN_RUN" \
     --feature-pack "$V" \
     --timesteps "$TIMESTEPS" \
     --seed "$SEED"
 done
 
 echo "Done. See results/ablations/${SCREEN_RUN}/ for summaries."
-

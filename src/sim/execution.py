@@ -65,6 +65,15 @@ class ExecutionEngine:
             self.settings = settings
             # Use keyword default to avoid treating the default as a key (unhashable)
             self.config = settings.get('execution', default={}) if settings else {}
+            # Optional bps-based costs + position sizing
+            try:
+                self.costs_cfg = settings.get('costs', default={}) if settings else {}
+            except Exception:
+                self.costs_cfg = {}
+            try:
+                self.position_cfg = settings.get('position', default={}) if settings else {}
+            except Exception:
+                self.position_cfg = {}
             # Filter only fields supported by ExecParams; map slippage (fraction) -> slippage_bps when present
             allowed = {
                 'tick_value', 'spread_ticks', 'impact_bps',
@@ -117,12 +126,37 @@ class ExecutionEngine:
             self.exec_params.slippage_bps / 10000
         )
         
-        # Market impact cost
+        # If a bps-based costs config is present, use notional-based model
+        try:
+            if isinstance(self.costs_cfg, dict) and any(k in self.costs_cfg for k in ('commission_bps', 'spread_bps', 'slippage_bps', 'impact_k')):
+                unit_size = float(self.position_cfg.get('unit_size', 1.0)) if isinstance(self.position_cfg, dict) else 1.0
+                shares = abs(quantity) * unit_size
+                notional = float(price) * float(shares)
+                commission_bps = float(self.costs_cfg.get('commission_bps', 0.0))
+                spread_bps = float(self.costs_cfg.get('spread_bps', 0.0))
+                slippage_bps = float(self.costs_cfg.get('slippage_bps', 0.0))
+                impact_k = float(self.costs_cfg.get('impact_k', 0.0))
+                commission = notional * commission_bps / 10000.0
+                spread_cost = notional * spread_bps / 10000.0
+                slippage_cost = notional * slippage_bps / 10000.0
+                impact_cost = notional * impact_k
+                total_cost = commission + spread_cost + slippage_cost + impact_cost
+                return {
+                    'commission': commission,
+                    'spread': spread_cost,
+                    'slippage': slippage_cost,
+                    'impact': impact_cost,
+                    'total': total_cost,
+                    'cost_per_contract': total_cost / abs(quantity) if quantity != 0 else 0
+                }
+        except Exception:
+            # Fall back to classic model below
+            pass
+
+        # Market impact cost (classic model)
         impact_cost = self._estimate_market_impact(quantity, price)
-        
         # Total cost
         total_cost = commission + slippage_cost + impact_cost
-        
         return {
             'commission': commission,
             'slippage': slippage_cost,

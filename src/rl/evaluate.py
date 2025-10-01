@@ -107,7 +107,7 @@ class ModelEvaluator:
         performance_metrics = self._calculate_performance_metrics(equity_curves)
         
         # Calculate trade statistics
-        trade_stats = self._calculate_trade_statistics(trade_lists)
+        trades_df, trade_stats = self._calculate_trade_statistics(trade_lists)
         
         # Calculate risk metrics
         risk_metrics = self._calculate_risk_metrics(equity_curves)
@@ -126,6 +126,11 @@ class ModelEvaluator:
         }
         
         self.results = results
+        # Attach trades as a list of dicts for JSON report
+        try:
+            self.results['trades'] = trades_df.to_dict(orient='records') if trades_df is not None else []
+        except Exception:
+            self.results['trades'] = []
         logger.info("Model evaluation completed")
         
         return results
@@ -150,15 +155,18 @@ class ModelEvaluator:
         returns = combined_equity.pct_change().dropna()
         
         # Calculate metrics
+        # Map timeframe string to periods per year for metrics function
+        tf = str(self.timeframe).lower() if self.timeframe else "daily"
+        ppy = 252 if tf in ("daily", "day", "1d") else (52 if tf in ("weekly", "week", "1w") else 12)
         metrics = calculate_performance_metrics(
             returns=returns,
             risk_free_rate=self.risk_free_rate,
-            timeframe=self.timeframe
+            periods_per_year=ppy
         )
         
         return metrics
     
-    def _calculate_trade_statistics(self, trade_lists: List[List[Dict]]) -> Dict[str, float]:
+    def _calculate_trade_statistics(self, trade_lists: List[List[Dict]]) -> (Optional[pd.DataFrame], Dict[str, float]):
         """
         Calculate trade statistics.
         
@@ -169,7 +177,7 @@ class ModelEvaluator:
             Trade statistics
         """
         if not trade_lists:
-            return {}
+            return None, {}
         
         # Flatten trade lists
         all_trades = []
@@ -177,28 +185,56 @@ class ModelEvaluator:
             all_trades.extend(trades)
         
         if not all_trades:
-            return {}
+            return None, {}
         
         # Convert to DataFrame
         trades_df = pd.DataFrame(all_trades)
+        # Normalize and infer fields
+        if 'direction' not in trades_df.columns:
+            trades_df['direction'] = trades_df.get('pos', 0).apply(lambda p: 'long' if p > 0 else ('short' if p < 0 else 'flat'))
+        if 'quantity' not in trades_df.columns:
+            trades_df['quantity'] = trades_df.get('pos', 0).abs().astype(int)
+        if 'duration_min' not in trades_df.columns and {'entry_time','exit_time'}.issubset(trades_df.columns):
+            try:
+                et = pd.to_datetime(trades_df['entry_time'])
+                xt = pd.to_datetime(trades_df['exit_time'])
+                trades_df['duration_min'] = (xt - et).dt.total_seconds() / 60.0
+            except Exception:
+                trades_df['duration_min'] = 0.0
         
         # Calculate statistics
+        pnl_series = trades_df['pnl'] if 'pnl' in trades_df.columns else pd.Series([], dtype=float)
         stats = {
             'total_trades': len(all_trades),
-            'winning_trades': len(trades_df[trades_df['pnl'] > 0]),
-            'losing_trades': len(trades_df[trades_df['pnl'] < 0]),
-            'win_rate': len(trades_df[trades_df['pnl'] > 0]) / len(trades_df),
-            'avg_win': trades_df[trades_df['pnl'] > 0]['pnl'].mean(),
-            'avg_loss': trades_df[trades_df['pnl'] < 0]['pnl'].mean(),
-            'profit_factor': trades_df[trades_df['pnl'] > 0]['pnl'].sum() / abs(trades_df[trades_df['pnl'] < 0]['pnl'].sum()),
-            'largest_win': trades_df['pnl'].max(),
-            'largest_loss': trades_df['pnl'].min(),
-            'avg_trade_duration': trades_df['duration'].mean() if 'duration' in trades_df.columns else 0,
+            'winning_trades': int((pnl_series > 0).sum()) if not pnl_series.empty else 0,
+            'losing_trades': int((pnl_series < 0).sum()) if not pnl_series.empty else 0,
+            'win_rate': float(((pnl_series > 0).sum() / len(trades_df)) if len(trades_df) else 0.0),
+            'avg_win': float(trades_df[pnl_series > 0]['pnl'].mean()) if 'pnl' in trades_df else 0.0,
+            'avg_loss': float(trades_df[pnl_series < 0]['pnl'].mean()) if 'pnl' in trades_df else 0.0,
+            'profit_factor': float(trades_df[pnl_series > 0]['pnl'].sum() / abs(trades_df[pnl_series < 0]['pnl'].sum())) if 'pnl' in trades_df and (trades_df[pnl_series < 0]['pnl'].sum() != 0) else 0.0,
+            'largest_win': float(trades_df['pnl'].max()) if 'pnl' in trades_df else 0.0,
+            'largest_loss': float(trades_df['pnl'].min()) if 'pnl' in trades_df else 0.0,
+            'avg_trade_duration_min': float(trades_df['duration_min'].mean()) if 'duration_min' in trades_df.columns else 0.0,
             'max_consecutive_wins': self._calculate_consecutive(trades_df['pnl'] > 0),
             'max_consecutive_losses': self._calculate_consecutive(trades_df['pnl'] < 0)
         }
-        
-        return stats
+        # Directional counts
+        try:
+            stats['long_trades'] = int((trades_df['direction'] == 'long').sum())
+            stats['short_trades'] = int((trades_df['direction'] == 'short').sum())
+        except Exception:
+            stats['long_trades'] = 0
+            stats['short_trades'] = 0
+        # Dollar PnL totals
+        if 'pnl' in trades_df.columns:
+            stats['gross_pnl'] = float(trades_df['pnl'].sum())
+            stats['avg_pnl'] = float(trades_df['pnl'].mean())
+            stats['median_pnl'] = float(trades_df['pnl'].median())
+        else:
+            stats['gross_pnl'] = 0.0
+            stats['avg_pnl'] = 0.0
+            stats['median_pnl'] = 0.0
+        return trades_df, stats
     
     def _calculate_consecutive(self, series: pd.Series) -> int:
         """
@@ -296,6 +332,23 @@ class ModelEvaluator:
         # Generate HTML report
         self._generate_html_report(output_path)
         
+        # Save trades CSV if available
+        try:
+            trades = self.results.get('trades', [])
+            cols = [
+                'ts','action','direction','quantity','pos','price',
+                'entry_time','exit_time','entry_price','exit_price',
+                'pnl','duration_min','commission_entry','commission_exit'
+            ]
+            df_tr = pd.DataFrame(trades) if trades else pd.DataFrame(columns=cols)
+            # Ensure consistent column order
+            for c in cols:
+                if c not in df_tr.columns:
+                    df_tr[c] = pd.Series(dtype=object)
+            df_tr = df_tr[cols]
+            df_tr.to_csv(output_path / 'trades.csv', index=False)
+        except Exception as e:
+            logger.warning(f"Saving trades.csv failed: {e}")
         # Generate plots
         self._generate_plots(output_path)
         

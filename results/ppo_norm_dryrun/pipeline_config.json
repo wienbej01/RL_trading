@@ -1,0 +1,12 @@
+{
+  "config_file": "configs/settings.yaml",
+  "train_start": "2024-06-01",
+  "train_end": "2024-06-15",
+  "test_start": "2024-06-05",
+  "test_end": "2024-06-07",
+  "tickers": [
+    "SPY"
+  ],
+  "output_dir": "results/ppo_norm_dryrun",
+  "timestamp": "2025-09-23T15:09:21.773142"
+}

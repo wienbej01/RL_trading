@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 
 
 class VIXDataLoader:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Optional[Settings] = None):
         """
         Initialize VIX data loader.
         

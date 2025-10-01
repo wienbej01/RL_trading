@@ -6,6 +6,12 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
+from src.features.packs import (
+    PACKS,
+    propose_curated_from_consensus,
+    select_features_strict,
+)  # type: ignore
+
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
     try:
@@ -16,32 +22,14 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _select_features(cfg: Dict[str, Any], variant: str, available: List[str], run_name: str | None = None) -> List[str]:
-    from src.features.packs import get_features_for_pack, propose_curated_from_consensus  # type: ignore
-
-    # Build curated from screen outputs if requested
-    curated: List[str] | None = None
-    if variant.startswith("curated") and run_name:
-        cons = Path("results/features") / run_name / "consensus_importance.parquet"
-        if cons.exists():
-            top_n = int((cfg.get("features", {}) or {}).get("curated_top_n", 40))
-            curated = propose_curated_from_consensus(cons, top_n)
-    # Base packs from config
-    packs = (cfg.get("features", {}) or {}).get("packs", ["price_vol", "microstructure", "context"])  # type: ignore
-    selected = get_features_for_pack(available, packs, curated)
-
-    # Minus variants: curated_minus:<pack>
-    if variant.startswith("curated_minus:"):
-        minus = variant.split(":", 1)[1]
-        drop = set(get_features_for_pack(available, [minus]))
-        selected = [f for f in selected if f not in drop]
-    return selected
+# (legacy selector removed; strict selection implemented inline in main)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Quick RL ablation runner (feature packs)")
     ap.add_argument("--config", required=True)
-    ap.add_argument("--run-name", required=True)
+    ap.add_argument("--run-name", required=True, help="Output run name (used under results/ablations)")
+    ap.add_argument("--screen-run", required=False, default=None, help="Feature screen run name (reads consensus); defaults to --run-name if not set")
     ap.add_argument("--feature-pack", required=True, help="curated or curated_minus:<pack>")
     ap.add_argument("--timesteps", type=int, default=300000)
     ap.add_argument("--seed", type=int, default=123)
@@ -82,12 +70,37 @@ def main() -> int:
     pipe = FeaturePipeline(settings.get("features", {}))
     feats = pipe.fit_transform(ohlcv)
     avail = [c for c in feats.columns if c != "ticker"]
-    selected = _select_features(cfg, args.feature_pack, avail, args.run_name)
+    screen_run = args.screen_run or args.run_name
+    # Resolve curated list if needed (from consensus_importance.parquet or curated_topN.txt)
+    curated_list = None
+    if args.feature_pack.startswith("curated"):
+        import os
+        cons = os.path.join("results", "features", screen_run, "consensus_importance.parquet")
+        if os.path.exists(cons):
+            top_n = int((cfg.get("features", {}) or {}).get("curated_top_n", 40))
+            curated_list = propose_curated_from_consensus(Path(cons), top_n)
+        else:
+            txt = os.path.join("results", "features", screen_run, f"curated_top{int((cfg.get('features',{}) or {}).get('curated_top_n',40))}.txt")
+            if os.path.exists(txt):
+                curated_list = [l.strip() for l in Path(txt).read_text().splitlines() if l.strip()]
+
+    selected = select_features_strict(avail, args.feature_pack, curated_list, PACKS)
+    assert selected, f"No features selected for pack '{args.feature_pack}'"
     feats = feats[[*(selected), "ticker"]]
 
-    # Train+backtest
+    # Write features_used.txt and print strict pack recap
     out_root = Path("results/ablations") / args.run_name / args.feature_pack.replace(":", "-")
     out_root.mkdir(parents=True, exist_ok=True)
+    (out_root / "features_used.txt").write_text("\n".join(selected) + "\n")
+    def pack_hits(feat_list: list[str]) -> dict:
+        return {name: len(set(feat_list).intersection(set(cols))) for name, cols in PACKS.items()}
+    print(f"[rl_ablate] {args.feature_pack} -> {len(selected)} feats; pack hits: {pack_hits(selected)}")
+    if args.feature_pack in PACKS:
+        extraneous = [f for f in selected if f not in PACKS[args.feature_pack]]
+        if extraneous:
+            raise ValueError(f"Strict pack violation for '{args.feature_pack}': {extraneous}")
+
+    # Train+backtest
     trainer = MultiTickerRLTrainer(settings)
     trainer.hp.total_steps = int(args.timesteps)
     model = trainer.train(data=ohlcv[(ohlcv.index >= tr_s) & (ohlcv.index <= tr_e)],
@@ -104,17 +117,134 @@ def main() -> int:
         "ofi_follow": {"total_trades": None, "total_return": None, "sharpe_ratio": None},
     }
     # Summary
-    kpis = {
-        "ablation": args.feature_pack,
-        "selected_features": selected,
-        "backtest_summary": summ,
-        "baselines": baselines,
-    }
+    # Ensure top-level portfolio_metrics present for summarizers
+    kpis = {"ablation": args.feature_pack, "selected_features": selected, "baselines": baselines}
+    # Try to merge from backtest/summary.json
+    try:
+        import json as _json
+        bj = out_root / "backtest" / "summary.json"
+        if bj.exists():
+            bjd = _json.loads(bj.read_text())
+            if isinstance(bjd, dict) and bjd.get("portfolio_metrics"):
+                kpis["portfolio_metrics"] = bjd["portfolio_metrics"]
+    except Exception:
+        pass
+    # Prefer live backtest summary returned by trainer
+    if isinstance(summ, dict) and summ.get('portfolio_metrics'):
+        kpis['portfolio_metrics'] = summ['portfolio_metrics']
+    # Also include raw backtest summary object
+    kpis["backtest_summary"] = summ
+    # Persist enriched summary.json at variant root
     (out_root / "summary.json").write_text(json.dumps(kpis, indent=2))
+    # Append run registry row
+    try:
+        import csv, time
+        reg_dir = Path('results/_registry')
+        reg_dir.mkdir(parents=True, exist_ok=True)
+        reg_csv = reg_dir / 'runs.csv'
+        pm = (kpis.get('portfolio_metrics') or {}) if isinstance(kpis.get('portfolio_metrics'), dict) else {}
+        row = {
+            'run_name': args.run_name,
+            'variant': args.feature_pack,
+            'seed': int(args.seed),
+            'timesteps': int(args.timesteps),
+            'sharpe': float(pm.get('sharpe_ratio', 0.0)),
+            'pf': float(pm.get('profit_factor', pm.get('profit_factor', 0.0))),
+            'ret': float(pm.get('total_return', 0.0)),
+            'maxDD': float(pm.get('max_drawdown', 0.0)),
+            'trades': int(pm.get('total_trades', 0)),
+            'long': int(pm.get('long_trades', 0)),
+            'short': int(pm.get('short_trades', 0)),
+            'flips': int(pm.get('flips', 0)),
+            'tx_costs_total': float(pm.get('tx_costs_total', 0.0)),
+            'timestamp': int(time.time()),
+        }
+        header = list(row.keys())
+        write_header = not reg_csv.exists()
+        with reg_csv.open('a', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=header)
+            if write_header:
+                w.writeheader()
+            w.writerow(row)
+    except Exception:
+        pass
     print(str((out_root / "summary.json").resolve()))
     return 0
+
+# --- injected: backtest summary augmentation ---
+def _augment_summaries(variant_dir: str):
+    """
+    Post-process backtest outputs:
+    - copy portfolio_metrics from backtest/summary.json to top-level if missing
+    - compute action_counts from backtest/trades.csv (direction or units sign)
+    - attach simple diagnostics: avg_duration_minutes, trades, long/short counts
+    """
+    import os, json, pandas as pd
+    top = os.path.join(variant_dir, "summary.json")
+    bt = os.path.join(variant_dir, "backtest", "summary.json")
+    trades_csv = os.path.join(variant_dir, "backtest", "trades.csv")
+
+    def _load(path):
+        try:
+            with open(path) as f: return json.load(f)
+        except Exception:
+            return {}
+
+    top_j = _load(top)
+    bt_j = _load(bt)
+
+    # Merge portfolio_metrics upward if top-level lacks them
+    if (not top_j.get("portfolio_metrics")) and bt_j.get("portfolio_metrics"):
+        top_j["portfolio_metrics"] = bt_j["portfolio_metrics"]
+
+    # Compute action counts from trades
+    action_counts = {"long": 0, "short": 0, "flat": 0}
+    avg_dur = None
+    if os.path.exists(trades_csv):
+        t = pd.read_csv(trades_csv)
+        if "direction" in t.columns:
+            vc = t["direction"].astype(str).value_counts(dropna=False)
+            action_counts["long"] = int(vc.get("long", 0))
+            action_counts["short"] = int(vc.get("short", 0))
+        elif "units" in t.columns:
+            s = t["units"].astype(float)
+            action_counts["long"] = int((s > 0).sum())
+            action_counts["short"] = int((s < 0).sum())
+        if "duration_minutes" in t.columns:
+            try:
+                avg_dur = float(t["duration_minutes"].mean())
+            except Exception:
+                avg_dur = None
+
+    # Attach diagnostics on both levels
+    diag = {
+        "trades": action_counts["long"] + action_counts["short"],
+        "avg_duration_minutes": avg_dur,
+        "action_counts": action_counts,
+    }
+    top_j["diagnostics"] = {**top_j.get("diagnostics", {}), **diag}
+    bt_j["diagnostics"]  = {**bt_j.get("diagnostics",  {}), **diag}
+
+    # If backtest has counts, mirror long/short into portfolio_metrics for convenience
+    pm = top_j.get("portfolio_metrics", {})
+    if pm is not None:
+        pm.setdefault("total_trades", diag["trades"])
+        pm.setdefault("long_trades", action_counts["long"])
+        pm.setdefault("short_trades", action_counts["short"])
+        top_j["portfolio_metrics"] = pm
+    pm_bt = bt_j.get("portfolio_metrics", {})
+    if pm_bt is not None:
+        pm_bt.setdefault("total_trades", diag["trades"])
+        pm_bt.setdefault("long_trades", action_counts["long"])
+        pm_bt.setdefault("short_trades", action_counts["short"])
+        bt_j["portfolio_metrics"] = pm_bt
+
+    # Write back
+    os.makedirs(os.path.dirname(bt), exist_ok=True)
+    with open(bt, "w") as f: json.dump(bt_j, f, indent=2)
+    with open(top, "w") as f: json.dump(top_j, f, indent=2)
+
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from sb3_contrib import RecurrentPPO
+from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.vec_env import VecNormalize
@@ -38,6 +39,8 @@ from ..sim.execution import ExecParams
 from ..sim.risk import RiskConfig
 from .train import evaluate_model  # reuse existing evaluator
 from .callbacks import KLStopCallback, AdaptiveLRByKL, LiveLRBump
+from ..utils.callbacks import EarlyStopNoImprove
+from ..utils.artifacts import BacktestResult as ArtifactBacktestResult
 
 
 logger = get_logger(__name__)
@@ -170,6 +173,7 @@ def _build_env_from_frames(
     features: pd.DataFrame,
     *,
     point_value: float = 1.0,
+    max_episode_bars: int | None = None,
 ) -> IntradayRLEnv:
     """Create an IntradayRLEnv from aligned OHLCV and features frames."""
     # Execution and risk parameters from settings with safe defaults
@@ -188,11 +192,21 @@ def _build_env_from_frames(
     reward_type = str(settings.get("env", "reward", "kind", default="dsr"))
     reward_scaling = float(settings.get("env", "reward_scaling", default=0.1))
     max_steps = int(settings.get("env", "max_steps", default=390))
+    if isinstance(max_episode_bars, int) and max_episode_bars > 0:
+        max_steps = min(max_steps, int(max_episode_bars))
+    # Enforce shorts parity for equity runs: allow_shorts must be True
+    try:
+        allow_shorts = bool(settings.get("env", "allow_shorts", default=True))
+    except Exception:
+        allow_shorts = True
+    if not allow_shorts:
+        raise ValueError("allow_shorts must be True for equity runs (parity enforcement)")
     env_cfg = EnvConfig(
         cash=100_000.0,
         max_steps=max_steps,
         reward_type=reward_type,
         reward_scaling=reward_scaling,
+        allow_shorts=True,
     )
     # Align indices and columns
     o = _ensure_dt_index(ohlcv)
@@ -304,13 +318,17 @@ class MultiTickerRLTrainer:
         self.hp = _read_hparams(config)
         self.model: Optional[RecurrentPPO] = None
         self._train_tickers: Optional[List[str]] = None
+        try:
+            self.fast_smoke: bool = bool(self.cfg.get('rl', {}).get('fast_smoke', False)) if isinstance(self.cfg, dict) else False
+        except Exception:
+            self.fast_smoke = False
 
     def _make_envs(self, data: pd.DataFrame, features: pd.DataFrame, tickers: List[str]) -> DummyVecEnv:
         envs: List[Any] = []
         for t in tickers:
             df_t = _slice_by_ticker(data, t)
             X_t = _slice_by_ticker(features, t)
-            envs.append(lambda df=df_t, X=X_t: _build_env_from_frames(self.settings, df, X))
+            envs.append(lambda df=df_t, X=X_t: _build_env_from_frames(self.settings, df, X, max_episode_bars=(2500 if self.fast_smoke else None)))
         return DummyVecEnv(envs)
 
     def train(
@@ -391,17 +409,25 @@ class MultiTickerRLTrainer:
             n_envs = max(1, n_envs)
             fns = []
             def make_single():
-                return _build_env_from_frames(self.settings, data, features)
+                return _build_env_from_frames(self.settings, data, features, max_episode_bars=(2500 if self.fast_smoke else None))
             for _ in range(n_envs):
                 fns.append(make_single)
             vec_env = SubprocVecEnv(fns) if n_envs > 1 else DummyVecEnv([make_single])
 
-        policy_kwargs = dict(
-            net_arch={"pi": [256, 256], "vf": [256, 256]},
-            activation_fn=__import__("torch", fromlist=["nn"]).nn.ReLU,
-            ortho_init=True,
-            normalize_images=False,
-        )
+        if self.fast_smoke:
+            policy_kwargs = dict(
+                net_arch=[64, 64],
+                activation_fn=__import__("torch", fromlist=["nn"]).nn.ReLU,
+                ortho_init=True,
+                normalize_images=False,
+            )
+        else:
+            policy_kwargs = dict(
+                net_arch={"pi": [256, 256], "vf": [256, 256]},
+                activation_fn=__import__("torch", fromlist=["nn"]).nn.ReLU,
+                ortho_init=True,
+                normalize_images=False,
+            )
         # Optional normalization config
         # Normalization settings (backward compatible)
         norm_cfg = (self.cfg.get('normalize', {}) if isinstance(self.cfg, dict) else {}) or {}
@@ -430,27 +456,97 @@ class MultiTickerRLTrainer:
         else:
             clip_sched = self.hp.clip_range
 
-        self.model = RecurrentPPO(
-            'MlpLstmPolicy',
-            vec_env,
-            learning_rate=lr_sched,
-            n_steps=max(1, int(self.hp.n_steps)),
-            batch_size=max(64, int(self.hp.batch_size)),
-            gamma=self.hp.gamma,
-            gae_lambda=self.hp.gae_lambda,
-            clip_range=clip_sched,
-            vf_coef=self.hp.vf_coef,
-            ent_coef=float(self.cfg.get('rl', {}).get('ppo', {}).get('ent_coef', self.hp.ent_coef)) if isinstance(self.cfg, dict) else self.hp.ent_coef,
-            max_grad_norm=self.hp.max_grad_norm,
-            n_epochs=self.hp.n_epochs,
-            target_kl=float(ppo_cfg.get('target_kl', self.hp.target_kl)) if isinstance(self.cfg, dict) else self.hp.target_kl,
-            clip_range_vf=float(ppo_cfg.get('clip_range_vf', 0.0)) if 'clip_range_vf' in ppo_cfg else None,
-            policy_kwargs=policy_kwargs,
-            device=self.hp.device,
-            verbose=1,
-            seed=seed,
-            tensorboard_log=str((output_dir / 'logs' / 'tensorboard').resolve()),
-        )
+        if self.fast_smoke:
+            # Standard PPO with MLP policy, no LSTM
+            self.model = PPO(
+                'MlpPolicy',
+                vec_env,
+                learning_rate=lr_sched,
+                n_steps=max(1, int(self.hp.n_steps)),
+                batch_size=max(64, int(self.hp.batch_size)),
+                gamma=self.hp.gamma,
+                gae_lambda=self.hp.gae_lambda,
+                clip_range=clip_sched,
+                vf_coef=self.hp.vf_coef,
+                ent_coef=float(self.cfg.get('rl', {}).get('ppo', {}).get('ent_coef', self.hp.ent_coef)) if isinstance(self.cfg, dict) else self.hp.ent_coef,
+                max_grad_norm=self.hp.max_grad_norm,
+                n_epochs=self.hp.n_epochs,
+                target_kl=float(ppo_cfg.get('target_kl', self.hp.target_kl)) if isinstance(self.cfg, dict) else self.hp.target_kl,
+                policy_kwargs=policy_kwargs,
+                device=self.hp.device,
+                verbose=0,
+                seed=seed,
+                tensorboard_log=None,
+            )
+            # Optional: epsilon action smoothing to avoid zero-entropy collapse (debug only)
+            try:
+                eps = float(self.cfg.get('rl', {}).get('ppo', {}).get('epsilon_action_prob', 0.0)) if isinstance(self.cfg, dict) else 0.0
+            except Exception:
+                eps = 0.0
+            if eps and eps > 0.0:
+                try:
+                    import torch as _torch
+                    from torch.distributions import Categorical as _Categorical  # type: ignore
+                    _orig_get = self.model.policy.get_distribution
+                    def _smoothed_get_distribution(obs, *a, **kw):  # type: ignore[override]
+                        dist = _orig_get(obs, *a, **kw)
+                        logits = getattr(dist.distribution, 'logits', None)
+                        if logits is not None:
+                            probs = _torch.softmax(logits, dim=-1)
+                            n = probs.shape[-1]
+                            probs = (1.0 - float(eps)) * probs + (float(eps) / float(max(1, int(n))))
+                            dist.distribution = _Categorical(probs=probs)
+                        return dist
+                    self.model.policy.get_distribution = _smoothed_get_distribution  # type: ignore[assignment]
+                    logger.info(f"Enabled epsilon_action_prob smoothing: eps={eps}")
+                except Exception:
+                    pass
+            # Log initial action priors (fast-smoke, non-recurrent)
+            try:
+                import torch as _torch
+                obs = vec_env.reset()
+                # Build a small batch from the initial observation
+                if isinstance(obs, (list, tuple)):
+                    obs0 = obs[0]
+                else:
+                    obs0 = obs
+                obs_batch = _torch.as_tensor(obs0).float()
+                if obs_batch.ndim == 1:
+                    obs_batch = obs_batch.unsqueeze(0)
+                dist = self.model.policy.get_distribution(obs_batch)
+                logits = getattr(dist.distribution, 'logits', None)
+                if logits is not None:
+                    probs = _torch.softmax(logits, dim=-1).mean(0)
+                    # Apply epsilon smoothing for logging if enabled
+                    if 'eps' in locals() and float(eps) > 0.0:
+                        n = probs.shape[-1]
+                        probs = (1.0 - float(eps)) * probs + (float(eps) / float(max(1, int(n))))
+                    probs = probs.detach().cpu().numpy()
+                    logger.info(f"Action priors mean: short={probs[0]:.3f}, flat={probs[1]:.3f}, long={probs[2]:.3f}")
+            except Exception:
+                pass
+        else:
+            self.model = RecurrentPPO(
+                'MlpLstmPolicy',
+                vec_env,
+                learning_rate=lr_sched,
+                n_steps=max(1, int(self.hp.n_steps)),
+                batch_size=max(64, int(self.hp.batch_size)),
+                gamma=self.hp.gamma,
+                gae_lambda=self.hp.gae_lambda,
+                clip_range=clip_sched,
+                vf_coef=self.hp.vf_coef,
+                ent_coef=float(self.cfg.get('rl', {}).get('ppo', {}).get('ent_coef', self.hp.ent_coef)) if isinstance(self.cfg, dict) else self.hp.ent_coef,
+                max_grad_norm=self.hp.max_grad_norm,
+                n_epochs=self.hp.n_epochs,
+                target_kl=float(ppo_cfg.get('target_kl', self.hp.target_kl)) if isinstance(self.cfg, dict) else self.hp.target_kl,
+                clip_range_vf=float(ppo_cfg.get('clip_range_vf', 0.0)) if 'clip_range_vf' in ppo_cfg else None,
+                policy_kwargs=policy_kwargs,
+                device=self.hp.device,
+                verbose=0,
+                seed=seed,
+                tensorboard_log=str((output_dir / 'logs' / 'tensorboard').resolve()),
+            )
         # Wrap with VecNormalize if requested
         if norm_obs or norm_rew:
             vec_env = VecNormalize(vec_env, norm_obs=norm_obs, norm_reward=norm_rew, clip_obs=clip_obs, clip_reward=clip_reward)
@@ -458,7 +554,7 @@ class MultiTickerRLTrainer:
         # Build a small eval env on a held-out tail slice if possible (single-ticker path)
         eval_cb = None
         try:
-            if len(tickers) == 1:
+            if (len(tickers) == 1) and (not self.fast_smoke):
                 idx = data.index
                 if isinstance(idx, pd.DatetimeIndex) and len(idx) > 1000:
                     cutoff = int(len(idx) * 0.9)
@@ -468,7 +564,7 @@ class MultiTickerRLTrainer:
                     d_eval = data.tail(1000)
                     X_eval = features.tail(1000)
                 def _make_eval():
-                    return _build_env_from_frames(self.settings, d_eval, X_eval)
+                    return _build_env_from_frames(self.settings, d_eval, X_eval, max_episode_bars=(2500 if self.fast_smoke else None))
                 eval_env = DummyVecEnv([_make_eval])
                 eval_cb = EvalAndLrCallback(eval_env=eval_env,
                                             eval_freq=int(self.cfg.get('rl', {}).get('eval', {}).get('eval_freq', 100000)),
@@ -480,13 +576,26 @@ class MultiTickerRLTrainer:
             eval_cb = None
 
         total_steps = int(self.hp.total_steps)
-        # Compose callbacks: KL early stop, adaptive LR by KL, live LR bump flag, and eval callback (if any)
+        # Compose callbacks: KL early stop, adaptive LR by KL, live LR bump flag
         cb_list = [
             KLStopCallback(target_kl=float(ppo_cfg.get('target_kl', 0.01)) if isinstance(ppo_cfg, dict) else 0.01),
             AdaptiveLRByKL(low=0.003, high=float(ppo_cfg.get('target_kl', 0.01)) if isinstance(ppo_cfg, dict) else 0.01,
                            up=1.15, down=0.7, min_lr=2e-5, max_lr=2e-4),
             LiveLRBump(run_dir=str(output_dir.resolve()), bump_factor=1.25),
         ]
+        # Optional: EarlyStopNoImprove unless in fast-smoke
+        try:
+            es_cfg = (self.cfg.get('rl', {}).get('early_stop', {}) if isinstance(self.cfg, dict) else {}) or {}
+            if es_cfg and not self.fast_smoke:
+                es = EarlyStopNoImprove(
+                    check_freq=int(es_cfg.get('check_freq', 10)),
+                    min_delta=float(es_cfg.get('min_delta', 1e-3)),
+                    patience=int(es_cfg.get('patience', 5)),
+                    verbose=1,
+                )
+                cb_list.append(es)
+        except Exception:
+            pass
         if eval_cb is not None:
             cb_list.append(eval_cb)
         self.model.learn(total_timesteps=total_steps, progress_bar=True, callback=CallbackList(cb_list))
@@ -652,7 +761,7 @@ class MultiTickerRLTrainer:
                 else:
                     eq = env0.get_equity_curve()
                 # Compute returns and portfolio stats
-                ret = eq.pct_change().dropna()
+                ret = eq.pct_change(fill_method=None).dropna()
                 stats = {}
                 if len(ret) > 1 and float(eq.iloc[0]) != 0.0:
                     stats = {
@@ -698,7 +807,51 @@ class MultiTickerRLTrainer:
                         pass
                 except Exception:
                     pass
-                tdf.to_csv(output_dir / 'trades.csv', index=False)
+                trades_path = output_dir / 'trades.csv'
+                tdf.to_csv(trades_path, index=False)
+                # Trades are the single source of truth for costs
+                try:
+                    trades_df = _pd.read_csv(trades_path)
+                    cost_cols = ["commission_cost","spread_cost","slippage_cost","impact_cost","total_cost","total_cost_est"]
+                    for c in cost_cols:
+                        if c not in trades_df.columns:
+                            trades_df[c] = 0.0
+                    trades_df[cost_cols] = trades_df[cost_cols].fillna(0.0)
+                    # Use max(total_cost, total_cost_est) per trade to guard legacy columns
+                    total_used = _pd.concat([
+                        _pd.to_numeric(trades_df["total_cost"], errors='coerce').fillna(0.0),
+                        _pd.to_numeric(trades_df["total_cost_est"], errors='coerce').fillna(0.0)
+                    ], axis=1).max(axis=1)
+                    sum_costs = float(total_used.sum())
+                    metrics["tx_costs_total"] = sum_costs
+                    assert abs(metrics["tx_costs_total"] - sum_costs) < 1e-9
+                    # Net PnL for PF/returns (aggregate and side)
+                    if 'gross_pnl' in trades_df.columns:
+                        trades_df['net_pnl'] = _pd.to_numeric(trades_df['gross_pnl'], errors='coerce').fillna(0.0) - total_used
+                    elif 'pnl' in trades_df.columns:
+                        # Assume pnl already net if gross not available
+                        trades_df['net_pnl'] = _pd.to_numeric(trades_df['pnl'], errors='coerce').fillna(0.0)
+                    else:
+                        trades_df['net_pnl'] = 0.0
+                    net = trades_df['net_pnl']
+                    pos_sum = float(net[net > 0].sum())
+                    neg_sum = float(net[net < 0].sum())
+                    metrics['profit_factor'] = float(pos_sum / (abs(neg_sum) + 1e-12)) if pos_sum > 0 else 0.0
+                    # Side segmented
+                    if 'direction' in trades_df.columns:
+                        m_long = trades_df['direction'] == 'long'
+                        m_short = trades_df['direction'] == 'short'
+                        lp = float(trades_df.loc[m_long, 'net_pnl'][trades_df.loc[m_long, 'net_pnl'] > 0].sum())
+                        ln = float(trades_df.loc[m_long, 'net_pnl'][trades_df.loc[m_long, 'net_pnl'] < 0].sum())
+                        sp = float(trades_df.loc[m_short, 'net_pnl'][trades_df.loc[m_short, 'net_pnl'] > 0].sum())
+                        sn = float(trades_df.loc[m_short, 'net_pnl'][trades_df.loc[m_short, 'net_pnl'] < 0].sum())
+                        metrics['long_pf'] = float(lp / (abs(ln) + 1e-12)) if lp > 0 else 0.0
+                        metrics['short_pf'] = float(sp / (abs(sn) + 1e-12)) if sp > 0 else 0.0
+                        metrics['long_ret'] = float(trades_df.loc[m_long, 'net_pnl'].sum())
+                        metrics['short_ret'] = float(trades_df.loc[m_short, 'net_pnl'].sum())
+                    # steps.parquet is mandatory upstream; no diagnostic fallback from trades
+                except Exception:
+                    pass
                 # Aggregate trade stats (zeros if none)
                 total_trades = int(len(tdf))
                 long_mask = (tdf['direction'] == 'long') if 'direction' in tdf else _pd.Series([], dtype=bool)
@@ -718,6 +871,52 @@ class MultiTickerRLTrainer:
                 }
                 # Expose under metrics and summary
                 metrics.update(trade_stats)
+                # --- Added: richer portfolio metrics from env diagnostics ---
+                try:
+                    # Action counts and flips
+                    acts = env0.get_action_counts() if hasattr(env0, 'get_action_counts') else {}
+                    metrics['long_steps'] = int(acts.get('long_steps', 0))
+                    metrics['short_steps'] = int(acts.get('short_steps', 0))
+                    metrics['flat_steps'] = int(acts.get('flat_steps', 0))
+                    metrics['flips'] = int(acts.get('flips', 0))
+                except Exception:
+                    metrics.setdefault('long_steps', 0)
+                    metrics.setdefault('short_steps', 0)
+                    metrics.setdefault('flat_steps', 0)
+                    metrics.setdefault('flips', 0)
+                try:
+                    # Turnover and exposure diagnostics from history
+                    turnover_total = float(_pd.to_numeric(hist.get('turnover', _pd.Series(dtype=float))).sum()) if not hist.empty else 0.0
+                    metrics['turnover'] = float(turnover_total)
+                except Exception:
+                    metrics.setdefault('turnover', 0.0)
+                try:
+                    exposure_pct = float(_pd.to_numeric(hist.get('exposure_pct', _pd.Series(dtype=float))).mean()) if ('exposure_pct' in hist.columns) else 0.0
+                    metrics['exposure_pct'] = float(exposure_pct)
+                except Exception:
+                    metrics.setdefault('exposure_pct', 0.0)
+                try:
+                    # Use metrics['tx_costs_total'] already set from trades to compute per-trade average
+                    tx_total = float(metrics.get('tx_costs_total', 0.0))
+                    metrics['tx_costs_per_trade'] = float(tx_total) / float(max(1, int(metrics.get('total_trades', 0))))
+                except Exception:
+                    metrics.setdefault('tx_costs_per_trade', 0.0)
+                # Deterministic parity flag from trades/steps
+                try:
+                    lt = int(metrics.get('long_trades', 0))
+                    st = int(metrics.get('short_trades', 0))
+                    ls = int(metrics.get('long_steps', 0))
+                    ss = int(metrics.get('short_steps', 0))
+                    if (lt > 0 or ls > 0) and (st > 0 or ss > 0):
+                        metrics['parity_flag'] = 'BOTH'
+                    elif (lt > 0 or ls > 0):
+                        metrics['parity_flag'] = 'ONLY_LONG'
+                    elif (st > 0 or ss > 0):
+                        metrics['parity_flag'] = 'ONLY_SHORT'
+                    else:
+                        metrics['parity_flag'] = 'NONE'
+                except Exception:
+                    metrics['parity_flag'] = 'NONE'
                 # Daily performance report (compact)
                 try:
                     import pandas as _pd
@@ -729,7 +928,8 @@ class MultiTickerRLTrainer:
                         daily = daily.rename('daily_pnl').to_frame()
                         daily['num_trades'] = int(total_trades)
                         # daily returns for sharpe-like
-                        dr = (eq.resample('1D').last().pct_change()).dropna()
+                        daily = eq.resample('1D').last()
+                        dr = daily.pct_change(fill_method=None).dropna()
                         if not dr.empty:
                             daily_sharpe = float((dr.mean() / (dr.std() + 1e-12)) * (252 ** 0.5))
                         else:
@@ -756,7 +956,415 @@ class MultiTickerRLTrainer:
             summary = {
                 'tickers': tickers,
                 'per_ticker_metrics': {tickers[0]: metrics},
+                'portfolio_metrics': metrics,
             }
+        # --- Diagnostics, parity, and baselines ---
+        try:
+            # Prefer the env we just used (portfolio or single)
+            env_ref = None
+            try:
+                env_ref = vec_env.envs[0]
+            except Exception:
+                try:
+                    env_ref = single_env.envs[0]  # type: ignore[name-defined]
+                except Exception:
+                    env_ref = None
+            import pandas as _pd
+            import numpy as _np
+            # Build and persist steps.parquet (fail loudly on missing data)
+            steps_path = output_dir.parent / 'steps.parquet'
+            df_steps = None
+            if env_ref is not None and hasattr(env_ref, 'get_diagnostics'):
+                diag = env_ref.get_diagnostics()
+                if diag is not None and not getattr(diag, 'empty', True):
+                    ts_index = _pd.to_datetime(diag.get('ts', diag.index))
+                    action_series = _pd.to_numeric(diag.get('action', diag.get('action_dir')), errors='coerce')
+                    pos_series = _pd.to_numeric(diag.get('pos', _pd.Series(index=diag.index, dtype=float)), errors='coerce')
+                    price_series = _pd.to_numeric(diag.get('price'), errors='coerce')
+                    cols = {
+                        'ts': ts_index,
+                        'action': action_series,
+                        'pos': pos_series,
+                        'price': price_series,
+                    }
+                    # Attach flow proxies from the live feature frame if available; else derive minimal proxy
+                    live_X = getattr(env_ref, 'X', None)
+                    attached = False
+                    if isinstance(live_X, _pd.DataFrame):
+                        for flow_col in ("ofi_proxy", "signed_vol_delta"):
+                            if flow_col in live_X.columns:
+                                cols[flow_col] = _pd.to_numeric(live_X[flow_col], errors='coerce').reindex(ts_index).astype('float32').fillna(0.0)
+                                attached = True
+                                break
+                    if not attached:
+                        # Minimal OHLCV proxy using price and volume
+                        try:
+                            c = _pd.to_numeric(price_series, errors='coerce').astype('float32')
+                            vol_src = None
+                            try:
+                                if isinstance(data, _pd.DataFrame) and 'volume' in data.columns:
+                                    if 'ticker' in data.columns:
+                                        vol_src = _pd.to_numeric(data['volume'], errors='coerce').groupby(data.index).sum()
+                                    else:
+                                        vol_src = _pd.to_numeric(data['volume'], errors='coerce')
+                            except Exception:
+                                vol_src = None
+                            v = _pd.to_numeric(vol_src, errors='coerce') if vol_src is not None else _pd.Series(0.0, index=ts_index)
+                            v = v.reindex(ts_index).fillna(0.0).astype('float32')
+                            sgn = _np.sign(c.diff().fillna(0.0))
+                            dvol = v.diff().fillna(0.0)
+                            ofi = (sgn * dvol).astype('float32')
+                            # Day z-score by ts_index date
+                            by_day = ofi.groupby(ts_index.date)
+                            ofi = (ofi - by_day.transform('mean')) / (by_day.transform('std') + 1e-12)
+                            cols['ofi_proxy'] = ofi.fillna(0.0).astype('float32')
+                        except Exception:
+                            cols['ofi_proxy'] = _pd.Series(0.0, index=ts_index, dtype='float32')
+                    df_steps = _pd.DataFrame(cols).set_index('ts')
+                    df_steps.index.name = 'timestamp'
+            # Fallback: synthesize steps from history or features if diagnostics unavailable
+            if df_steps is None or len(df_steps) == 0:
+                try:
+                    hist = env_ref.get_history_df() if (env_ref is not None and hasattr(env_ref, 'get_history_df')) else _pd.DataFrame()
+                except Exception:
+                    hist = _pd.DataFrame()
+                if not hist.empty:
+                    ts_index = _pd.to_datetime(hist.index if isinstance(hist.index, _pd.DatetimeIndex) else hist.get('timestamp'), utc=True, errors='coerce')
+                    ts_index = ts_index.tz_convert('America/New_York') if ts_index.tz is not None else ts_index
+                    # Aggregate per-ticker positions if present
+                    pos_cols = [c for c in hist.columns if str(c).startswith('pos_')]
+                    pos_series = _pd.to_numeric(hist[pos_cols].sum(axis=1), errors='coerce') if pos_cols else _pd.Series(0, index=hist.index)
+                    # Infer action from pos changes
+                    dpos = _np.sign(_pd.to_numeric(pos_series, errors='coerce').diff().fillna(0.0).to_numpy())
+                    action_series = _pd.Series(dpos, index=hist.index)
+                    price_series = _pd.Series(_np.nan, index=hist.index)
+                    cols = {
+                        'ts': ts_index,
+                        'action': action_series,
+                        'pos': pos_series,
+                        'price': price_series,
+                    }
+                    # Attach proxies from features if available; else derive minimal proxy
+                    live_X = getattr(env_ref, 'X', None)
+                    src = live_X if isinstance(live_X, _pd.DataFrame) else features
+                    attached = False
+                    if isinstance(src, _pd.DataFrame):
+                        for flow_col in ("ofi_proxy", "signed_vol_delta"):
+                            if flow_col in src.columns:
+                                cols[flow_col] = _pd.to_numeric(src[flow_col], errors='coerce').reindex(ts_index).astype('float32').fillna(0.0)
+                                attached = True
+                                break
+                    if not attached:
+                        try:
+                            # Use OHLCV from `data` to build minimal proxy
+                            vol_src = None
+                            if isinstance(data, _pd.DataFrame) and 'volume' in data.columns:
+                                if 'ticker' in data.columns:
+                                    vol_src = _pd.to_numeric(data['volume'], errors='coerce').groupby(data.index).sum()
+                                else:
+                                    vol_src = _pd.to_numeric(data['volume'], errors='coerce')
+                            v = _pd.to_numeric(vol_src, errors='coerce') if vol_src is not None else _pd.Series(0.0, index=ts_index)
+                            v = v.reindex(ts_index).fillna(0.0).astype('float32')
+                            # For price, we may not have a portfolio-level price; use zeros for sign
+                            c = _pd.Series(0.0, index=ts_index, dtype='float32')
+                            sgn = _np.sign(c.diff().fillna(0.0))
+                            dvol = v.diff().fillna(0.0)
+                            ofi = (sgn * dvol).astype('float32')
+                            by_day = ofi.groupby(ts_index.date)
+                            ofi = (ofi - by_day.transform('mean')) / (by_day.transform('std') + 1e-12)
+                            cols['ofi_proxy'] = ofi.fillna(0.0).astype('float32')
+                        except Exception:
+                            cols['ofi_proxy'] = _pd.Series(0.0, index=ts_index, dtype='float32')
+                    df_steps = _pd.DataFrame(cols).set_index('ts')
+                    df_steps.index.name = 'timestamp'
+                else:
+                    # Last resort: build empty scaffold from features timeline
+                    try:
+                        ts_index = _pd.to_datetime(features.index, utc=True, errors='coerce')
+                        cols = {
+                            'ts': ts_index,
+                            'action': _pd.Series(0, index=ts_index),
+                            'pos': _pd.Series(0, index=ts_index),
+                            'price': _pd.Series(_np.nan, index=ts_index),
+                        }
+                        attached = False
+                        for flow_col in ("ofi_proxy", "signed_vol_delta"):
+                            if flow_col in features.columns:
+                                cols[flow_col] = _pd.to_numeric(features[flow_col], errors='coerce').reindex(ts_index).astype('float32').fillna(0.0)
+                                attached = True
+                                break
+                        if not attached:
+                            # Minimal proxy from OHLCV in `data`
+                            try:
+                                vol_src = None
+                                if isinstance(data, _pd.DataFrame) and 'volume' in data.columns:
+                                    if 'ticker' in data.columns:
+                                        vol_src = _pd.to_numeric(data['volume'], errors='coerce').groupby(data.index).sum()
+                                    else:
+                                        vol_src = _pd.to_numeric(data['volume'], errors='coerce')
+                                v = _pd.to_numeric(vol_src, errors='coerce') if vol_src is not None else _pd.Series(0.0, index=ts_index)
+                                v = v.reindex(ts_index).fillna(0.0).astype('float32')
+                                c = _pd.Series(0.0, index=ts_index, dtype='float32')
+                                sgn = _np.sign(c.diff().fillna(0.0))
+                                dvol = v.diff().fillna(0.0)
+                                ofi = (sgn * dvol).astype('float32')
+                                by_day = ofi.groupby(ts_index.date)
+                                ofi = (ofi - by_day.transform('mean')) / (by_day.transform('std') + 1e-12)
+                                cols['ofi_proxy'] = ofi.fillna(0.0).astype('float32')
+                            except Exception:
+                                cols['ofi_proxy'] = _pd.Series(0.0, index=ts_index, dtype='float32')
+                        df_steps = _pd.DataFrame(cols).set_index('ts')
+                        df_steps.index.name = 'timestamp'
+                    except Exception:
+                        df_steps = _pd.DataFrame({'action': [], 'pos': [], 'price': []})
+            # Attach OHLCV flow proxies from features if available (ofi_proxy, signed_vol_delta)
+            try:
+                if hasattr(env_ref, 'X') and isinstance(env_ref.X, _pd.DataFrame):
+                    for _col in ['ofi_proxy', 'signed_vol_delta']:
+                        if _col in env_ref.X.columns and _col not in df_steps.columns:
+                            ser = _pd.to_numeric(env_ref.X[_col], errors='coerce')
+                            df_steps[_col] = ser.reindex(df_steps.index)
+                else:
+                    # Try from provided features frame
+                    for _col in ['ofi_proxy', 'signed_vol_delta']:
+                        if _col in features.columns and _col not in df_steps.columns:
+                            ser = _pd.to_numeric(features[_col], errors='coerce')
+                            df_steps[_col] = ser.reindex(df_steps.index)
+            except Exception:
+                pass
+            # Always write steps.parquet (may be minimal if little info available)
+            try:
+                df_steps = df_steps.sort_index()
+                df_steps.to_parquet(steps_path, engine='pyarrow', index=True)
+            except Exception as _e:
+                logger.warning(f"Failed to write steps.parquet: {_e}")
+
+            # Compute metrics strictly from steps.parquet
+            s = _pd.read_parquet(steps_path).sort_index()
+            # Drop rows with NaN in action or pos
+            s = s.loc[s['action'].notna() & s['pos'].notna()]
+            a = s['action'].astype(int).to_numpy()
+            p_arr = s['pos'].astype(int).to_numpy()
+            # Entropy over {-1,0,1} (base-2)
+            vals, cnts = _np.unique(a, return_counts=True)
+            probs = cnts / cnts.sum() if cnts.sum() > 0 else _np.array([1.0])
+            action_entropy = float(-_np.sum(probs * _np.log2(probs + 1e-12))) if probs.size else 0.0
+            # Entries/exits/flips
+            if p_arr.size >= 2:
+                entries = int(((p_arr[:-1] == 0) & (p_arr[1:] != 0)).sum())
+                exits = int(((p_arr[:-1] != 0) & (p_arr[1:] == 0)).sum())
+                flips = int(((p_arr[:-1] * p_arr[1:]) < 0).sum())
+            else:
+                entries = exits = flips = 0
+            dp = _np.diff(p_arr, prepend=p_arr[0]) if p_arr.size else _np.array([0])
+            turnover = float(_np.abs(dp).sum())
+            avg_abs_pos = float(_np.mean(_np.abs(p_arr))) if p_arr.size else 0.0
+            avg_abs_dpos = float(_np.mean(_np.abs(dp))) if dp.size else 0.0
+            # corr(sign(action), sign(flow_proxy)) preferring ofi_proxy, else signed_vol_delta
+            corr_action_flow = None
+            try:
+                flow_col = 'ofi_proxy' if ('ofi_proxy' in s.columns) else ('signed_vol_delta' if ('signed_vol_delta' in s.columns) else None)
+                if flow_col and s[flow_col].notna().sum() > 50:
+                    sgn_a = _np.sign(s['action'].to_numpy())
+                    sgn_o = _np.sign(s[flow_col].to_numpy())
+                    corr_action_flow = float(_np.corrcoef(sgn_a, sgn_o)[0, 1])
+                else:
+                    if flow_col is None:
+                        logger.warning("No flow proxy ('ofi_proxy' or 'signed_vol_delta') available in steps; skipping corr_action_flow")
+                    else:
+                        logger.warning("Insufficient non-NaN samples for %s to compute corr_action_flow", flow_col)
+            except Exception:
+                corr_action_flow = None
+            # Write metrics into dict
+            metrics['turnover'] = float(turnover)
+            metrics['entries'] = int(entries)
+            metrics['exits'] = int(exits)
+            metrics['flips'] = int(flips)
+            metrics['avg_abs_pos'] = float(avg_abs_pos)
+            metrics['avg_abs_dpos'] = float(avg_abs_dpos)
+            metrics['action_entropy'] = float(action_entropy)
+            metrics['corr_action_flow'] = corr_action_flow
+
+            # Runtime guard: if no short steps, emit WARN with config context and action dist
+            try:
+                short_steps = int((s['action'] < 0).sum()) if 's' in locals() else 0
+                if short_steps == 0:
+                    try:
+                        allow_sh = bool(self.settings.get('env', 'allow_shorts', default=True))
+                    except Exception:
+                        allow_sh = True
+                    try:
+                        max_short_exp = self.settings.get('env', 'max_short_exposure', default=None)
+                    except Exception:
+                        max_short_exp = None
+                    counts = s['action'].value_counts()
+                    logger.warning(f"NO_SHORTS detected: allow_shorts={allow_sh} max_short_exposure={max_short_exp} action_counts={counts.to_dict()}")
+            except Exception:
+                pass
+
+            # Parity flag will be set later after trade KPIs using steps/trades
+
+            # Baselines on test set (no_trade, vwap_fade, ofi_follow)
+            try:
+                # Build baselines from steps.parquet
+                pr = None
+                try:
+                    s = _pd.read_parquet(steps_path)
+                    pr = _pd.to_numeric(s['price'], errors='coerce')
+                except Exception:
+                    pr = _pd.to_numeric(data['close'], errors='coerce') if 'close' in data.columns else None
+                def _metrics_from_returns(ret_ser: _pd.Series) -> dict:
+                    ret = ret_ser.dropna()
+                    if ret.empty:
+                        return {'sharpe': 0.0, 'pf': 0.0, 'ret': 0.0, 'maxdd': 0.0}
+                    total_ret = float(ret.sum())
+                    vol = float(ret.std())
+                    sharpe = float((ret.mean() / (vol + 1e-12)) * (252 ** 0.5)) if vol > 0 else 0.0
+                    pos_sum = float(ret[ret > 0].sum())
+                    neg_sum = float(ret[ret < 0].sum())
+                    pf = float(pos_sum / (abs(neg_sum) + 1e-12)) if pos_sum > 0 else 0.0
+                    # Max drawdown from cumulative equity proxy
+                    eq = (1 + ret).cumprod()
+                    maxdd = float(((eq / eq.cummax()) - 1).min()) if len(eq) > 1 else 0.0
+                    return {'sharpe': sharpe, 'pf': pf, 'ret': total_ret, 'maxdd': maxdd}
+                baselines = {}
+                # No-trade: all zeros
+                baselines['no_trade'] = {'sharpe': 0.0, 'pf': 0.0, 'ret': 0.0, 'maxdd': 0.0}
+                if pr is not None and len(pr) > 1:
+                    price_ret = pr.pct_change(fill_method=None).fillna(0.0)
+                    # Ensure baselines dir
+                    baselines_dir = (output_dir.parent / 'baselines')
+                    try:
+                        baselines_dir.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                    # no_trade positions (all zeros) aligned to steps timeline
+                    try:
+                        s = _pd.read_parquet(steps_path)
+                        idx = s.index
+                        pos_nt = _pd.Series(0.0, index=idx, name='pos')
+                        (baselines_dir / 'no_trade_steps.parquet').unlink(missing_ok=True) if hasattr(baselines_dir, 'unlink') else None
+                        pos_nt.to_frame().to_parquet(baselines_dir / 'no_trade_steps.parquet', engine='pyarrow', index=True)
+                    except Exception:
+                        pos_nt = None
+                    # OFI-follow baseline from steps parquet (pos = sign(ofi_best))
+                    try:
+                        s = _pd.read_parquet(steps_path)
+                        if 'ofi_best' in s.columns and s['ofi_best'].notna().any():
+                            pos_ofi = _pd.Series(_np.sign(s['ofi_best'].fillna(0.0)), index=s.index, name='pos')
+                            pos_ofi.to_frame().to_parquet(baselines_dir / 'ofi_follow_steps.parquet', engine='pyarrow', index=True)
+                            ret_ser2 = pos_ofi.shift(1).fillna(0.0).to_numpy(dtype=float) * price_ret.reindex(s.index).fillna(0.0).to_numpy(dtype=float)
+                            baselines['ofi_follow'] = _metrics_from_returns(_pd.Series(ret_ser2, index=s.index))
+                    except Exception:
+                        pass
+                metrics['baselines'] = baselines
+                # Write diagnostics.csv with selected metrics (in ticker root alongside steps.parquet)
+                import csv as _csv
+                diag_out = output_dir.parent / 'diagnostics.csv'
+                rows: list[dict[str, object]] = []
+                # action_entropy first, then corr_action_flow
+                rows.append({'metric': 'action_entropy', 'value': float(metrics.get('action_entropy', 0.0) or 0.0)})
+                corr_val = metrics.get('corr_action_flow', None)
+                rows.append({'metric': 'corr_action_flow', 'value': (float(corr_val) if isinstance(corr_val, (int, float)) else '')})
+                if 'ofi_follow' in baselines:
+                    try:
+                        rows.append({'metric': 'ret_if_follow_ofi', 'value': float(baselines['ofi_follow'].get('ret', 0.0) or 0.0)})
+                    except Exception:
+                        rows.append({'metric': 'ret_if_follow_ofi', 'value': ''})
+                with diag_out.open('w', newline='') as f:
+                    w = _csv.DictWriter(f, fieldnames=['metric','value'])
+                    w.writeheader(); w.writerows(rows)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # --- Per-side KPIs & parity flag (single or portfolio) ---
+        try:
+            # Wherever possible, compute from the last used env (portfolio or single)
+            env_ref = None
+            try:
+                env_ref = vec_env.envs[0]
+            except Exception:
+                try:
+                    env_ref = single_env.envs[0]  # type: ignore[name-defined]
+                except Exception:
+                    env_ref = None
+            trades = []
+            if env_ref is not None and hasattr(env_ref, 'get_trades'):
+                trades = env_ref.get_trades()
+            import pandas as _pd
+            tdf = _pd.DataFrame(trades)
+            # Side masks
+            long_m = (tdf.get('direction') == 'long') if not tdf.empty else _pd.Series([], dtype=bool)
+            short_m = (tdf.get('direction') == 'short') if not tdf.empty else _pd.Series([], dtype=bool)
+            # Profit factor per side
+            def _pf(mask):
+                if tdf.empty or mask.sum() == 0:
+                    return 0.0
+                pnl = _pd.to_numeric(tdf.loc[mask, 'pnl'], errors='coerce').fillna(0.0)
+                pos = float(pnl[pnl > 0].sum())
+                neg = float(pnl[pnl < 0].sum())
+                return float(pos / (abs(neg) + 1e-12)) if (pos > 0 or neg < 0) else 0.0
+            # Return per side (sum pnl / sum notional)
+            def _ret(mask):
+                if tdf.empty or mask.sum() == 0:
+                    return 0.0
+                pnl = _pd.to_numeric(tdf.loc[mask, 'pnl'], errors='coerce').fillna(0.0)
+                units = _pd.to_numeric(tdf.loc[mask, 'units'] if 'units' in tdf.columns else tdf.loc[mask, 'quantity'] if 'quantity' in tdf.columns else _pd.Series(0.0, index=tdf.index), errors='coerce').abs().fillna(0.0)
+                entry = _pd.to_numeric(tdf.loc[mask, 'entry_price'], errors='coerce').fillna(0.0)
+                notional = (units * entry).replace(0.0, _pd.NA).fillna(0.0)
+                denom = float(notional.sum())
+                return float(pnl.sum() / (denom + 1e-12)) if denom > 0 else 0.0
+            long_pf = _pf(long_m)
+            short_pf = _pf(short_m)
+            long_ret = _ret(long_m)
+            short_ret = _ret(short_m)
+            # Inject into metrics where applicable
+            try:
+                metrics['long_pf'] = float(long_pf)
+                metrics['short_pf'] = float(short_pf)
+                metrics['long_ret'] = float(long_ret)
+                metrics['short_ret'] = float(short_ret)
+            except Exception:
+                pass
+            # Parity flag (deterministic from steps/trades): BOTH / ONLY_LONG / ONLY_SHORT / NONE
+            try:
+                steps_path = output_dir.parent / 'steps.parquet'
+                s = _pd.read_parquet(steps_path) if steps_path.exists() else _pd.DataFrame()
+            except Exception:
+                s = _pd.DataFrame()
+            has_long = False
+            has_short = False
+            try:
+                if not s.empty:
+                    has_long = bool(((s.get('action', _pd.Series(dtype=float)) > 0).any()) or ((s.get('pos', _pd.Series(dtype=float)) > 0).any()))
+                    has_short = bool(((s.get('action', _pd.Series(dtype=float)) < 0).any()) or ((s.get('pos', _pd.Series(dtype=float)) < 0).any()))
+            except Exception:
+                pass
+            # Also consider trade directions if present
+            try:
+                if not tdf.empty and 'direction' in tdf.columns:
+                    has_long = has_long or (tdf['direction'] == 'long').any()
+                    has_short = has_short or (tdf['direction'] == 'short').any()
+            except Exception:
+                pass
+            try:
+                flag = 'NONE'
+                if has_long and has_short:
+                    flag = 'BOTH'
+                elif has_long and not has_short:
+                    flag = 'ONLY_LONG'
+                elif has_short and not has_long:
+                    flag = 'ONLY_SHORT'
+                summary['parity_flag'] = flag
+                try:
+                    metrics['parity_flag'] = flag
+                except Exception:
+                    pass
+            except Exception:
+                summary['parity_flag'] = 'NONE'
+        except Exception:
+            pass
         with (output_dir / 'summary.json').open('w') as f:
             import json
             json.dump(summary, f, indent=2, default=str)
@@ -775,3 +1383,57 @@ class MultiTickerRLTrainer:
     def get_backtest_summary(self) -> Dict[str, Any]:
         # Expose a last-known summary if desired (not persisted across processes)
         return {}
+
+    # Compatibility convenience: train then backtest, and return an ArtifactBacktestResult
+    # by loading the artifacts the existing backtest method writes.
+    def train_and_backtest(
+        self,
+        *,
+        data: pd.DataFrame,
+        features: pd.DataFrame,
+        output_dir: Path,
+        eval_episodes: int = 1,
+    ) -> ArtifactBacktestResult:
+        if not isinstance(output_dir, Path):
+            output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model = self.train(data=data, features=features, output_dir=output_dir)
+        # Run backtest (existing method writes files)
+        _ = self.backtest(model=model, data=data, features=features, output_dir=output_dir, eval_episodes=eval_episodes)
+        # Load artifacts into a BacktestResult for a single ticker context
+        import pandas as _pd
+        # Steps
+        steps_path = output_dir.parent / 'steps.parquet'
+        try:
+            steps_df = _pd.read_parquet(steps_path) if steps_path.exists() else _pd.DataFrame()
+            if not steps_df.empty and 'timestamp' in steps_df.index.names:
+                steps_df.index.name = 'ts'
+        except Exception:
+            steps_df = _pd.DataFrame()
+        # Trades
+        try:
+            trades_df = _pd.read_csv(output_dir / 'trades.csv')
+        except Exception:
+            trades_df = _pd.DataFrame()
+        # Equity
+        try:
+            equity_df = _pd.read_csv(output_dir / 'portfolio_history.csv', index_col=0)
+            if 'equity' not in equity_df.columns and equity_df.shape[1] >= 1:
+                equity_df.columns = ['equity']
+        except Exception:
+            equity_df = _pd.DataFrame({'equity': []})
+        # Metrics summary
+        try:
+            import json as _json
+            metrics = _json.loads((output_dir / 'summary.json').read_text())
+        except Exception:
+            metrics = {}
+        feat_names = [c for c in features.columns]
+        return ArtifactBacktestResult(
+            trades=trades_df,
+            equity=equity_df,
+            steps=(steps_df if not steps_df.empty else None),
+            metrics=metrics,
+            feature_names=feat_names,
+            baselines={},
+        )

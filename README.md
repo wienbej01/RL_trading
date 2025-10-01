@@ -13,6 +13,7 @@ This system implements a sophisticated RL trading agent using PPO-LSTM architect
 - **Triple-Barrier Exits**: Profit targets, stop losses, and time-based exits
 - **Comprehensive Feature Engineering**: Technical indicators, microstructure features, time encoding
 - **Walk-Forward Validation**: Rigorous backtesting with temporal splits
+  - Embargoed Walk-Forward driver with CPCV feature screening (`scripts/run_wf.py`)
 - **Real-Time Monitoring**: Live performance dashboards and risk analytics
 - **Paper & Live Trading**: Seamless transition from simulation to live markets
 - **Extensive Testing**: 99%+ test coverage with unit, integration, and performance tests
@@ -155,6 +156,25 @@ When a backtest completes, the following artifacts are written under `<run>/back
   - return_pct: pnl / |entry_price * units|
   - trade_id, run_seed, window_start, window_end
 
+## 🚀 Embargoed Walk-Forward + CPCV (Sprint 1)
+
+- List windows (no training):
+  `python scripts/run_wf.py --config configs/settings.yaml --run-name demo --tickers AAPL MSFT \
+     --train-start 2024-01-01 --train-end 2024-03-31 --dry-run`
+
+- Full run with CPCV feature screening + PPO per window:
+  `python scripts/run_wf.py --config configs/settings.yaml --run-name demo --tickers AAPL MSFT \
+     --train-start 2024-01-01 --train-end 2024-03-31 --wf-train-days 60 --wf-valid-days 10 \
+     --wf-test-days 10 --wf-step-days 10 --embargo-min 15 --feature-pack curated --timesteps 100000`
+
+Flags:
+- `--no-cache`: bypass feature cache LOAD once (forces recompute) while still SAVING to the augmented cache path (hash includes run_name, screen_run, final_features, and micro proxies module hash).
+
+Purging/Embargo:
+- Purging removes training samples overlapping with test periods (time-based leakage).
+- Embargo adds a time buffer on both sides of the test set to prevent near-leakage.
+- CPCV computes consensus feature importance on the train set only, honoring the embargo.
+
 Flags & tips:
 - Use `--strict-test-window` to avoid fallback to a different test slice when the requested window is empty.
 - Limit evaluation to tickers with coverage via `--test-tickers`.
@@ -226,6 +246,23 @@ PYTHONPATH=. venv/bin/python scripts/polygon_bulk_ingest.py \
 - Time‑of‑day: cyclic encodings (hour/minute/day), market‑open flags; can be toggled off.
 - Pruning: low variance filter and correlation threshold.
 
+### OHLCV Microstructure Proxies (canonical)
+
+When L1 quotes are unavailable, we compute these OHLCV‑only proxies and use them consistently in curated packs, diagnostics, and steps:
+
+- `ofi_proxy`: tick‑rule flow proxy z‑scored by day
+- `bar_imbalance`: (close − open)/(high − low) clipped to [-1, 1]
+- `signed_vol_delta`: sign(Δclose) * Δvolume (day z‑score)
+- `spread_bps_hl`: (rolling‑median(high − low)/close) × 1e4
+- `quote_intensity_proxy`: zscore of rolling root‑sum‑squared returns
+- `queue_imbalance_proxy`: (vol_up − vol_down)/(vol_up + vol_down)
+
+L1→OHLCV remapping in pipeline (when L1 absent): ofi_best→ofi_proxy, spread_bps→spread_bps_hl, quote_intensity→quote_intensity_proxy, queue_imbalance→queue_imbalance_proxy.
+
+Curated packs now resolve to: `curated_topN ∪ MICROSTRUCTURE_OHLCV` (dedup, curated order first) and we expose a `LAST_CURATED_CACHE_TOKEN` so feature caches invalidate when curated changes.
+
+Diagnostics compute `corr_action_flow` against the first available flow proxy (`ofi_proxy` then `signed_vol_delta`). `steps.parquet` always carries a flow proxy — attached from features if present, or derived minimally from OHLCV.
+
 Feature generation prints a summary so you can verify VIX/SMT/ICT/VPA coverage.
 
 ## ⚙️ Training Settings (CPU‑only optimized)
@@ -241,6 +278,7 @@ Feature generation prints a summary so you can verify VIX/SMT/ICT/VPA coverage.
 
 - `scripts/collect_polygon_us_stocks.py` — upgraded US stocks downloader (parallel, per‑day aggregates, reference, fundamentals, CA, snapshots)
 - `scripts/aggregate_us_stock_data.py` — aggregate per‑day minute files to `data/raw/<TICKER>_1min.parquet`
+- `scripts/audit_pipeline.py` — forensic audit for a single WF window/ticker; hard‑fails if proxies/diagnostics/cost parity do not reconcile.
 - `scripts/download_vix_data.py` — Yahoo (^VIX, ^VIX9D, ^VIX3M) to `data/external/vix.parquet`
 - `scripts/download_vix_term_structure.py` — Polygon indices with fallback (may be restricted)
 - `scripts/ingest_external_vix.py` — ingest Databento/FRED/CBOE VIX files into unified parquet
@@ -877,3 +915,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Built with ❤️ by the RL Trading Team**
+## 📚 Documentation
+
+- Technical overview: `docs/TECHNICAL_OVERVIEW.md`
+- Trade logic and environments: `docs/TRADE_LOGIC.md`
+- User guide (install → WF/CPCV): `docs/USER_GUIDE.md`

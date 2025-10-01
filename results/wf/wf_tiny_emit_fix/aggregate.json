@@ -1,0 +1,32 @@
+{
+  "agg_sharpe": NaN,
+  "agg_pf": NaN,
+  "agg_ret": NaN,
+  "agg_maxdd": NaN,
+  "trades_total": 0,
+  "long_total": 0,
+  "short_total": 0,
+  "costs_total": 0.0,
+  "windows": [
+    {
+      "window": 0,
+      "sharpe_ratio": NaN,
+      "profit_factor": NaN,
+      "total_return": NaN,
+      "max_drawdown": NaN,
+      "total_trades": 0,
+      "long_trades": 0,
+      "short_trades": 0,
+      "tx_costs_total": 0.0,
+      "no_shorts_tickers": 0
+    }
+  ],
+  "tickers": [
+    "SPY"
+  ],
+  "skipped_windows": [],
+  "no_shorts_windows": 0,
+  "no_shorts_tickers_total": 0,
+  "parity_violations": [],
+  "parity_ok": true
+}

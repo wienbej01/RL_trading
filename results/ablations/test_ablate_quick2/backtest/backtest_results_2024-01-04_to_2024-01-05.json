@@ -1,0 +1,42 @@
+{
+  "tickers": [
+    "AAPL",
+    "MSFT"
+  ],
+  "portfolio_metrics": {
+    "mean_reward": 160.7479726736201,
+    "std_reward": 0.0,
+    "mean_length": 548.0,
+    "std_length": 0.0,
+    "max_reward": 160.7479726736201,
+    "min_reward": 160.7479726736201,
+    "total_return": 0.0016074799999943935,
+    "annual_return": 0.0007424771276096642,
+    "annual_volatility": 0.002681569226404889,
+    "sharpe_ratio": 0.2767792489202185,
+    "max_drawdown": -0.0020185572241802063,
+    "calmar_ratio": 0.36768971021224356,
+    "win_rate": 1.0,
+    "profit_factor": 167500000000001.12,
+    "sortino_ratio": 0.20352925194290214,
+    "total_trades": 2,
+    "long_trades": 1,
+    "short_trades": 1,
+    "avg_duration_minutes": 126.0,
+    "avg_duration_minutes_long": 10.0,
+    "avg_duration_minutes_short": 242.0,
+    "avg_pnl": 83.75000000000057,
+    "avg_pnl_long": 54.000000000002046,
+    "avg_pnl_short": 113.49999999999909,
+    "long_steps": 0,
+    "short_steps": 232,
+    "flat_steps": 316,
+    "flips": 0,
+    "turnover": 400.0,
+    "exposure_pct": 0.08706125351973591,
+    "tx_costs_total": 400.0,
+    "tx_costs_per_trade": 200.0,
+    "daily_sharpe_proxy": 0.0,
+    "intraday_max_drawdown": -0.0020185572241802063
+  }
+}

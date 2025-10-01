@@ -238,6 +238,41 @@ walkforward:
   test_size: 0.2
   regime_aware: true
   aggregation_method: "median"
+
+# Tiny-smoke defaults for equities (SPY) — realistic bps-based costs
+costs:
+  commission_bps: 0.2   # 0.20 bps of notional per trade
+  spread_bps: 0.3       # 0.30 bps of notional per trade
+  slippage_bps: 0.2     # 0.20 bps of notional per trade
+  impact_k: 0.0         # additional impact multiplier on notional (0 to disable)
+
+position:
+  unit_size: 1.0        # shares per unit quantity
+
+# New: sprint-1 walk-forward + CPCV settings
+wf:
+  enabled: true
+  train_days: 60
+  valid_days: 10
+  test_days: 10
+  step_days: 10
+  embargo_min: 15
+  timezone: "America/New_York"
+  strict_test_window: true
+  tz: America/New_York
+
+tuning:
+  optuna_trials: 0
+
+reward:
+  mix:
+    dsr: 1.0
+    turnover: 0.2
+    inventory: 0.05
+    cvar: 0.0
+
+logging:
+  level: INFO
   
   # Fold configuration
   fold_config:
@@ -504,6 +539,7 @@ normalize:
 env:
   max_steps: 390
   reward_scaling: 0.1
+  allow_shorts: true
   reward:
     kind: hybrid2
     alpha: 0.15

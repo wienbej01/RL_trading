@@ -1,0 +1,33 @@
+{
+  "pooled": {
+    "window": 0,
+    "sharpe_ratio": NaN,
+    "profit_factor": NaN,
+    "total_return": NaN,
+    "max_drawdown": NaN,
+    "total_trades": 0,
+    "long_trades": 0,
+    "short_trades": 0,
+    "tx_costs_total": 0.0,
+    "no_shorts_tickers": 0
+  },
+  "per_ticker": [
+    {
+      "ticker": "SPY",
+      "window": 0,
+      "sharpe": 0.0,
+      "pf": 0.0,
+      "ret": 0.0,
+      "maxdd": 0.0,
+      "trades": 0,
+      "tx_costs_total": 0.0,
+      "long_trades": 0,
+      "short_trades": 0,
+      "long_pf": null,
+      "short_pf": null,
+      "long_ret": null,
+      "short_ret": null,
+      "parity_flag": "BOTH"
+    }
+  ]
+}

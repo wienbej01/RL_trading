@@ -1,0 +1,12 @@
+{
+  "config_file": "configs/settings.yaml",
+  "train_start": "2024-06-01",
+  "train_end": "2024-08-15",
+  "test_start": "2024-08-16",
+  "test_end": "2024-09-30",
+  "tickers": [
+    "SPY"
+  ],
+  "output_dir": "results/mt_cluster_core",
+  "timestamp": "2025-09-23T12:40:16.772298"
+}

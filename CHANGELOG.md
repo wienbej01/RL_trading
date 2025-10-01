@@ -11,3 +11,19 @@
 - Added KLStopCallback, AdaptiveLRByKL, and LiveLRBump callbacks; wired into trainer
 - New script `scripts/lr_bump.sh` to nudge LR mid‑run without restart
 - Static low‑price universe runner `scripts/run_lowpx_portfolio.sh` and universe list
+
+## Align features and diagnostics to OHLCV proxies; add artifacts and audit
+
+### Added
+- OHLCV microstructure proxies alignment across packs, pipeline, diagnostics, and runner.
+- L1→OHLCV remapping in pipeline when quotes are unavailable.
+- `corr_action_flow` diagnostics and guaranteed flow proxy in steps.parquet (derive if missing).
+- Artifacts writer (`src/utils/artifacts.py`) and audit script (`scripts/audit_pipeline.py`).
+- Feature cache key augmentation and `--no-cache` flag in `scripts/run_wf.py`.
+
+### Changed
+- Curated packs now resolve to `curated_topN ∪ MICROSTRUCTURE_OHLCV` and expose `LAST_CURATED_CACHE_TOKEN`.
+- Runner logs, checks, and tests updated to use OHLCV proxies nomenclature.
+
+### Tests
+- Added tests for OHLCV proxies, diagnostics flow correlation, and artifacts writing.

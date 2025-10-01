@@ -1,0 +1,31 @@
+{
+  "windows": [
+    {
+      "window": {
+        "start": "2020-09-14 07:00:00-04:00",
+        "end": "2020-09-17 15:07:00-04:00"
+      },
+      "status": "skip_empty"
+    },
+    {
+      "window": {
+        "start": "2020-09-17 15:07:00-04:00",
+        "end": "2020-09-23 14:42:00-04:00"
+      },
+      "status": "skip_empty"
+    },
+    {
+      "window": {
+        "start": "2020-09-23 14:43:00-04:00",
+        "end": "2020-09-29 15:06:00-04:00"
+      },
+      "status": "skip_empty"
+    }
+  ],
+  "aggregate": {
+    "median_sharpe": null,
+    "median_trades_per_day": null,
+    "worst_quintile_avg_pnl": null,
+    "max_drawdown_worst": null
+  }
+}

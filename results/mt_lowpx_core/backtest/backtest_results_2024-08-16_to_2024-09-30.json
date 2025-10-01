@@ -1,0 +1,33 @@
+{
+  "tickers": [
+    "SNAP"
+  ],
+  "portfolio_metrics": {
+    "mean_reward": -42.57099743152503,
+    "std_reward": 0.0,
+    "mean_length": 9452.0,
+    "std_length": 0.0,
+    "max_reward": -42.57099743152503,
+    "min_reward": -42.57099743152503,
+    "total_return": -0.00042571000001349603,
+    "annual_return": -1.135037514410353e-05,
+    "annual_volatility": 6.0692008626494864e-05,
+    "sharpe_ratio": -0.18701698276399784,
+    "max_drawdown": -0.0006350394953201777,
+    "calmar_ratio": -0.01787359586870016,
+    "win_rate": 0.4473684210526316,
+    "profit_factor": 1.377183695076738,
+    "sortino_ratio": -0.04828839965011895,
+    "total_trades": 38,
+    "long_trades": 2,
+    "short_trades": 36,
+    "avg_duration_minutes": 10.552631578947368,
+    "avg_duration_minutes_long": 10.0,
+    "avg_duration_minutes_short": 10.583333333333334,
+    "avg_pnl": 0.37500000000000955,
+    "avg_pnl_long": -1.4649999999999608,
+    "avg_pnl_short": 0.4772222222222301,
+    "daily_sharpe_proxy": -4.640386161487043,
+    "intraday_max_drawdown": -0.0006350394953201777
+  }
+}

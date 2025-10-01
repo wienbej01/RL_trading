@@ -149,8 +149,10 @@ class PortfolioRLEnv(Env):
         self.index = common_idx
         self.n = len(self.index)
         self.N = len(self.tickers)
-        self.feat_sizes = feat_sizes
-        self.feature_dim = int(sum(feat_sizes))
+        # Track feature sizes as inferred from current X map
+        self.feat_sizes = [int(self.X[t].shape[1]) if t in self.X else 0 for t in self.tickers]
+        # Derive feature_dim directly from X to avoid drift vs. later mutations
+        self.feature_dim = int(sum(int(self.X[t].shape[1]) for t in self.tickers if t in self.X))
 
         # Determine bar duration in minutes robustly (ignore large gaps and day changes)
         try:
@@ -174,15 +176,24 @@ class PortfolioRLEnv(Env):
         # Spaces: MultiDiscrete(3 per ticker) → map to {-1,0,1}
         self.action_space = MultiDiscrete([3] * self.N)
         # Obs = concatenated features + current positions per ticker
-        self.observation_space = Box(low=-np.inf, high=np.inf, shape=(self.feature_dim + self.N,), dtype=np.float32)
+        # Build shape defensively from current X
+        obs_len = int(self.feature_dim + self.N)
+        self.observation_space = Box(low=-np.inf, high=np.inf, shape=(obs_len,), dtype=np.float32)
 
         # Exec params
         try:
             self.point_value = float(self.settings.get("execution", "point_value", default=1.0))
             self.tc_per_trade = float(self.settings.get("execution", "commission_per_contract", default=0.0))
+            # Optional microstructure params used for trade cost approximation
+            self.spread_ticks = int(self.settings.get("execution", "spread_ticks", default=1))
+            self.impact_bps = float(self.settings.get("execution", "impact_bps", default=0.0))
+            self.slippage_bps = float(self.settings.get("execution", "slippage_bps", default=0.0))
         except Exception:
             self.point_value = 1.0
             self.tc_per_trade = 0.0
+            self.spread_ticks = 1
+            self.impact_bps = 0.0
+            self.slippage_bps = 0.0
 
         # Precompute ATR per ticker
         self.atr_map: Dict[str, pd.Series] = {}
@@ -215,6 +226,21 @@ class PortfolioRLEnv(Env):
         pos = self.pos.astype(np.float32)
         out = np.concatenate([*feats, pos], axis=0).astype(np.float32)
         out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        # Guard: ensure observation matches declared space; pad/truncate if needed
+        expected = int(self.observation_space.shape[0])
+        got = int(out.shape[0])
+        if got != expected:
+            try:
+                import warnings as _warn
+                if got > expected:
+                    _warn.warn(f"PortfolioRLEnv: truncating obs from {got} to {expected} dims to match observation_space")
+                    out = out[:expected]
+                else:  # got < expected
+                    _warn.warn(f"PortfolioRLEnv: padding obs from {got} to {expected} dims to match observation_space")
+                    out = np.pad(out, (0, expected - got), mode='constant', constant_values=0.0)
+            except Exception:
+                # Best-effort fallback
+                out = (out[:expected] if got > expected else np.pad(out, (0, expected - got), mode='constant'))
         return out
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
@@ -224,6 +250,10 @@ class PortfolioRLEnv(Env):
         self.pos = np.zeros((self.N,), dtype=np.int32)
         self.equity = float(self.cash)
         self.equity_curve: List[float] = [self.equity]
+        # Diagnostics & logging accumulators
+        self._action_counts = {'long': 0, 'short': 0, 'flat': 0}
+        self._flips = 0
+        self.tx_costs_total = 0.0  # commission + spread + slippage + impact (estimated)
         # Preserve last snapshots across auto-reset; do not clear here
         if not hasattr(self, '_last_equity_curve'):
             self._last_equity_curve = None
@@ -250,7 +280,6 @@ class PortfolioRLEnv(Env):
         a = np.asarray(action).reshape(-1)
         desired = (a - 1).astype(np.int32)
         desired = np.clip(desired, -1, 1)
-
         # Time and session bookkeeping
         ts_cur = self.index[self.i]
         day_cur = ts_cur.date()
@@ -377,6 +406,16 @@ class PortfolioRLEnv(Env):
             # charge per unit changed (commission per share/contract)
             tc = float(np.sum(np.abs(change_units))) * float(self.tc_per_trade)
             self.cash -= tc
+            # Track full microstructure cost estimate (commission + spread + slippage + impact)
+            try:
+                prices_arr = prices if isinstance(prices, np.ndarray) else np.asarray(prices, dtype=float)
+            except Exception:
+                prices_arr = np.zeros_like(change_units, dtype=float)
+            units_abs = np.abs(change_units).astype(float)
+            spread_cost = float(self.spread_ticks) * float(self.point_value) * float(np.sum(units_abs))
+            slippage_cost = float(self.slippage_bps) / 10000.0 * float(np.nansum(prices_arr * units_abs))
+            impact_cost = float(self.impact_bps) / 10000.0 * float(np.nansum(prices_arr * units_abs))
+            self.tx_costs_total = float(self.tx_costs_total) + float(tc) + float(spread_cost) + float(slippage_cost) + float(impact_cost)
 
         # Set new positions (sign) and units
         self.pos = desired
@@ -435,10 +474,31 @@ class PortfolioRLEnv(Env):
             else:
                 self.hold_bars[k] = 0
         self.daily_entries += new_daily_entries
+        # Net direction counts and flips (per-ticker sign flips)
+        try:
+            prev_net = int(np.sign(np.sum(prev_pos)))
+            cur_net = int(np.sign(np.sum(self.pos)))
+            if cur_net > 0:
+                self._action_counts['long'] += 1
+            elif cur_net < 0:
+                self._action_counts['short'] += 1
+            else:
+                self._action_counts['flat'] += 1
+            flips_this_step = int(np.sum((prev_pos != 0) & (self.pos != 0) & (np.sign(prev_pos) != np.sign(self.pos))))
+            self._flips = int(self._flips) + int(flips_this_step)
+        except Exception:
+            pass
+        # Exposure diagnostics
+        try:
+            exposure_pct = float(gross_exposure_val / max(1e-6, float(self.equity)))
+        except Exception:
+            exposure_pct = 0.0
         self.history.append({
             'timestamp': ts,
             'equity': float(self.equity),
             'turnover': step_turnover,
+            'gross_exposure': float(gross_exposure_val),
+            'exposure_pct': float(exposure_pct),
             'open_positions': open_count,
             'daily_entries': int(self.daily_entries),
             **{f'pos_{t}': int(self.pos[k]) for k, t in enumerate(self.tickers)},
@@ -455,6 +515,19 @@ class PortfolioRLEnv(Env):
             except Exception:
                 prev_close_prices[t] = 0.0
                 cur_close_prices[t] = 0.0
+        # Update MFE/MAE trackers on open trades using current bar extremes
+        for k, t in enumerate(self.tickers):
+            ot = self._open_trades.get(t)
+            if ot is None:
+                continue
+            try:
+                cur_high = float(self.ohlcv[t]['high'].iloc[self.i])
+                cur_low = float(self.ohlcv[t]['low'].iloc[self.i])
+            except Exception:
+                cur_high = cur_close_prices.get(t, 0.0)
+                cur_low = cur_close_prices.get(t, 0.0)
+            ot['max_high'] = max(cur_high, float(ot.get('max_high', cur_high)))
+            ot['min_low'] = min(cur_low, float(ot.get('min_low', cur_low)))
         for k, t in enumerate(self.tickers):
             prev = int(prev_pos[k])
             cur = int(self.pos[k])
@@ -469,6 +542,23 @@ class PortfolioRLEnv(Env):
                     duration_minutes = float(duration_bars) * float(getattr(self, 'bar_minutes', 1.0))
                     dir_sign = 1 if ot.get('direction') == 'long' else -1
                     pnl = dir_sign * (exit_price - float(ot.get('entry_price', 0.0))) * float(abs(int(ot.get('units', 0)))) * float(self.point_value)
+                    # Compute MFE/MAE in PnL terms using recorded extremes
+                    entry_price = float(ot.get('entry_price', 0.0))
+                    units_abs = float(abs(int(ot.get('units', 0))))
+                    max_high = float(ot.get('max_high', exit_price))
+                    min_low = float(ot.get('min_low', exit_price))
+                    if dir_sign > 0:  # long
+                        mfe = (max_high - entry_price) * units_abs * float(self.point_value)
+                        mae = (entry_price - min_low) * units_abs * float(self.point_value)
+                    else:  # short
+                        mfe = (entry_price - min_low) * units_abs * float(self.point_value)
+                        mae = (max_high - entry_price) * units_abs * float(self.point_value)
+                    # Approximate round-trip costs (commission, slippage, impact)
+                    avg_price = 0.5 * (entry_price + exit_price)
+                    commission = self.tc_per_trade * units_abs * 2.0 if self.tc_per_trade > 0 else 0.0
+                    spread_cost = float(self.spread_ticks) * float(self.point_value) * units_abs  # round-trip approx
+                    slippage_cost = (self.slippage_bps / 10000.0) * avg_price * units_abs * 2.0
+                    impact_cost = (self.impact_bps / 10000.0) * avg_price * units_abs * 2.0
                     rec = {
                         'ticker': t,
                         'direction': ot.get('direction'),
@@ -479,7 +569,14 @@ class PortfolioRLEnv(Env):
                         'units': int(abs(int(ot.get('units', 0)))),
                         'duration_bars': int(duration_bars),
                         'duration_minutes': float(duration_minutes),
-                        'pnl': float(pnl)
+                        'pnl': float(pnl),
+                        'mfe': float(mfe),
+                        'mae': float(mae),
+                        'commission': float(commission),
+                        'spread_cost': float(spread_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'total_cost_est': float(commission + spread_cost + slippage_cost + impact_cost),
                     }
                     self.trades.append(rec)
                 self._open_trades[t] = None
@@ -494,6 +591,8 @@ class PortfolioRLEnv(Env):
                     'entry_i': int(self.i),
                     'entry_price': float(entry_price),
                     'units': int(abs(units)),
+                    'max_high': float(self.ohlcv[t]['high'].iloc[self.i]) if 'high' in self.ohlcv[t].columns else float(entry_price),
+                    'min_low': float(self.ohlcv[t]['low'].iloc[self.i]) if 'low' in self.ohlcv[t].columns else float(entry_price),
                 }
 
         # Advance time
@@ -522,6 +621,13 @@ class PortfolioRLEnv(Env):
                 self._last_trades = list(self.trades)
             except Exception:
                 self._last_trades = []
+            # Snapshot diagnostics that will be cleared on reset
+            try:
+                self._last_action_counts = dict(self._action_counts)
+                self._last_flips = int(self._flips)
+                self._last_tx_costs_total = float(getattr(self, 'tx_costs_total', 0.0))
+            except Exception:
+                pass
         return obs, float(reward), terminated, truncated, info
 
     # Helper to export equity curve
@@ -543,3 +649,26 @@ class PortfolioRLEnv(Env):
         if hasattr(self, '_last_trades') and self.trades == []:
             return list(self._last_trades)
         return list(self.trades)
+
+    # --- Added: action counts API ---
+    def get_action_counts(self) -> Dict[str, int]:
+        """Return counts of net-long/short/flat steps and flips across tickers.
+
+        long/short/flat are counted by net portfolio direction per step.
+        flips counts per-ticker sign flips when both sides are non-zero.
+        """
+        try:
+            counts = dict(self._action_counts)
+            flips = int(getattr(self, '_flips', 0))
+            # Prefer last snapshot if current counters are empty/reset by VecEnv
+            if (counts.get('long', 0) + counts.get('short', 0) + counts.get('flat', 0)) == 0 and hasattr(self, '_last_action_counts'):
+                counts = dict(getattr(self, '_last_action_counts', {}))
+                flips = int(getattr(self, '_last_flips', flips))
+            return {
+                'long_steps': int(counts.get('long', 0)),
+                'short_steps': int(counts.get('short', 0)),
+                'flat_steps': int(counts.get('flat', 0)),
+                'flips': int(flips),
+            }
+        except Exception:
+            return {'long_steps': 0, 'short_steps': 0, 'flat_steps': 0, 'flips': 0}

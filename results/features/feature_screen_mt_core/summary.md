@@ -1,0 +1,55 @@
+# Feature Screening Summary
+
+Run: feature_screen_mt_core
+
+## Top 50 (consensus)
+- bar_imbalance: 0.000
+- bb_lower: 0.000
+- bb_middle: 0.000
+- bb_upper: 0.000
+- bos_down: 0.000
+- bos_up: 0.000
+- delta_vol: 0.000
+- direction_ema: 0.000
+- dist_cdo_bp: 0.000
+- dist_cdo_bp_atr: 0.000
+- dist_eq_high: 0.000
+- dist_eq_low: 0.000
+- dist_last_swing_high: 0.000
+- dist_last_swing_low: 0.000
+- dist_pdh_bp: 0.000
+- dist_pdl_bp: 0.000
+- dist_pdm_mid: 0.000
+- dist_pdo_bp: 0.000
+- dist_pp_bp: 0.000
+- dist_r1_bp: 0.000
+- dist_rollmax_bp: 0.000
+- dist_rollmax_bp_atr: 0.000
+- dist_rollmin_bp: 0.000
+- dist_rollmin_bp_atr: 0.000
+- dist_s1_bp: 0.000
+- dist_s2_bp: 0.000
+- dist_session_vwap: 0.000
+- dist_session_vwap_atr: 0.000
+- dist_vwap: 0.000
+- dist_vwap_atr: 0.000
+- effort_result: 0.000
+- ema_50: 0.000
+- eq_high_flag: 0.000
+- eq_low_flag: 0.000
+- imbalance_persist: 0.000
+- intrabar_vol: 0.000
+- macd: 0.000
+- macd_histogram: 0.000
+- macd_line: 0.000
+- macd_signal: 0.000
+- minute_sin: 0.000
+- price_impact: 0.000
+- regime_trend: 0.000
+- regime_trend_sign: 0.000
+- rsi_14: 0.000
+- sma_20: 0.000
+- sma_50: 0.000
+- spread: 0.000
+- swing_high_flag: 0.000
+- swing_low_flag: 0.000

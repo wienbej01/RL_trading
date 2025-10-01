@@ -32,6 +32,8 @@ class EnvConfig:
     reward_type: str = 'dsr'  # 'dsr', 'pnl', 'sharpe'
     penalty_factor: float = 0.1
     reward_scaling: float = 0.1
+    allow_shorts: bool = True
+    allow_long: bool = True
 
 
 class IntradayRLEnv(Env):
@@ -79,6 +81,17 @@ class IntradayRLEnv(Env):
         self.point_value = point_value
         self.env_config = env_config or EnvConfig(cash=cash)
         self.config = config  # Store config for compatibility
+        logger.info(f"allow_shorts={getattr(self.env_config, 'allow_shorts', True)}")
+        # Parity enforcement: equities require allow_shorts=True
+        if not bool(getattr(self.env_config, 'allow_shorts', True)):
+            raise ValueError("EnvConfig.allow_shorts must be True for equity runs (parity enforcement)")
+        # Optional: max_short_exposure must be None or > 0 if present in settings
+        try:
+            msexp = self.settings.get('env', 'max_short_exposure', default=None)
+            if msexp is not None and float(msexp) <= 0:
+                raise ValueError("max_short_exposure must be > 0 when allow_shorts=True")
+        except Exception:
+            pass
 
         # Data
         self.ohlcv = ohlcv[['open', 'high', 'low', 'close', 'volume']].copy()
@@ -217,6 +230,8 @@ class IntradayRLEnv(Env):
         self._daily_trade_count = 0
         self._day_return_sum = 0.0
         self._day_return_count = 0
+        # Episode step counter for truncation by max_steps
+        self._steps_in_episode = 0
         # Lagrangian multiplier for activity soft-constraint
         try:
             self._lambda_activity = float(self.config.get('env', {}).get('reward', {}).get('activity', {}).get('lambda_init', 0.0)) if isinstance(self.config, dict) else 0.0
@@ -227,11 +242,26 @@ class IntradayRLEnv(Env):
         self._dd_slope_ema = 0.0
         # Last action direction for churn penalty
         self._last_action_dir = 0
+        # Action counts (for diagnostics)
+        self._act_counts = {"long": 0, "short": 0, "flat": 0}
+        # Flip tracker and cumulative tx costs (commission+spread+slippage+impact)
+        self._flips = 0
+        self._last_nonzero_dir = 0
+        self.tx_costs_total = 0.0
+        # Composite reward accumulators and diagnostics
+        self._sum_abs_pos = 0.0
+        self._sum_abs_dpos = 0.0
+        self._reward_steps = 0
+        self._diagnostics = []
         
         # Reset risk manager
         self.risk_manager.reset_daily_metrics()
     
     def reset(self, seed=None, options: Dict[str, Any] = None):
+        self._act_counts = {'long':0,'short':0,'flat':0}
+        self._flips = 0
+        self._last_nonzero_dir = 0
+        self.tx_costs_total = 0.0
         """
         Reset environment.
         
@@ -285,6 +315,7 @@ class IntradayRLEnv(Env):
             self.i = int(fallback_idx) if fallback_idx is not None else max(0, len(self.df) - 1)
 
         ts = self.df.index[self.i]
+        prev_pos = int(getattr(self, 'pos', 0))
         obs = self._obs(ts, float(self.df["close"].iloc[self.i]))
         
         return obs, {}
@@ -313,6 +344,11 @@ class IntradayRLEnv(Env):
 
         # Current bar
         ts = self.df.index[self.i]
+        # Increment episode step count early
+        try:
+            self._steps_in_episode = int(self._steps_in_episode) + 1
+        except Exception:
+            self._steps_in_episode = 1
         # Reset daily counters on date change
         try:
             cur_date = ts.date()
@@ -357,14 +393,44 @@ class IntradayRLEnv(Env):
         # Execute action mapping used by this environment (internal actions 0,1,2 map to -1,0,1 dir)
         # Robust containment check now that act is an int
         desired_dir = {-1: -1, 0: 0, 1: 1}[act - 1] if act in (0, 1, 2) else 0
+        # Respect environment setting for shorting
+        if not bool(getattr(self.env_config, "allow_shorts", True)) and desired_dir < 0:
+            desired_dir = 0
+        # Count action intent
+        try:
+            if desired_dir > 0:
+                self._act_counts["long"] += 1
+            elif desired_dir < 0:
+                self._act_counts["short"] += 1
+            else:
+                self._act_counts["flat"] += 1
+            # Count flips across consecutive non-zero action intents
+            if desired_dir != 0 and self._last_nonzero_dir != 0 and int(np.sign(desired_dir)) != int(np.sign(self._last_nonzero_dir)):
+                self._flips = int(self._flips) + 1
+            if desired_dir != 0:
+                self._last_nonzero_dir = int(np.sign(desired_dir))
+        except Exception:
+            pass
         reward = 0.0
         info: Dict[str, Any] = {}
 
         # Flatten at EOD regardless of action
         if self._eod(ts):
             if self.pos != 0:
-                # charge closing cost
-                tc = estimate_tc(self.pos, price, self.exec_sim)
+                # charge closing cost (once)
+                try:
+                    side = 'sell' if self.pos > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(getattr(self.exec_sim.exec_params, 'spread_ticks', 0) * getattr(self.exec_sim.exec_params, 'tick_value', 0.0) * abs(int(self.pos)))
+                    total_cost = commission_cost + slippage_cost + impact_cost + spread_cost
+                except Exception:
+                    total_cost = estimate_tc(self.pos, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = 0.0
+                    spread_cost = 0.0
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
                 # Log close event at EOD
                 try:
                     open_ts = getattr(self, '_open_ts', None)
@@ -373,7 +439,7 @@ class IntradayRLEnv(Env):
                     direction = 'long' if self.pos > 0 else 'short'
                     exit_price = float(price)
                     gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
-                    net_pnl = gross_pnl - entry_tc - float(tc)
+                    net_pnl = gross_pnl - entry_tc - float(total_cost)
                     self.trades.append({
                         'ts': ts,
                         'pos': 0,
@@ -386,14 +452,19 @@ class IntradayRLEnv(Env):
                         'exit_price': float(exit_price),
                         'quantity': qty,
                         'direction': direction,
+                        'gross_pnl': float(gross_pnl),
                         'pnl': float(net_pnl),
                         'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
                         'commission_entry': float(entry_tc),
-                        'commission_exit': float(tc)
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
                     })
                 except Exception:
                     pass
-                self.cash -= tc
+                self.cash -= float(total_cost)
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -442,6 +513,11 @@ class IntradayRLEnv(Env):
                 ) else self.stop_price
                 pnl_exit = (exit_price - self.entry_price) * self.pos * self.point_value
                 tc_exit = estimate_tc(self.pos, float(exit_price), self.exec_sim)
+                try:
+                    spread_cost = float(getattr(self.exec_sim.exec_params, 'spread_ticks', 0)) * float(getattr(self.exec_sim.exec_params, 'tick_value', 0.0)) * abs(int(self.pos))
+                    self.tx_costs_total = float(self.tx_costs_total) + float(tc_exit) + float(spread_cost)
+                except Exception:
+                    self.tx_costs_total = float(self.tx_costs_total) + float(tc_exit)
                 self.cash += pnl_exit - tc_exit
                 # Log trade close with PnL/duration metadata
                 try:
@@ -477,9 +553,9 @@ class IntradayRLEnv(Env):
 
         # Time-stop (max holding minutes)
         try:
-            max_hold = int(self.config.get('env', {}).get('trading', {}).get('max_holding_minutes', 0)) if isinstance(self.config, dict) else 0
+            max_hold = int(self.config.get('env', {}).get('trading', {}).get('max_hold_minutes', 120)) if isinstance(self.config, dict) else 120
         except Exception:
-            max_hold = 0
+            max_hold = 120
         if max_hold and self.pos != 0:
             # approximate bar count equals minutes since entry
             # track entry step index lazily
@@ -488,7 +564,19 @@ class IntradayRLEnv(Env):
             held = self.i - int(self.entry_index)
             if held >= max_hold:
                 # flatten at market price with transaction cost
-                tc_exit = estimate_tc(self.pos, price, self.exec_sim)
+                try:
+                    side = 'sell' if self.pos > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(getattr(self.exec_sim.exec_params, 'spread_ticks', 0) * getattr(self.exec_sim.exec_params, 'tick_value', 0.0) * abs(int(self.pos)))
+                    total_cost = commission_cost + slippage_cost + impact_cost + spread_cost
+                except Exception:
+                    total_cost = estimate_tc(self.pos, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = 0.0
+                    spread_cost = 0.0
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
                 try:
                     # Log trade close with PnL/duration metadata
                     open_ts = getattr(self, '_open_ts', None)
@@ -497,26 +585,32 @@ class IntradayRLEnv(Env):
                     direction = 'long' if self.pos > 0 else 'short'
                     exit_price = float(price)
                     gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
-                    net_pnl = gross_pnl - entry_tc - float(tc_exit)
+                    net_pnl = gross_pnl - entry_tc - float(total_cost)
                     self.trades.append({
                         'ts': ts,
                         'pos': 0,
                         'price': float(exit_price),
                         'action': 'close',
+                        'reason': 'max_hold',
                         'entry_time': open_ts if open_ts is not None else ts,
                         'exit_time': ts,
                         'entry_price': float(self.entry_price),
                         'exit_price': float(exit_price),
                         'quantity': qty,
                         'direction': direction,
+                        'gross_pnl': float(gross_pnl),
                         'pnl': float(net_pnl),
                         'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
                         'commission_entry': float(entry_tc),
-                        'commission_exit': float(tc_exit)
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
                     })
                 except Exception:
                     pass
-                self.cash -= tc_exit
+                self.cash -= float(total_cost)
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -587,9 +681,21 @@ class IntradayRLEnv(Env):
                 self.pos = contracts * int(np.sign(desired_dir))
                 self.entry_price = price
                 self._set_barrier_prices(self.pos, price, atr_val)
-                # pay entry cost
-                entry_tc = estimate_tc(self.pos, price, self.exec_sim)
-                self.cash -= entry_tc
+                # pay entry cost (once)
+                try:
+                    side = 'buy' if self.pos > 0 else 'sell'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(getattr(self.exec_sim.exec_params, 'spread_ticks', 0) * getattr(self.exec_sim.exec_params, 'tick_value', 0.0) * abs(int(self.pos)))
+                    total_cost = commission_cost + slippage_cost + impact_cost + spread_cost
+                except Exception:
+                    total_cost = estimate_tc(self.pos, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = 0.0
+                    spread_cost = 0.0
+                self.cash -= float(total_cost)
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
                 try:
                     direction = 'long' if self.pos > 0 else 'short'
                     qty = int(abs(self.pos))
@@ -599,11 +705,16 @@ class IntradayRLEnv(Env):
                         'price': float(price),
                         'action': 'open',
                         'direction': direction,
-                        'quantity': qty
+                        'quantity': qty,
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
                     })
                     # Track open trade context for close logging
                     self._open_ts = ts
-                    self._entry_tc = float(entry_tc)
+                    self._entry_tc = float(total_cost)
                     # Increment daily trade count
                     self._daily_trade_count = int(self._daily_trade_count) + 1
                     # Side-balance counters (opens)
@@ -617,13 +728,15 @@ class IntradayRLEnv(Env):
                 self.scale_out_done = False
             else:
                 # Helpful debug breadcrumbs when trades fail to open
-                logger.debug(
-                    "Skip open: contracts=0 (risk sizing) | price=%.4f atr=%.4f equity=%.2f stop_r=%.3f",
-                    price, atr_val, self.equity,
-                    float(getattr(self.risk_manager.risk_config, 'stop_r_multiple', 1.0))
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Skip open: contracts=0 (risk sizing) | price=%.4f atr=%.4f equity=%.2f stop_r=%.3f",
+                        price, atr_val, self.equity,
+                        float(getattr(self.risk_manager.risk_config, 'stop_r_multiple', 1.0))
+                    )
         elif desired_dir != 0 and self.pos == 0 and in_no_trade:
-            logger.debug("Skip open: in no-trade window at %s", ts)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Skip open: in no-trade window at %s", ts)
 
         # Partial scale-out when in profit (optional)
         try:
@@ -635,10 +748,34 @@ class IntradayRLEnv(Env):
             if r_unreal >= scale_r and abs(self.pos) > 1:
                 half = int(abs(self.pos) // 2) * int(np.sign(self.pos))
                 self.cash += (price - self.entry_price) * half * self.point_value
-                self.cash -= estimate_tc(half, price, self.exec_sim)
+                try:
+                    side = 'sell' if half > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(half)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(getattr(self.exec_sim.exec_params, 'spread_ticks', 0) * getattr(self.exec_sim.exec_params, 'tick_value', 0.0) * abs(int(half)))
+                    total_cost = commission_cost + slippage_cost + impact_cost + spread_cost
+                except Exception:
+                    total_cost = estimate_tc(half, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = 0.0
+                    spread_cost = 0.0
+                self.cash -= float(total_cost)
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
                 self.pos -= half
                 try:
-                    self.trades.append({'ts': ts, 'pos': int(self.pos), 'price': float(price), 'action': 'scale_out'})
+                    self.trades.append({
+                        'ts': ts,
+                        'pos': int(self.pos),
+                        'price': float(price),
+                        'action': 'scale_out',
+                        'quantity': int(abs(half)),
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
+                    })
                 except Exception:
                     pass
                 self.scale_out_done = True
@@ -879,6 +1016,26 @@ class IntradayRLEnv(Env):
             except Exception:
                 pass
 
+        # Composite reward (Sprint 5 light): r = w_ret*dPnL - w_turnover*|Δpos| - w_inventory*|pos|
+        try:
+            rw_cfg = (self.config.get('env', {}).get('reward', {}) if isinstance(self.config, dict) else {}) or {}
+            include_costs = bool(rw_cfg.get('include_costs', True))
+            w_ret = float(rw_cfg.get('w_ret', 1.0))
+            w_turn = float(rw_cfg.get('w_turnover', 0.30))
+            w_inv = float(rw_cfg.get('w_inventory', 0.10))
+        except Exception:
+            include_costs, w_ret, w_turn, w_inv = True, 1.0, 0.30, 0.10
+        dpos = abs(int(self.pos) - int(prev_pos))
+        # Accumulate realized averages
+        try:
+            self._sum_abs_pos += abs(int(self.pos))
+            self._sum_abs_dpos += dpos
+            self._reward_steps += 1
+        except Exception:
+            pass
+        comp = (w_ret * float(pnl)) - (w_turn * float(dpos)) - (w_inv * float(abs(int(self.pos))))
+        reward += comp
+
         reward *= self.env_config.reward_scaling
         reward = np.clip(reward, -1, 1)
         # Track last action dir for churn evaluation next step
@@ -892,7 +1049,18 @@ class IntradayRLEnv(Env):
         if self.realized_drawdown > max_daily_pct:
             # Force flat and charge closing costs
             if self.pos != 0:
-                tc = estimate_tc(self.pos, price, self.exec_sim)
+                try:
+                    side = 'sell' if self.pos > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(getattr(self.exec_sim.exec_params, 'spread_ticks', 0) * getattr(self.exec_sim.exec_params, 'tick_value', 0.0) * abs(int(self.pos)))
+                    total_cost = commission_cost + slippage_cost + impact_cost + spread_cost
+                except Exception:
+                    total_cost = estimate_tc(self.pos, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = 0.0
+                    spread_cost = 0.0
                 try:
                     # Log close due to kill-switch
                     open_ts = getattr(self, '_open_ts', None)
@@ -901,7 +1069,7 @@ class IntradayRLEnv(Env):
                     direction = 'long' if self.pos > 0 else 'short'
                     exit_price = float(price)
                     gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
-                    net_pnl = gross_pnl - entry_tc - float(tc)
+                    net_pnl = gross_pnl - entry_tc - float(total_cost)
                     self.trades.append({
                         'ts': ts,
                         'pos': 0,
@@ -914,14 +1082,20 @@ class IntradayRLEnv(Env):
                         'exit_price': float(exit_price),
                         'quantity': qty,
                         'direction': direction,
+                        'gross_pnl': float(gross_pnl),
                         'pnl': float(net_pnl),
                         'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
                         'commission_entry': float(entry_tc),
-                        'commission_exit': float(tc)
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
                     })
                 except Exception:
                     pass
-                self.cash -= tc
+                self.cash -= float(total_cost)
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -941,10 +1115,40 @@ class IntradayRLEnv(Env):
         if np.isnan(next_price) or np.isinf(next_price):
             next_price = 0.0
 
+        # Diagnostics: per-step action intent and OFI sign proxy
+        try:
+            ofi_val = float(self.X.loc[ts].get('order_flow_imbalance', np.nan))
+            ofi_sign = 0 if not np.isfinite(ofi_val) or ofi_val == 0 else (1 if ofi_val > 0 else -1)
+        except Exception:
+            ofi_val = float('nan')
+            ofi_sign = 0
+        try:
+            self._diagnostics.append({
+                'ts': ts,
+                'action': int(np.sign(desired_dir)) if desired_dir != 0 else 0,
+                'pos': int(self.pos),
+                'prev_pos': int(prev_pos),
+                'dpos': int(dpos),
+                'price': float(price),
+                'ofi_best': float(ofi_val),
+                'ofi_sign': int(ofi_sign),
+            })
+        except Exception:
+            pass
+
+        # Check episode truncation by max_steps
+        truncated = False
+        try:
+            max_steps = int(getattr(self.env_config, 'max_steps', 0))
+        except Exception:
+            max_steps = 0
+        if max_steps and int(self._steps_in_episode) >= max_steps and not done:
+            truncated = True
+            done = True
+
         obs = self._obs(next_ts, next_price)
 
-        logger.info("Before returning from step")
-        # Diagnostic info
+        # Diagnostic info (only when DEBUG to reduce overhead)
         info = {
             "pnl": float(pnl),
             "drawdown_penalty": float(drawdown_penalty),
@@ -952,8 +1156,18 @@ class IntradayRLEnv(Env):
             "realized_drawdown": float(self.realized_drawdown),
         }
         info["equity"] = float(self.equity)
-        logger.info(f"Total step time: {time.time() - step_start_time:.6f}s")
-        return obs, float(reward), bool(done), False, info
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Before returning from step")
+            logger.debug("Total step time: %.6fs", (time.time() - step_start_time))
+        return obs, float(reward), bool(done), bool(truncated), info
+
+    def get_diagnostics(self):
+        """Return per-step diagnostics as a DataFrame if available."""
+        try:
+            import pandas as _pd
+            return _pd.DataFrame(self._diagnostics)
+        except Exception:
+            return None
     
     def _obs(self, ts, price):
         """Construct observation vector."""
@@ -1407,6 +1621,18 @@ class IntradayRLEnvironment(IntradayRLEnv):
         """Check triple barrier conditions for test compatibility."""
         # This would be implemented based on the current price and barrier prices
         return False  # Placeholder
+
+    # Diagnostics summary for richer logging consumers
+    def get_action_counts(self) -> Dict[str, int]:
+        try:
+            return {
+                'long_steps': int(self._act_counts.get('long', 0)),
+                'short_steps': int(self._act_counts.get('short', 0)),
+                'flat_steps': int(self._act_counts.get('flat', 0)),
+                'flips': int(getattr(self, '_flips', 0)),
+            }
+        except Exception:
+            return {'long_steps': 0, 'short_steps': 0, 'flat_steps': 0, 'flips': 0}
 
 
 # Keep the original alias for backward compatibility

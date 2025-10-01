@@ -1,0 +1,87 @@
+{
+  "ablation": "curated_minus:price_vol",
+  "selected_features": [
+    "bar_imbalance",
+    "effort_result",
+    "price_impact",
+    "dist_vwap",
+    "dist_session_vwap",
+    "dist_pdh_bp",
+    "dist_pdm_mid",
+    "dist_eq_high",
+    "dist_eq_low",
+    "dist_cdo_bp",
+    "dist_pdo_bp",
+    "dist_pp_bp",
+    "dist_r1_bp",
+    "dist_s1_bp",
+    "dist_r2_bp",
+    "dist_s2_bp",
+    "dist_rollmax_bp",
+    "dist_rollmin_bp",
+    "dist_last_swing_high",
+    "dist_last_swing_low",
+    "delta_vol",
+    "regime_vol",
+    "regime_trend",
+    "regime_trend_sign",
+    "vix",
+    "vix_z",
+    "bos_down",
+    "bos_up",
+    "direction_ema",
+    "eq_high_flag",
+    "eq_low_flag",
+    "imbalance_persist"
+  ],
+  "backtest_summary": {
+    "tickers": [
+      "SPY"
+    ],
+    "portfolio_metrics": {
+      "mean_reward": 4109.953242831514,
+      "std_reward": 0.0,
+      "mean_length": 14256.0,
+      "std_length": 0.0,
+      "max_reward": 4109.953242831514,
+      "min_reward": 4109.953242831514,
+      "total_return": 0.0410995299999832,
+      "annual_return": 0.000716144687878062,
+      "annual_volatility": 0.002800040393992636,
+      "sharpe_ratio": 0.25567109423522855,
+      "max_drawdown": -0.015043289280441963,
+      "calmar_ratio": 0.04758862122157889,
+      "win_rate": 0.5166666666666667,
+      "profit_factor": 1.1221606961238513,
+      "sortino_ratio": 0.3280489446078983,
+      "total_trades": 60,
+      "long_trades": 31,
+      "short_trades": 29,
+      "avg_duration_minutes": 149.95,
+      "avg_duration_minutes_long": 77.38709677419355,
+      "avg_duration_minutes_short": 227.51724137931035,
+      "avg_pnl": 7.206666666666403,
+      "avg_pnl_long": 11.064838709677177,
+      "avg_pnl_short": 3.0824137931031617,
+      "daily_sharpe_proxy": 4.779908237255903,
+      "intraday_max_drawdown": -0.015043289280441963
+    }
+  },
+  "baselines": {
+    "no_trade": {
+      "total_trades": 0,
+      "total_return": 0.0,
+      "sharpe_ratio": 0.0
+    },
+    "vwap_fade": {
+      "total_trades": null,
+      "total_return": null,
+      "sharpe_ratio": null
+    },
+    "ofi_follow": {
+      "total_trades": null,
+      "total_return": null,
+      "sharpe_ratio": null
+    }
+  }
+}

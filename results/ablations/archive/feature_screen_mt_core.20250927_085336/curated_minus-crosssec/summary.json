@@ -1,0 +1,103 @@
+{
+  "ablation": "curated_minus:crosssec",
+  "selected_features": [
+    "atr",
+    "dist_vwap_atr",
+    "dist_cdo_bp_atr",
+    "gap_open_prev_close_atr",
+    "dist_pp_bp_atr",
+    "dist_r1_bp_atr",
+    "dist_s1_bp_atr",
+    "dist_rollmax_bp_atr",
+    "dist_rollmin_bp_atr",
+    "dist_session_vwap_atr",
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_histogram",
+    "macd_line",
+    "bb_width",
+    "bar_imbalance",
+    "effort_result",
+    "price_impact",
+    "dist_vwap",
+    "dist_session_vwap",
+    "dist_pdh_bp",
+    "dist_pdm_mid",
+    "dist_eq_high",
+    "dist_eq_low",
+    "dist_cdo_bp",
+    "dist_pdo_bp",
+    "dist_pp_bp",
+    "dist_r1_bp",
+    "dist_s1_bp",
+    "dist_r2_bp",
+    "dist_s2_bp",
+    "dist_rollmax_bp",
+    "dist_rollmin_bp",
+    "dist_last_swing_high",
+    "dist_last_swing_low",
+    "delta_vol",
+    "regime_vol",
+    "regime_trend",
+    "regime_trend_sign",
+    "vix",
+    "vix_z",
+    "bos_down",
+    "bos_up",
+    "direction_ema",
+    "eq_high_flag",
+    "eq_low_flag",
+    "imbalance_persist"
+  ],
+  "backtest_summary": {
+    "tickers": [
+      "SPY"
+    ],
+    "portfolio_metrics": {
+      "mean_reward": 2394.945422969293,
+      "std_reward": 0.0,
+      "mean_length": 14256.0,
+      "std_length": 0.0,
+      "max_reward": 2394.945422969293,
+      "min_reward": 2394.945422969293,
+      "total_return": 0.023949449999973293,
+      "annual_return": 0.0004238409107231167,
+      "annual_volatility": 0.0032859254014727863,
+      "sharpe_ratio": 0.12895955263779613,
+      "max_drawdown": -0.020341389242134134,
+      "calmar_ratio": 0.020831982849260515,
+      "win_rate": 0.5166666666666667,
+      "profit_factor": 0.909058415294665,
+      "sortino_ratio": 0.17506438232443317,
+      "total_trades": 60,
+      "long_trades": 60,
+      "short_trades": 0,
+      "avg_duration_minutes": 203.58333333333334,
+      "avg_duration_minutes_long": 203.58333333333334,
+      "avg_duration_minutes_short": 0.0,
+      "avg_pnl": -8.86266666666605,
+      "avg_pnl_long": -8.86266666666605,
+      "avg_pnl_short": 0.0,
+      "daily_sharpe_proxy": 2.2601711867720153,
+      "intraday_max_drawdown": -0.020341389242134134
+    }
+  },
+  "baselines": {
+    "no_trade": {
+      "total_trades": 0,
+      "total_return": 0.0,
+      "sharpe_ratio": 0.0
+    },
+    "vwap_fade": {
+      "total_trades": null,
+      "total_return": null,
+      "sharpe_ratio": null
+    },
+    "ofi_follow": {
+      "total_trades": null,
+      "total_return": null,
+      "sharpe_ratio": null
+    }
+  }
+}

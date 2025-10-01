@@ -1,0 +1,30 @@
+{
+  "agg_sharpe": -0.34308187562741965,
+  "agg_pf": 0.5450674758053831,
+  "agg_ret": -0.0120288200000074,
+  "agg_maxdd": -0.014205907432146447,
+  "trades_total": 11,
+  "long_total": 0,
+  "short_total": 11,
+  "costs_total": 2200.0,
+  "windows": [
+    {
+      "window": 0,
+      "sharpe_ratio": -0.34308187562741965,
+      "profit_factor": 0.5450674758053831,
+      "total_return": -0.0120288200000074,
+      "max_drawdown": -0.014205907432146447,
+      "total_trades": 11,
+      "long_trades": 0,
+      "short_trades": 11,
+      "tx_costs_total": 2200.0,
+      "no_shorts_tickers": 0
+    }
+  ],
+  "tickers": [
+    "SPY"
+  ],
+  "skipped_windows": [],
+  "no_shorts_windows": 0,
+  "no_shorts_tickers_total": 0
+}

@@ -1,0 +1,111 @@
+{
+  "sharpe_agg": -0.06798684219725815,
+  "pf_agg": 0.8067900464213125,
+  "ret_agg": -0.0030143900000123105,
+  "maxDD_agg": -0.017607727071749624,
+  "trades_total": 122,
+  "long_total": 76,
+  "short_total": 46,
+  "windows": [
+    {
+      "window": 1,
+      "sharpe_ratio": 0.0,
+      "profit_factor": 0.0,
+      "total_return": 0.0,
+      "max_drawdown": 0.0,
+      "total_trades": 0,
+      "long_trades": 0,
+      "short_trades": 0
+    },
+    {
+      "window": 2,
+      "sharpe_ratio": -0.03292965137138579,
+      "profit_factor": 1.4572179289026612,
+      "total_return": -0.00045944000000235974,
+      "max_drawdown": -0.005745352305026485,
+      "total_trades": 10,
+      "long_trades": 0,
+      "short_trades": 10
+    },
+    {
+      "window": 3,
+      "sharpe_ratio": 0.1902648361477199,
+      "profit_factor": 0.7086902614968325,
+      "total_return": 0.0014533399999997346,
+      "max_drawdown": -0.0018490523916716572,
+      "total_trades": 16,
+      "long_trades": 16,
+      "short_trades": 0
+    },
+    {
+      "window": 4,
+      "sharpe_ratio": -0.44599120494126965,
+      "profit_factor": 0.4431712065336108,
+      "total_return": -0.006966070000002073,
+      "max_drawdown": -0.0072560400000019065,
+      "total_trades": 14,
+      "long_trades": 14,
+      "short_trades": 0
+    },
+    {
+      "window": 5,
+      "sharpe_ratio": 0.11030643490718783,
+      "profit_factor": 1.6035680751173642,
+      "total_return": 0.003828779999943363,
+      "max_drawdown": -0.009802921296328315,
+      "total_trades": 14,
+      "long_trades": 14,
+      "short_trades": 0
+    },
+    {
+      "window": 6,
+      "sharpe_ratio": -0.32763009971321416,
+      "profit_factor": 0.24913251699119773,
+      "total_return": -0.013626580000038666,
+      "max_drawdown": -0.017607727071749624,
+      "total_trades": 16,
+      "long_trades": 0,
+      "short_trades": 16
+    },
+    {
+      "window": 7,
+      "sharpe_ratio": 0.5269169328415882,
+      "profit_factor": 1.726582278480993,
+      "total_return": 0.008437569999992556,
+      "max_drawdown": -0.0039827124388436275,
+      "total_trades": 12,
+      "long_trades": 12,
+      "short_trades": 0
+    },
+    {
+      "window": 8,
+      "sharpe_ratio": -0.23712184036576459,
+      "profit_factor": 0.5391854190535244,
+      "total_return": -0.006524020000005549,
+      "max_drawdown": -0.010861094139419714,
+      "total_trades": 14,
+      "long_trades": 14,
+      "short_trades": 0
+    },
+    {
+      "window": 9,
+      "sharpe_ratio": -0.040135629927428036,
+      "profit_factor": 0.9691195795006258,
+      "total_return": -0.0011630000000048312,
+      "max_drawdown": -0.006142766725604321,
+      "total_trades": 12,
+      "long_trades": 6,
+      "short_trades": 6
+    },
+    {
+      "window": 10,
+      "sharpe_ratio": -0.42354819955001527,
+      "profit_factor": 0.37123319813631545,
+      "total_return": -0.015124480000005278,
+      "max_drawdown": -0.016923431247062748,
+      "total_trades": 14,
+      "long_trades": 0,
+      "short_trades": 14
+    }
+  ]
+}
