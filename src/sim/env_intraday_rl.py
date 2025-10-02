@@ -219,10 +219,13 @@ class IntradayRLEnv(Env):
                     w_dsr=float(rw_cfg.get('w_dsr', 0.0)),
                     include_costs=bool(rw_cfg.get('include_costs', True))
                 )
+                logger.info(f"Initialized CompositeReward with config: {rw_cfg}")
             else:
                 self.composite_reward = None
-        except Exception:
+                logger.info(f"Using legacy reward system (kind: {rw_cfg.get('kind', 'unknown')})")
+        except Exception as e:
             self.composite_reward = None
+            logger.warning(f"Failed to initialize CompositeReward: {e}")
 
         logger.info(f"Environment initialized with {len(self.ohlcv)} bars, {feature_dim} features from {getattr(self, 'data_source', 'unknown')} data")
     
@@ -1065,25 +1068,8 @@ class IntradayRLEnv(Env):
             except Exception:
                 pass
 
-        # Composite reward (Sprint 5 light): r = w_ret*dPnL - w_turnover*|Δpos| - w_inventory*|pos|
-        try:
-            rw_cfg = (self.config.get('env', {}).get('reward', {}) if isinstance(self.config, dict) else {}) or {}
-            include_costs = bool(rw_cfg.get('include_costs', True))
-            w_ret = float(rw_cfg.get('w_ret', 1.0))
-            w_turn = float(rw_cfg.get('w_turnover', 0.30))
-            w_inv = float(rw_cfg.get('w_inventory', 0.10))
-        except Exception:
-            include_costs, w_ret, w_turn, w_inv = True, 1.0, 0.30, 0.10
-        dpos = abs(int(self.pos) - int(prev_pos))
-        # Accumulate realized averages
-        try:
-            self._sum_abs_pos += abs(int(self.pos))
-            self._sum_abs_dpos += dpos
-            self._reward_steps += 1
-        except Exception:
-            pass
-        comp = (w_ret * float(pnl)) - (w_turn * float(dpos)) - (w_inv * float(abs(int(self.pos))))
-        reward += comp
+        # Note: Composite reward is now handled above in the main reward calculation section
+        # This section is removed to avoid double-counting
 
         reward *= self.env_config.reward_scaling
         reward = np.clip(reward, -1, 1)

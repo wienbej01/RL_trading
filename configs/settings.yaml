@@ -549,7 +549,13 @@ env:
   reward_scaling: 0.1
   allow_shorts: true
   reward:
-    kind: hybrid2
+    kind: composite  # Use composite reward for Sprint 5
+    w_ret: 1.0
+    w_turnover: 0.2
+    w_inv: 0.05
+    w_dsr: 0.0
+    include_costs: true
+    # Fallback hybrid2 parameters if composite not used
     alpha: 0.15
     beta: 0.25
     dir_weight: 300.0

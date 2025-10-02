@@ -224,10 +224,13 @@ class PortfolioRLEnv(Env):
                     w_dsr=float(reward_config.get('w_dsr', 0.0)),
                     include_costs=bool(reward_config.get('include_costs', True))
                 )
+                logger.info(f"Initialized CompositeReward with config: {reward_config}")
             else:
                 self.composite_reward = None
-        except Exception:
+                logger.info(f"Using legacy reward system (kind: {reward_config.get('kind', 'unknown')})")
+        except Exception as e:
             self.composite_reward = None
+            logger.warning(f"Failed to initialize CompositeReward: {e}")
             
         # State
         self.reset()
