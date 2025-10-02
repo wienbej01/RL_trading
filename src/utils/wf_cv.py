@@ -23,8 +23,9 @@ def _tz(ts: pd.Timestamp | str, tz: str) -> pd.Timestamp:
     return t.tz_convert(tz)
 
 def _add_days(ts: pd.Timestamp, days: int) -> pd.Timestamp:
-    # business days are safer for intraday equities
-    return (ts.tz_convert(None) + pd.tseries.offsets.BDay(days)).tz_localize(ts.tz)
+    # Use calendar days for speed - market hours filtering is handled by data loader
+    # BDay offset is extremely slow (checks holiday calendar for every date)
+    return ts + pd.Timedelta(days=days)
 
 def EmbargoedWalkForward(
     start: str | pd.Timestamp,

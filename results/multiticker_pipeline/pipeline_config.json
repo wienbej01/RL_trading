@@ -1,12 +1,12 @@
 {
   "config_file": "configs/settings.yaml",
   "train_start": "2024-05-01",
-  "train_end": "2024-06-30",
+  "train_end": "2024-06-15",
   "test_start": "2024-06-15",
   "test_end": "2024-06-30",
   "tickers": [
     "SPY"
   ],
   "output_dir": "results/multiticker_pipeline",
-  "timestamp": "2025-10-02T14:05:34.795978"
+  "timestamp": "2025-10-02T17:50:48.230261"
 }
