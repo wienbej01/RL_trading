@@ -8,7 +8,7 @@ Supports both Polygon and Databento data formats with automatic column mapping.
 import numpy as np
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Tuple
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.feature_selection import SelectKBest, f_regression
 import logging
@@ -42,7 +42,12 @@ except Exception:
 
 from ..utils.logging import get_logger
 from ..utils.feat_cache import feature_cache_path, save_features, load_features, augment_cfg_hash
-from .packs import resolve_feature_pack, LAST_CURATED_CACHE_TOKEN
+from .packs import (
+    resolve_feature_pack,
+    LAST_CURATED_CACHE_TOKEN,
+    resolve_curated_pack,
+    MICROSTRUCTURE_OHLCV,
+)
 
 
 class FeaturePipeline:
@@ -1556,3 +1561,124 @@ class FeaturePipeline:
             return features[keep_cols]
         else:
             return features
+
+
+def build_features_for_window(
+    *,
+    ohlcv: pd.DataFrame,
+    base_features: pd.DataFrame,
+    run_name: str,
+    ticker: str,
+    window_k: int,
+    window_dir: Union[str, os.PathLike[str], Path],
+    screen_dir: Optional[Union[str, os.PathLike[str], Path]],
+    feature_pack: Optional[str],
+    start: Union[pd.Timestamp, str],
+    end: Union[pd.Timestamp, str],
+    use_cache: bool = True,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Resolve curated features for a single walk-forward window.
+
+    This helper selects the curated subset for a window, persists bookkeeping, and
+    serves feature caches. It assumes ``base_features`` already contains the
+    computed indicators for the requested ticker/window span.
+    """
+
+    log = logger or logging.getLogger("features.window")
+
+    window_path = Path(window_dir)
+    window_path.mkdir(parents=True, exist_ok=True)
+
+    screen_path = Path(screen_dir) if screen_dir is not None else window_path
+    screen_path.mkdir(parents=True, exist_ok=True)
+
+    has_l1 = all(col in ohlcv.columns for col in ("bid_price", "ask_price", "bid_size", "ask_size"))
+
+    curated_from_screen = resolve_curated_pack(
+        screen_path,
+        has_l1=has_l1,
+        logger=log,
+        window_k=window_k,
+        ticker=ticker,
+    )
+
+    available = [col for col in base_features.columns if col != "ticker"]
+    pack_keys: List[str] = []
+    if feature_pack:
+        pack_keys = [p.strip() for p in str(feature_pack).split(",") if p.strip()]
+
+    resolved = resolve_feature_pack(available, pack_keys, curated=curated_from_screen) if pack_keys else curated_from_screen
+    if not resolved:
+        resolved = available
+
+    resolved_order = dict.fromkeys(resolved)
+    final_cols = [col for col in base_features.columns if col != "ticker" and col in resolved_order]
+    if not final_cols:
+        final_cols = available
+
+    base_hash = (
+        f"{run_name}|{ticker}|{pd.Timestamp(start):%Y%m%d}-{pd.Timestamp(end):%Y%m%d}|"
+        f"{','.join(pack_keys) or 'manual'}|{screen_path}"
+    )
+    cfg_hash = augment_cfg_hash(
+        base_hash,
+        run_name=run_name,
+        features=final_cols,
+        micro_module_path=Path('src/features/micro_ohlcv.py'),
+        curated_token=LAST_CURATED_CACHE_TOKEN,
+    )
+    cache_path = feature_cache_path(
+        run_name=run_name,
+        ticker=ticker,
+        split=f"window{window_k:02d}",
+        start=start,
+        end=end,
+        cfg_hash=cfg_hash,
+    )
+
+    feats: Optional[pd.DataFrame] = None
+    if use_cache and cache_path.exists():
+        try:
+            log.info("Feature cache HIT -> %s", cache_path)
+            cached = load_features(cache_path)
+            missing_cols = [c for c in final_cols if c not in cached.columns]
+            if missing_cols:
+                log.warning(
+                    "Feature cache %s missing columns %s; recomputing",
+                    cache_path,
+                    missing_cols,
+                )
+            else:
+                keep = ['ticker'] + final_cols if 'ticker' in cached.columns else final_cols
+                feats = cached.loc[:, keep].copy()
+        except Exception as exc:
+            log.warning("Failed to load feature cache %s (%s); recomputing", cache_path, exc)
+            feats = None
+
+    if feats is None:
+        status = "BYPASS" if not use_cache else "MISS"
+        log.info(
+            "Feature cache %s -> computing %d features for window %02d ticker %s",
+            status,
+            len(final_cols),
+            window_k,
+            ticker,
+        )
+        cols_to_keep = ['ticker'] + final_cols if 'ticker' in base_features.columns else final_cols
+        feats = base_features.loc[:, [c for c in cols_to_keep if c in base_features.columns]].copy()
+        if use_cache:
+            save_features(feats, cache_path)
+
+    curated = [c for c in final_cols if c != 'ticker']
+
+    try:
+        (window_path / 'features_used.txt').write_text("\n".join(curated) + "\n")
+    except Exception:
+        pass
+
+    missing_micro = [f for f in MICROSTRUCTURE_OHLCV if f in curated and f not in feats.columns]
+    if missing_micro:
+        raise AssertionError(f"Requested microstructure proxies missing from features: {missing_micro}")
+
+    return feats, curated

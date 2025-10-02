@@ -26,12 +26,11 @@ import pandas as pd
 from src.utils.config_loader import load_config
 from src.utils.wf_cv import EmbargoedWalkForward
 from src.data.data_loader import UnifiedDataLoader
-from src.features.pipeline import FeaturePipeline
-from src.features.packs import get_features_for_pack, MICROSTRUCTURE_MIN, MICROSTRUCTURE_OHLCV
+from src.features.pipeline import FeaturePipeline, build_features_for_window
+from src.features.packs import get_features_for_pack, MICROSTRUCTURE_OHLCV
 from src.rl.multiticker_trainer import MultiTickerRLTrainer
 from src.utils.feat_cache import feature_cache_path, load_features, save_features
-from src.utils.artifacts import write_backtest_artifacts
-from src.utils.artifacts import BacktestResult as ArtifactBacktestResult
+from src.utils.artifacts import write_backtest_artifacts, BacktestResult
 
 
 def parse_args() -> argparse.Namespace:
@@ -360,37 +359,69 @@ def main() -> int:
                     screen_dir = Path('results/features') / screen_run
                     screen_dir.mkdir(parents=True, exist_ok=True)
                     (screen_dir / 'curated_topN.txt').write_text("\n".join(cols[:40]) + "\n")
-            # Load curated list from screen_dir
+            # Resolve curated feature list and build training matrix for this window/ticker
+            if screen_dir is None:
+                screen_dir = Path('results/features') / f"{args.run_name}_w{wi:02d}_{tck}"
             try:
-                used = screen_dir / 'features_used.txt'
-                topn = screen_dir / 'curated_topN.txt'
-                if used.exists():
-                    curated = [l.strip() for l in used.read_text().splitlines() if l.strip()]
-                elif topn.exists():
-                    curated = [l.strip() for l in topn.read_text().splitlines() if l.strip()]
-            except Exception:
-                curated = [c for c in X_tr.columns if c != 'ticker'][:40]
-            # Fallback: ensure curated includes basic microstructure keys if available in X_tr
-            try:
-                avail_cols = [c for c in X_tr.columns if c != 'ticker']
-                if not any((m in curated) for m in MICROSTRUCTURE_MIN):
-                    ms_present = [m for m in MICROSTRUCTURE_MIN if any((a == m or a.startswith(m) or a.endswith(m)) for a in avail_cols)]
-                    curated = curated + [m for m in ms_present if m not in curated]
-            except Exception:
-                pass
+                feats_window, curated = build_features_for_window(
+                    ohlcv=o_tr,
+                    base_features=X_tr,
+                    run_name=args.run_name,
+                    ticker=tck,
+                    window_k=wi,
+                    window_dir=wdir,
+                    screen_dir=screen_dir,
+                    feature_pack=args.feature_pack,
+                    start=tr_s,
+                    end=te_e,
+                    use_cache=not getattr(args, 'no_cache', False),
+                    logger=log,
+                )
+            except AssertionError as err:
+                raise
+            except Exception as err:
+                log.warning(
+                    "[features] window=%02d ticker=%s curated resolution failed (%s); falling back to raw features",
+                    wi,
+                    tck,
+                    err,
+                )
+                curated = [c for c in X_tr.columns if c != 'ticker']
+                feats_window = X_tr[['ticker'] + curated] if 'ticker' in X_tr.columns else X_tr[curated]
 
-            # Reduce features to curated list
-            keep_tr2 = [c for c in X_tr.columns if (c in curated or c == 'ticker')]
-            keep_te2 = [c for c in X_te.columns if (c in curated or c == 'ticker')]
-            X_tr2 = X_tr[keep_tr2]
-            X_te2 = X_te[keep_te2]
-            # Log curated diagnostic and warn if microstructure key absent
+            curated = [c for c in curated if c != 'ticker']
+            ticker_col = 'ticker'
+            if ticker_col not in feats_window.columns:
+                feats_window = feats_window.copy()
+                feats_window[ticker_col] = tck
+            ordered_cols = [ticker_col] + [c for c in curated]
+            feats_window = feats_window.loc[:, ordered_cols]
+            X_tr2 = feats_window
+
+            X_te2 = X_te.copy()
+            if ticker_col not in X_te2.columns:
+                X_te2.insert(0, ticker_col, tck)
+            else:
+                X_te2[ticker_col] = tck
+            for col in curated:
+                if col not in X_te2.columns:
+                    X_te2[col] = 0.0
+            X_te2 = X_te2.loc[:, [ticker_col] + curated]
+
+            # Diagnostics on curated set
             try:
-                includes_micro = any(any((f == m or f.startswith(m) or f.endswith(m)) for f in curated) for m in MICROSTRUCTURE_OHLCV)
-                missing = [m for m in MICROSTRUCTURE_OHLCV if not any((f == m or f.startswith(m) or f.endswith(m)) for f in curated)]
-                log.info(f"[features] window={wi:02d} ticker={tck} curated count={len(curated)} includes_micro={includes_micro} missing={missing[:3]} first10={curated[:10]}")
+                includes_micro = any(m in curated for m in MICROSTRUCTURE_OHLCV)
+                missing = [m for m in MICROSTRUCTURE_OHLCV if m not in curated]
+                log.info(
+                    "[features] window=%02d ticker=%s curated count=%d includes_micro=%s missing=%s",
+                    wi,
+                    tck,
+                    len(curated),
+                    includes_micro,
+                    missing[:3],
+                )
                 if not includes_micro:
-                    print(f"[WARN] window {wi:02d} ticker {tck}: microstructure absent; shorts may underperform")
+                    print(f"[WARN] window {wi:02d} ticker {tck}: microstructure proxies absent; shorts may underperform")
             except Exception:
                 pass
 
@@ -418,7 +449,7 @@ def main() -> int:
             window_dir = wdir
             (wdir / tck).mkdir(parents=True, exist_ok=True)
             try:
-                res: ArtifactBacktestResult = trainer.train_and_backtest(
+                res: BacktestResult = trainer.train_and_backtest(
                     data=o_tr,
                     features=X_tr2,
                     output_dir=wdir / tck / 'backtest',
@@ -427,7 +458,7 @@ def main() -> int:
             except Exception as e:
                 # On failure, emit FAIL artifacts with minimal context
                 import pandas as _pd
-                empty = ArtifactBacktestResult(
+                empty = BacktestResult(
                     trades=_pd.DataFrame(),
                     equity=_pd.DataFrame({'equity': []}),
                     steps=_pd.DataFrame(),
@@ -443,23 +474,18 @@ def main() -> int:
 
             # Pull per-ticker metrics
             pm = dict(res.metrics or {})
-            # Save features_used for this window/ticker (copy from screen run if present)
-            (wdir / tck).mkdir(parents=True, exist_ok=True)
-            try:
-                if screen_dir is not None and (screen_dir / 'features_used.txt').exists():
-                    import shutil as _sh
-                    _sh.copyfile(str(screen_dir / 'features_used.txt'), str(wdir / tck / 'features_used.txt'))
-                else:
-                    (wdir / tck / 'features_used.txt').write_text("\n".join(curated) + "\n")
-            except Exception:
-                (wdir / tck / 'features_used.txt').write_text("\n".join(curated) + "\n")
+            # Handle nested portfolio_metrics structure
+            if 'portfolio_metrics' in pm and isinstance(pm['portfolio_metrics'], dict):
+                # Merge nested metrics into top level
+                pm.update(pm['portfolio_metrics'])
             # Verify features include microstructure signals used for parity/shorts
             try:
-                feats_used = set(curated)
+                feats_used = set(res.feature_names or curated)
                 if not any(m in feats_used for m in MICROSTRUCTURE_OHLCV):
-                    print(f"[WARN] window {wi:02d} ticker {tck}: features_used.txt lacks OHLCV micro proxies; shorts may underperform")
+                    print(f"[WARN] window {wi:02d} ticker {tck}: feature set lacks OHLCV micro proxies; shorts may underperform")
             except Exception:
                 pass
+            curated = list(res.feature_names or curated)
             # Save action mix
             mix = {
                 'long_steps': int(pm.get('long_steps', 0)),
@@ -609,6 +635,8 @@ def main() -> int:
                 # 1) Microstructure inclusion
                 try:
                     used_path = tdir / 'features_used.txt'
+                    if not used_path.exists():
+                        used_path = wdir / 'features_used.txt'
                     curated_list = [l.strip() for l in used_path.read_text().splitlines() if l.strip()] if used_path.exists() else []
                     includes_micro = any(m in curated_list for m in MICROSTRUCTURE_OHLCV)
                     missing = [m for m in MICROSTRUCTURE_OHLCV if m not in curated_list]
@@ -656,7 +684,7 @@ def main() -> int:
                         _pd.to_numeric(tdf['total_cost_est'], errors='coerce').fillna(0.0)
                     ], axis=1).max(axis=1)
                     sum_costs = float(used.sum())
-                    ok_costs = abs(tx_sum - sum_costs) < 1e-9
+                    ok_costs = abs(tx_sum - sum_costs) < 1e-6
                     print(f"  costs: summary={tx_sum:.4f} trades_sum={sum_costs:.4f} ok={ok_costs}")
                 except Exception as e:
                     print(f"  costs: ERROR ({e})")

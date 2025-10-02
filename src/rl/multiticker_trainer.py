@@ -40,7 +40,7 @@ from ..sim.risk import RiskConfig
 from .train import evaluate_model  # reuse existing evaluator
 from .callbacks import KLStopCallback, AdaptiveLRByKL, LiveLRBump
 from ..utils.callbacks import EarlyStopNoImprove
-from ..utils.artifacts import BacktestResult as ArtifactBacktestResult
+from ..utils.artifacts import BacktestResult
 
 
 logger = get_logger(__name__)
@@ -1384,8 +1384,8 @@ class MultiTickerRLTrainer:
         # Expose a last-known summary if desired (not persisted across processes)
         return {}
 
-    # Compatibility convenience: train then backtest, and return an ArtifactBacktestResult
-    # by loading the artifacts the existing backtest method writes.
+    # Convenience helper: train, backtest, and return a BacktestResult bundle
+    # for downstream artifact writers.
     def train_and_backtest(
         self,
         *,
@@ -1393,47 +1393,121 @@ class MultiTickerRLTrainer:
         features: pd.DataFrame,
         output_dir: Path,
         eval_episodes: int = 1,
-    ) -> ArtifactBacktestResult:
+    ) -> BacktestResult:
         if not isinstance(output_dir, Path):
             output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         model = self.train(data=data, features=features, output_dir=output_dir)
-        # Run backtest (existing method writes files)
-        _ = self.backtest(model=model, data=data, features=features, output_dir=output_dir, eval_episodes=eval_episodes)
-        # Load artifacts into a BacktestResult for a single ticker context
+        summary = self.backtest(
+            model=model,
+            data=data,
+            features=features,
+            output_dir=output_dir,
+            eval_episodes=eval_episodes,
+        )
+
         import pandas as _pd
-        # Steps
-        steps_path = output_dir.parent / 'steps.parquet'
+        import numpy as _np
+
+        trades_path = output_dir / 'trades.csv'
         try:
-            steps_df = _pd.read_parquet(steps_path) if steps_path.exists() else _pd.DataFrame()
-            if not steps_df.empty and 'timestamp' in steps_df.index.names:
-                steps_df.index.name = 'ts'
-        except Exception:
-            steps_df = _pd.DataFrame()
-        # Trades
-        try:
-            trades_df = _pd.read_csv(output_dir / 'trades.csv')
+            trades_df = _pd.read_csv(trades_path)
         except Exception:
             trades_df = _pd.DataFrame()
-        # Equity
+
+        equity_path = output_dir / 'portfolio_history.csv'
         try:
-            equity_df = _pd.read_csv(output_dir / 'portfolio_history.csv', index_col=0)
+            equity_df = _pd.read_csv(equity_path, index_col=0)
             if 'equity' not in equity_df.columns and equity_df.shape[1] >= 1:
                 equity_df.columns = ['equity']
         except Exception:
             equity_df = _pd.DataFrame({'equity': []})
-        # Metrics summary
-        try:
-            import json as _json
-            metrics = _json.loads((output_dir / 'summary.json').read_text())
-        except Exception:
-            metrics = {}
-        feat_names = [c for c in features.columns]
-        return ArtifactBacktestResult(
+
+        steps_path = output_dir.parent / 'steps.parquet'
+        steps_df: _pd.DataFrame
+        if steps_path.exists():
+            try:
+                raw_steps = _pd.read_parquet(steps_path).copy()
+                if 'ts' in raw_steps.columns and not isinstance(raw_steps.index, _pd.DatetimeIndex):
+                    ts_index = _pd.to_datetime(raw_steps['ts'], utc=True, errors='coerce')
+                    mask = ts_index.notna()
+                    ts_index = _pd.DatetimeIndex(ts_index[mask])
+                    steps_df = raw_steps.loc[mask].drop(columns=['ts']).set_index(ts_index)
+                else:
+                    ts_index = _pd.to_datetime(raw_steps.index, utc=True, errors='coerce')
+                    mask = ts_index.notna()
+                    ts_index = _pd.DatetimeIndex(ts_index[mask])
+                    steps_df = raw_steps.loc[mask].copy()
+                    steps_df.index = ts_index
+                steps_df.index.name = 'ts'
+            except Exception:
+                steps_df = _pd.DataFrame()
+        else:
+            steps_df = _pd.DataFrame()
+
+        if steps_df.empty:
+            ts_index = _pd.to_datetime(features.index, utc=True, errors='coerce')
+            ts_index = _pd.DatetimeIndex(ts_index[ts_index.notna()])
+            steps_df = _pd.DataFrame(
+                {
+                    'action': _pd.Series(0, index=ts_index, dtype='int32'),
+                    'pos': _pd.Series(0, index=ts_index, dtype='int32'),
+                    'price': _pd.Series(_np.nan, index=ts_index, dtype='float32'),
+                }
+            )
+            steps_df.index.name = 'ts'
+        else:
+            ts_index = _pd.to_datetime(steps_df.index, utc=True, errors='coerce')
+            mask = ts_index.notna()
+            ts_index = _pd.DatetimeIndex(ts_index[mask])
+            steps_df = steps_df.loc[mask]
+            steps_df.index = ts_index
+            steps_df['action'] = _pd.to_numeric(steps_df.get('action', 0), errors='coerce').fillna(0).astype('int8')
+            steps_df['pos'] = _pd.to_numeric(steps_df.get('pos', 0), errors='coerce').fillna(0).astype('int8')
+            steps_df['price'] = _pd.to_numeric(steps_df.get('price'), errors='coerce')
+
+        live_features = features.copy()
+        attached = False
+        for col in ("ofi_proxy", "signed_vol_delta"):
+            if col in live_features.columns:
+                ser = _pd.to_numeric(live_features[col], errors='coerce').reindex(ts_index).fillna(0.0).astype('float32')
+                steps_df[col] = ser
+                attached = True
+                break
+
+        if not attached:
+            price_series = _pd.to_numeric(steps_df.get('price'), errors='coerce').reindex(ts_index)
+            if price_series.isna().all():
+                if isinstance(data, _pd.DataFrame) and 'close' in data.columns:
+                    close_series = _pd.to_numeric(data['close'], errors='coerce')
+                    price_series = close_series.reindex(ts_index)
+            price_series = price_series.fillna(method='ffill').fillna(0.0)
+
+            if isinstance(data, _pd.DataFrame) and 'volume' in data.columns:
+                if 'ticker' in data.columns and data['ticker'].nunique() > 1:
+                    try:
+                        first_ticker = str(data['ticker'].dropna().iloc[0])
+                        vol_src = _pd.to_numeric(data.loc[data['ticker'] == first_ticker, 'volume'], errors='coerce')
+                    except Exception:
+                        vol_src = _pd.to_numeric(data['volume'], errors='coerce')
+                else:
+                    vol_src = _pd.to_numeric(data['volume'], errors='coerce')
+                volume_series = vol_src.reindex(ts_index).fillna(0.0)
+            else:
+                volume_series = _pd.Series(0.0, index=ts_index)
+
+            ofi = (_np.sign(price_series.diff().fillna(0.0)) * volume_series).astype('float32')
+            by_day = ofi.groupby(ts_index.date)
+            steps_df['ofi_proxy'] = ((ofi - by_day.transform('mean')) / (by_day.transform('std') + 1e-12)).fillna(0.0).astype('float32')
+
+        metrics_dict = summary if isinstance(summary, dict) else {}
+        feature_names = [c for c in features.columns if c != 'ticker']
+
+        return BacktestResult(
             trades=trades_df,
             equity=equity_df,
-            steps=(steps_df if not steps_df.empty else None),
-            metrics=metrics,
-            feature_names=feat_names,
+            steps=steps_df,
+            metrics=metrics_dict,
+            feature_names=feature_names,
             baselines={},
         )

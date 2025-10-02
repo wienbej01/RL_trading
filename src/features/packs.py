@@ -257,6 +257,10 @@ def select_features_strict(
         # Do not intersect with available; this is the requested final list to compute
         base = list(curated_list)
         final = list(dict.fromkeys(base + MICROSTRUCTURE_OHLCV))
+        # Add MICROSTRUCTURE_MIN features that are in avail_cols
+        for m in MICROSTRUCTURE_MIN:
+            if m in aset and m not in final:
+                final.append(m)
         # Publish resolved list and token for cache keys
         try:
             global LAST_CURATED_RESOLVED

@@ -1,0 +1,235 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.3, pytest-8.4.1, pluggy-1.6.0
+rootdir: /home/jacobw/RL_trading/rl-intraday
+configfile: pytest.ini
+plugins: anyio-4.10.0, cov-6.2.1
+collected 27 items / 18 errors
+
+==================================== ERRORS ====================================
+______________________ ERROR collecting bin/debug_test.py ______________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/bin/debug_test.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+bin/debug_test.py:12: in <module>
+    from src.utils.config_loader import Settings
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+_______________ ERROR collecting bin/test_environment_polygon.py _______________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/bin/test_environment_polygon.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+bin/test_environment_polygon.py:9: in <module>
+    from src.sim.env_intraday_rl import IntradayRLEnv
+E   ModuleNotFoundError: No module named 'src.sim.env_intraday_rl'
+________________ ERROR collecting test_polygon_compatibility.py ________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/test_polygon_compatibility.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test_polygon_compatibility.py:9: in <module>
+    from src.features.pipeline import FeaturePipeline
+src/features/pipeline.py:19: in <module>
+    from .technical_indicators import (
+src/features/technical_indicators.py:20: in <module>
+    from ..utils.config_loader import Settings
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+________________ ERROR collecting tests/test_artifacts_write.py ________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_artifacts_write.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_artifacts_write.py:3: in <module>
+    from src.utils.artifacts import BacktestResult, write_backtest_artifacts
+E   ModuleNotFoundError: No module named 'src.utils.artifacts'
+_________________ ERROR collecting tests/test_config_loader.py _________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_config_loader.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_config_loader.py:11: in <module>
+    from src.utils.config_loader import Settings, ConfigError, load_yaml
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+__________________ ERROR collecting tests/test_cpcv_split.py ___________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_cpcv_split.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_cpcv_split.py:3: in <module>
+    from src.utils.wf_cv import CombinatorialPurgedKFold
+E   ModuleNotFoundError: No module named 'src.utils.wf_cv'
+_________________ ERROR collecting tests/test_data_modules.py __________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_data_modules.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_data_modules.py:12: in <module>
+    from src.data.ibkr_client import IBKRClient
+src/data/ibkr_client.py:24: in <module>
+    from ..utils.config_loader import Settings
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+__________________ ERROR collecting tests/test_env_actions.py __________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_env_actions.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_env_actions.py:4: in <module>
+    from src.sim.env_intraday_rl import IntradayRLEnv, EnvConfig
+E   ModuleNotFoundError: No module named 'src.sim.env_intraday_rl'
+___________________ ERROR collecting tests/test_features.py ____________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_features.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_features.py:10: in <module>
+    from src.features.technical_indicators import (
+src/features/technical_indicators.py:20: in <module>
+    from ..utils.config_loader import Settings
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+____________________ ERROR collecting tests/test_logging.py ____________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_logging.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_logging.py:11: in <module>
+    from src.utils.logging import get_logger, setup_logging
+E   ModuleNotFoundError: No module named 'src.utils.logging'
+____________________ ERROR collecting tests/test_metrics.py ____________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_metrics.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_metrics.py:10: in <module>
+    from src.utils.metrics import (
+E   ModuleNotFoundError: No module named 'src.utils.metrics'
+________________ ERROR collecting tests/test_micro_features.py _________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_micro_features.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_micro_features.py:6: in <module>
+    from src.features.pipeline import FeaturePipeline
+src/features/pipeline.py:19: in <module>
+    from .technical_indicators import (
+src/features/technical_indicators.py:20: in <module>
+    from ..utils.config_loader import Settings
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+_______________ ERROR collecting tests/test_polygon_ingestor.py ________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_polygon_ingestor.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_polygon_ingestor.py:16: in <module>
+    from src.data.polygon_ingestor import PolygonDataIngestor, IngestionMetadata
+src/data/polygon_ingestor.py:30: in <module>
+    from .polygon_client import PolygonClient, PolygonAPIError
+src/data/polygon_client.py:32: in <module>
+    from ..utils.config_loader import Settings
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+_________________ ERROR collecting tests/test_portfolio_env.py _________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_portfolio_env.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_portfolio_env.py:4: in <module>
+    from src.sim.portfolio_env import PortfolioRLEnv, PortfolioEnvConfig
+E   ModuleNotFoundError: No module named 'src.sim.portfolio_env'
+__________________ ERROR collecting tests/test_rl_modules.py ___________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_rl_modules.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_rl_modules.py:12: in <module>
+    from src.rl.ppo_lstm_policy import PPOLSTMPolicy
+src/rl/ppo_lstm_policy.py:14: in <module>
+    from ..utils.config_loader import Settings
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+____________________ ERROR collecting tests/test_trading.py ____________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_trading.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_trading.py:11: in <module>
+    from src.trading.paper_trading import PaperTradingEngine
+src/trading/paper_trading.py:19: in <module>
+    from ..utils.config_loader import Settings
+E   ModuleNotFoundError: No module named 'src.utils.config_loader'
+_________________ ERROR collecting tests/test_walk_forward.py __________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_walk_forward.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_walk_forward.py:5: in <module>
+    from src.utils.wf_cv import EmbargoedWalkForward
+E   ModuleNotFoundError: No module named 'src.utils.wf_cv'
+_____________________ ERROR collecting tests/test_wf_cv.py _____________________
+ImportError while importing test module '/home/jacobw/RL_trading/rl-intraday/tests/test_wf_cv.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_wf_cv.py:2: in <module>
+    from src.utils.wf_cv import EmbargoedWalkForward
+E   ModuleNotFoundError: No module named 'src.utils.wf_cv'
+=============================== warnings summary ===============================
+venv/lib/python3.13/site-packages/eventkit/util.py:21
+  /home/jacobw/RL_trading/rl-intraday/venv/lib/python3.13/site-packages/eventkit/util.py:21: DeprecationWarning: There is no current event loop
+    return asyncio.get_event_loop_policy().get_event_loop()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+ERROR bin/debug_test.py
+ERROR bin/test_environment_polygon.py
+ERROR test_polygon_compatibility.py
+ERROR tests/test_artifacts_write.py
+ERROR tests/test_config_loader.py
+ERROR tests/test_cpcv_split.py
+ERROR tests/test_data_modules.py
+ERROR tests/test_env_actions.py
+ERROR tests/test_features.py
+ERROR tests/test_logging.py
+ERROR tests/test_metrics.py
+ERROR tests/test_micro_features.py
+ERROR tests/test_polygon_ingestor.py
+ERROR tests/test_portfolio_env.py
+ERROR tests/test_rl_modules.py
+ERROR tests/test_trading.py
+ERROR tests/test_walk_forward.py
+ERROR tests/test_wf_cv.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 18 errors during collection !!!!!!!!!!!!!!!!!!!
+======================== 1 warning, 18 errors in 46.77s ========================
