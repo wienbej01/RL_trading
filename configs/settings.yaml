@@ -186,6 +186,7 @@ environment:
   # Reward configuration
   reward:
     type: "hybrid2"
+    kind: "hybrid2"  # New: can be "composite" for the new reward function
     regime_weighting: true
     asymmetric_drawdown_penalty: true
     lagrangian_activity_shaping: true
@@ -214,6 +215,13 @@ environment:
     # Potential-based shaping
     potential_weight: 0.1
     discount_factor: 0.99
+    
+    # Composite reward parameters (used when kind: "composite")
+    w_ret: 1.0
+    w_turnover: 0.2
+    w_inv: 0.05
+    w_dsr: 0.0
+    include_costs: true
   
   # Risk management
   risk:

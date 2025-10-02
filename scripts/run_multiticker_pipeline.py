@@ -72,6 +72,8 @@ def parse_args():
                         help='One or more feature pack names (see src/features/packs.py)')
     parser.add_argument('--feature-list-path', type=str, default=None,
                         help='Path to a newline-delimited list of feature names to keep')
+    parser.add_argument('--feature-screen-run', type=str, default=None,
+                        help='Use curated list from results/features/<name>/ if pack starts with curated*')
     # Backtest behavior
     parser.add_argument('--strict-test-window', action='store_true',
                         help='Do not fall back to a different window if the test split is empty')
@@ -98,6 +100,8 @@ def parse_args():
                         help='Subset of tickers to trade during backtest (if provided)')
     parser.add_argument('--load-model', type=str, default=None,
                         help='Path to a saved SB3 model to load for backtest (skip training)')
+    parser.add_argument('--reward-mix', type=str, default=None,
+                        help='Reward mix parameters in format ret=1.0,turnover=0.2,inventory=0.05,dsr=0.0')
     return parser.parse_args()
 
 
@@ -217,6 +221,26 @@ def generate_features(config, args, data):
             if bool(fp_cfg.get('use_pack', False)):
                 packs = fp_cfg.get('packs', []) or []
                 selected = get_features_for_pack(available, packs)
+        # Feature screening: use curated list from a previous screen run if provided
+        if args.feature_screen_run and str(args.feature_pack or '').startswith('curated'):
+            try:
+                import pathlib
+                base = (pathlib.Path('results/features') / args.feature_screen_run).resolve()
+                if base.exists():
+                    used = base / 'features_used.txt'
+                    topn = base / 'curated_topN.txt'
+                    src = used if used.exists() else (topn if topn.exists() else None)
+                    if src is not None and src.exists():
+                        curated = [l.strip() for l in src.read_text().splitlines() if l.strip()]
+                        # Union with selected features if any
+                        if selected:
+                            # Keep only features that are both in selected and curated
+                            selected = [f for f in selected if f in curated]
+                        else:
+                            # Use curated list directly
+                            selected = curated
+            except Exception as e:
+                logger.warning(f"Failed to load feature screen run {args.feature_screen_run}: {e}")
         if selected:
             keep = [c for c in features.columns if (c in selected or c == 'ticker')]
             features = features[keep]
@@ -330,6 +354,26 @@ def main():
     
     # Load configuration
     config = load_config(args.config)
+    
+    # Process reward-mix parameter if provided
+    if args.reward_mix:
+        try:
+            # Parse reward mix parameters
+            reward_params = {}
+            for param in args.reward_mix.split(','):
+                key, value = param.split('=')
+                reward_params[key.strip()] = float(value.strip())
+            
+            # Update config with reward parameters
+            config.setdefault('env', {}).setdefault('reward', {})['kind'] = 'composite'
+            config.setdefault('env', {}).setdefault('reward', {})['w_ret'] = reward_params.get('ret', 1.0)
+            config.setdefault('env', {}).setdefault('reward', {})['w_turnover'] = reward_params.get('turnover', 0.2)
+            config.setdefault('env', {}).setdefault('reward', {})['w_inv'] = reward_params.get('inventory', 0.05)
+            config.setdefault('env', {}).setdefault('reward', {})['w_dsr'] = reward_params.get('dsr', 0.0)
+            config.setdefault('env', {}).setdefault('reward', {})['include_costs'] = reward_params.get('include_costs', True)
+        except Exception as e:
+            logger.warning(f"Failed to parse reward-mix parameter: {e}")
+    
     # Inject portfolio-env flag into config for trainer
     if args.portfolio_env:
         config.setdefault('env', {}).setdefault('portfolio', {})['force'] = True

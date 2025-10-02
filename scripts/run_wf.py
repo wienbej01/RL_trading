@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--feature-pack', type=str, default=None)
     ap.add_argument('--feature-list-path', type=str, default=None)
     ap.add_argument('--feature-screen-run', type=str, default=None, help='Use curated list from results/features/<name>/ if pack starts with curated*')
+    ap.add_argument('--reward-mix', type=str, default=None, help='Reward mix parameters in format ret=1.0,turnover=0.2,inventory=0.05,dsr=0.0')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--strict-test-window', action='store_true', help='Skip tickers with empty test slice; skip window if all empty')
     ap.add_argument('--fast-smoke', action='store_true', help='Fast PPO smoke mode: small MLP policy, fewer steps, no TB/eval, env max 2500 bars')

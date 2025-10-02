@@ -29,6 +29,7 @@ from gymnasium.spaces import Box, MultiDiscrete
 
 from ..utils.config_loader import Settings
 from ..utils.logging import get_logger
+from ..rl.composite_reward import CompositeReward
 
 
 logger = get_logger(__name__)
@@ -212,8 +213,27 @@ class PortfolioRLEnv(Env):
             except Exception:
                 self.atr_map[t] = pd.Series(0.0, index=o.index)
 
+        # Initialize composite reward if configured
+        try:
+            reward_config = getattr(self.cfg, 'reward', {}) if hasattr(self.cfg, 'reward') else {}
+            if reward_config.get('kind') == 'composite':
+                self.composite_reward = CompositeReward(
+                    w_ret=float(reward_config.get('w_ret', 1.0)),
+                    w_turnover=float(reward_config.get('w_turnover', 0.2)),
+                    w_inv=float(reward_config.get('w_inv', 0.05)),
+                    w_dsr=float(reward_config.get('w_dsr', 0.0)),
+                    include_costs=bool(reward_config.get('include_costs', True))
+                )
+            else:
+                self.composite_reward = None
+        except Exception:
+            self.composite_reward = None
+            
         # State
         self.reset()
+        
+        # Track previous equity for PnL calculation
+        self._prev_equity = float(self.cfg.cash)
 
     def _obs(self, i: int) -> np.ndarray:
         # concatenate features in ticker order, then positions
@@ -273,6 +293,12 @@ class PortfolioRLEnv(Env):
         # Allowed tickers mask
         allowed = set(self.cfg.allowed_trade_tickers or [])
         self.allowed_mask = np.array([(t in allowed) for t in self.tickers], dtype=bool) if allowed else None
+        # Reset composite reward if it exists
+        if self.composite_reward is not None:
+            self.composite_reward.reset()
+        # Track previous equity and transaction costs for reward calculation
+        self._prev_equity = float(self.cfg.cash)
+        self._prev_tx_costs = 0.0
         return self._obs(self.i), {}
 
     def step(self, action: np.ndarray):
@@ -427,27 +453,50 @@ class PortfolioRLEnv(Env):
             prev_p = float(np.nan_to_num(self.ohlcv[t]["close"].iloc[self.i - 1], nan=0.0, posinf=0.0, neginf=0.0))
             cur_p = float(np.nan_to_num(self.ohlcv[t]["close"].iloc[self.i], nan=0.0, posinf=0.0, neginf=0.0))
             pnl += (cur_p - prev_p) * float(self.units[k]) * float(self.point_value)
-        # Reward shaping penalties
-        turnover = float(np.sum(np.abs(change_units)))
-        # Gross exposure value at current bar
-        gross_exposure_val = float(np.sum(np.abs(self.units) * prices * float(self.point_value)))
-        exposure_violation = max(0.0, gross_exposure_val - cap) if cap > 0 else 0.0
+            
+        # Use composite reward if configured, otherwise use existing reward calculation
+        if self.composite_reward is not None:
+            # Calculate transaction cost for this step
+            tx_cost = 0.0
+            if self.composite_reward.include_costs:
+                try:
+                    tx_cost = float(getattr(self, 'tx_costs_total', 0.0)) - float(getattr(self, '_prev_tx_costs', 0.0))
+                    self._prev_tx_costs = float(getattr(self, 'tx_costs_total', 0.0))
+                except Exception:
+                    tx_cost = 0.0
+            
+            # Calculate composite reward
+            reward, reward_info = self.composite_reward.step(float(pnl), int(np.sum(self.pos)), float(tx_cost))
+            
+            # Apply reward scaling
+            shaped = reward * float(self.cfg.reward_scaling) if hasattr(self.cfg, 'reward_scaling') else reward
+        else:
+            # Reward shaping penalties
+            turnover = float(np.sum(np.abs(change_units)))
+            # Gross exposure value at current bar
+            gross_exposure_val = float(np.sum(np.abs(self.units) * prices * float(self.point_value)))
+            exposure_violation = max(0.0, gross_exposure_val - cap) if cap > 0 else 0.0
 
-        # Holding penalty: per open position per bar
-        open_count = int(np.sum(self.pos != 0))
-        hold_pen = float(self.cfg.position_holding_penalty) * float(open_count)
+            # Holding penalty: per open position per bar
+            open_count = int(np.sum(self.pos != 0))
+            hold_pen = float(self.cfg.position_holding_penalty) * float(open_count)
 
-        shaped = pnl \
-            - float(self.cfg.turnover_penalty) * turnover \
-            - float(self.cfg.exposure_penalty) * exposure_violation \
-            - hold_pen
-        # sanitize shaped
-        if not np.isfinite(shaped):
-            shaped = 0.0
+            shaped = pnl \
+                - float(self.cfg.turnover_penalty) * turnover \
+                - float(self.cfg.exposure_penalty) * exposure_violation \
+                - hold_pen
+            # sanitize shaped
+            if not np.isfinite(shaped):
+                shaped = 0.0
 
         self.cash += float(shaped)
         self.equity = self.cash
         self.equity_curve.append(self.equity)
+        
+        # Track transaction costs for composite reward
+        if self.composite_reward is not None:
+            self._prev_tx_costs = float(getattr(self, 'tx_costs_total', 0.0))
+            
         # Record step history
         try:
             ts = self.index[self.i]

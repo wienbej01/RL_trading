@@ -206,6 +206,23 @@ class IntradayRLEnv(Env):
 
         # Reward tracking
         self.dsr = DifferentialSharpe()
+        
+        # Initialize composite reward if configured
+        try:
+            rw_cfg = (self.config.get('env', {}).get('reward', {}) if isinstance(self.config, dict) else {}) or {}
+            if rw_cfg.get('kind') == 'composite':
+                from ..rl.composite_reward import CompositeReward
+                self.composite_reward = CompositeReward(
+                    w_ret=float(rw_cfg.get('w_ret', 1.0)),
+                    w_turnover=float(rw_cfg.get('w_turnover', 0.2)),
+                    w_inv=float(rw_cfg.get('w_inv', 0.05)),
+                    w_dsr=float(rw_cfg.get('w_dsr', 0.0)),
+                    include_costs=bool(rw_cfg.get('include_costs', True))
+                )
+            else:
+                self.composite_reward = None
+        except Exception:
+            self.composite_reward = None
 
         logger.info(f"Environment initialized with {len(self.ohlcv)} bars, {feature_dim} features from {getattr(self, 'data_source', 'unknown')} data")
     
@@ -253,6 +270,12 @@ class IntradayRLEnv(Env):
         self._sum_abs_dpos = 0.0
         self._reward_steps = 0
         self._diagnostics = []
+        # Track previous transaction costs for composite reward calculation
+        self._prev_tx_costs = 0.0
+        
+        # Reset composite reward if it exists
+        if self.composite_reward is not None:
+            self.composite_reward.reset()
         
         # Reset risk manager
         self.risk_manager.reset_daily_metrics()
@@ -788,6 +811,10 @@ class IntradayRLEnv(Env):
 
         # Compute pnl for reward as realized delta in equity this step
         pnl = float(self.equity - prev_equity)
+        
+        # Track transaction costs for composite reward
+        if self.composite_reward is not None:
+            self._prev_tx_costs = float(getattr(self, 'tx_costs_total', 0.0))
 
         # Compute risk penalties per modified_step logic
         # Drawdown as fraction from peak equity
@@ -811,162 +838,184 @@ class IntradayRLEnv(Env):
         risk_penalty = max(0.0, float(realised_fraction))  # penalize only when drawdown is present
 
         # --- Reward Calculation ---
-        # Compute bar return for optional directional shaping (de-meaned within day)
-        try:
-            prev_price = float(self.df["close"].iloc[self.i - 1]) if self.i > 0 else price
-            bar_return = (price - prev_price) / max(prev_price, 1e-8)
-        except Exception:
-            bar_return = 0.0
+        # Use composite reward if configured, otherwise use existing reward calculation
+        if self.composite_reward is not None:
+            # Calculate transaction cost for this step
+            tx_cost = 0.0
+            if self.include_costs:
+                try:
+                    tx_cost = float(getattr(self, 'tx_costs_total', 0.0)) - float(getattr(self, '_prev_tx_costs', 0.0))
+                    self._prev_tx_costs = float(getattr(self, 'tx_costs_total', 0.0))
+                except Exception:
+                    tx_cost = 0.0
+            
+            # Calculate composite reward
+            reward, reward_info = self.composite_reward.step(float(pnl), int(self.pos), float(tx_cost))
+            
+            # Apply reward scaling
+            reward *= self.env_config.reward_scaling
+            reward = np.clip(reward, -1, 1)
+        else:
+            # Compute bar return for optional directional shaping (de-meaned within day)
+            try:
+                prev_price = float(self.df["close"].iloc[self.i - 1]) if self.i > 0 else price
+                bar_return = (price - prev_price) / max(prev_price, 1e-8)
+            except Exception:
+                bar_return = 0.0
 
-        # Update daily mean return trackers (use previous mean to de-mean current return)
-        try:
-            day_mean_ret = (self._day_return_sum / max(1, self._day_return_count))
-        except Exception:
-            day_mean_ret = 0.0
-        # Remove de-meaning bias - use raw bar_return for directional rewards
-        # The de-meaning was penalizing correct directional bets
-        eff_bar_return = float(bar_return)  # Use raw return, not de-meaned
-        # Update running stats after computing eff return
-        try:
-            self._day_return_sum += float(bar_return)
-            self._day_return_count += 1
-        except Exception:
-            pass
-        # Compute normalized PnL using ATR if requested
-        try:
-            pnl_cap = float(self.config.get('env', {}).get('reward', {}).get('pnl_cap', 1.0)) if isinstance(self.config, dict) else 1.0
-        except Exception:
-            pnl_cap = 1.0
-        pnl_norm = 0.0
-        try:
-            denom = max(1e-6, atr_val * float(getattr(self, 'point_value', 1.0)))
-            pnl_norm = float(np.clip(pnl / denom, -pnl_cap, pnl_cap))
-        except Exception:
+            # Update daily mean return trackers (use previous mean to de-mean current return)
+            try:
+                day_mean_ret = (self._day_return_sum / max(1, self._day_return_count))
+            except Exception:
+                day_mean_ret = 0.0
+            # Remove de-meaning bias - use raw bar_return for directional rewards
+            # The de-meaning was penalizing correct directional bets
+            eff_bar_return = float(bar_return)  # Use raw return, not de-meaned
+            # Update running stats after computing eff return
+            try:
+                self._day_return_sum += float(bar_return)
+                self._day_return_count += 1
+            except Exception:
+                pass
+            # Compute normalized PnL using ATR if requested
+            try:
+                pnl_cap = float(self.config.get('env', {}).get('reward', {}).get('pnl_cap', 1.0)) if isinstance(self.config, dict) else 1.0
+            except Exception:
+                pnl_cap = 1.0
             pnl_norm = 0.0
-
-        # Drawdown acceleration penalty (EMA of dd slope)
-        try:
-            dd = (self.equity / max(self.max_equity, 1e-6)) - 1.0
-            dd_slope = float(dd - self._prev_dd)
-            self._prev_dd = float(dd)
-            # EMA update
-            dd_alpha = 0.2
-            self._dd_slope_ema = (1 - dd_alpha) * self._dd_slope_ema + dd_alpha * dd_slope
-        except Exception:
-            dd_slope = 0.0
-
-        if self.env_config.reward_type == 'pnl':
-            reward = pnl
-        elif self.env_config.reward_type == 'dsr':
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            reward = self.dsr.update(step_return)
-        elif self.env_config.reward_type == 'sharpe':
-            # Note: simplified Sharpe ratio proxy per step
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            reward = step_return / (np.std(self.equity_curve) + 1e-8) if len(self.equity_curve) > 1 else 0.0
-        elif self.env_config.reward_type == 'blend':
-            # Blended reward: alpha * DSR + beta * raw_pnl - penalties
-            alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.5)) if isinstance(self.config, dict) else 0.5
-            beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.5)) if isinstance(self.config, dict) else 0.5
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            dsr_val = self.dsr.update(step_return)
-            reward = alpha * dsr_val + beta * pnl
-            # Microstructure penalty (optional): discourage trading in poor liquidity
             try:
-                rvol = float(self.X.loc[ts].get('rvol', 1.0))
-                spread = float(self.X.loc[ts].get('spread', 0.0))
-                mu_pen = float(self.config.get('env', {}).get('reward', {}).get('micro_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
-                # time-of-day widening: add extra penalty during first/last widen window
-                widen_min = int(self.config.get('env', {}).get('trading', {}).get('widen_spread_minutes', 0)) if isinstance(self.config, dict) else 0
-                minutes_since_midnight = ts.hour * 60 + ts.minute
-                session_open = 9 * 60 + 30
-                session_close = 16 * 60
-                in_widen = (widen_min and session_open <= minutes_since_midnight < session_open + widen_min) or \
-                           (widen_min and session_close - widen_min <= minutes_since_midnight < session_close)
-                widen_factor = 1.0 + (0.25 if in_widen else 0.0)
-                # apply micro penalty only under poor liquidity
-                if rvol < 1.0:
-                    reward -= mu_pen * widen_factor * (max(0.0, 1.5 - rvol) + spread)
+                denom = max(1e-6, atr_val * float(getattr(self, 'point_value', 1.0)))
+                pnl_norm = float(np.clip(pnl / denom, -pnl_cap, pnl_cap))
             except Exception:
-                pass
-            # Optional activity shaping toward target trades/day
+                pnl_norm = 0.0
+
+            # Drawdown acceleration penalty (EMA of dd slope)
             try:
-                if self.entry_index == self.i:
-                    target = int(self.config.get('env', {}).get('reward', {}).get('trade_target_per_day', 2)) if isinstance(self.config, dict) else 2
-                    bonus = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
-                    penalty = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
-                    if self._daily_trade_count <= target:
-                        reward += bonus
+                dd = (self.equity / max(self.max_equity, 1e-6)) - 1.0
+                dd_slope = float(dd - self._prev_dd)
+                self._prev_dd = float(dd)
+                # EMA update
+                dd_alpha = 0.2
+                self._dd_slope_ema = (1 - dd_alpha) * self._dd_slope_ema + dd_alpha * dd_slope
+            except Exception:
+                dd_slope = 0.0
+
+            if self.env_config.reward_type == 'pnl':
+                reward = pnl
+            elif self.env_config.reward_type == 'dsr':
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                reward = self.dsr.update(step_return)
+            elif self.env_config.reward_type == 'sharpe':
+                # Note: simplified Sharpe ratio proxy per step
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                reward = step_return / (np.std(self.equity_curve) + 1e-8) if len(self.equity_curve) > 1 else 0.0
+            elif self.env_config.reward_type == 'blend':
+                # Blended reward: alpha * DSR + beta * raw_pnl - penalties
+                alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.5)) if isinstance(self.config, dict) else 0.5
+                beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.5)) if isinstance(self.config, dict) else 0.5
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                dsr_val = self.dsr.update(step_return)
+                reward = alpha * dsr_val + beta * pnl
+                # Microstructure penalty (optional): discourage trading in poor liquidity
+                try:
+                    rvol = float(self.X.loc[ts].get('rvol', 1.0))
+                    spread = float(self.X.loc[ts].get('spread', 0.0))
+                    mu_pen = float(self.config.get('env', {}).get('reward', {}).get('micro_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                    # time-of-day widening: add extra penalty during first/last widen window
+                    widen_min = int(self.config.get('env', {}).get('trading', {}).get('widen_spread_minutes', 0)) if isinstance(self.config, dict) else 0
+                    minutes_since_midnight = ts.hour * 60 + ts.minute
+                    session_open = 9 * 60 + 30
+                    session_close = 16 * 60
+                    in_widen = (widen_min and session_open <= minutes_since_midnight < session_open + widen_min) or \
+                               (widen_min and session_close - widen_min <= minutes_since_midnight < session_close)
+                    widen_factor = 1.0 + (0.25 if in_widen else 0.0)
+                    # apply micro penalty only under poor liquidity
+                    if rvol < 1.0:
+                        reward -= mu_pen * widen_factor * (max(0.0, 1.5 - rvol) + spread)
+                except Exception:
+                    pass
+                # Optional activity shaping toward target trades/day
+                try:
+                    if self.entry_index == self.i:
+                        target = int(self.config.get('env', {}).get('reward', {}).get('trade_target_per_day', 2)) if isinstance(self.config, dict) else 2
+                        bonus = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
+                        penalty = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                        if self._daily_trade_count <= target:
+                            reward += bonus
+                        else:
+                            # penalize excess trades beyond target
+                            reward -= penalty * max(0, int(self._daily_trade_count) - target)
                     else:
-                        # penalize excess trades beyond target
-                        reward -= penalty * max(0, int(self._daily_trade_count) - target)
-                else:
-                    # Backward-compatible open bonus
-                    open_bonus = float(self.config.get('env', {}).get('reward', {}).get('open_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
-                    if open_bonus > 0 and self.entry_index == self.i:
-                        reward += open_bonus
-            except Exception:
-                pass
-            reward -= float(drawdown_penalty) + float(risk_penalty)
-        elif self.env_config.reward_type == 'directional':
-            # Pure directional shaping on chosen action (short=-1, hold=0, long=1)
-            # Encourages taking a side even before a position is opened.
-            try:
-                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
-            except Exception:
-                dir_w = 100.0
-            reward = dir_w * float(desired_dir) * float(eff_bar_return)
-            reward -= float(drawdown_penalty) + float(risk_penalty)
-        elif self.env_config.reward_type == 'hybrid':
-            # Hybrid: blend of DSR, PnL, and directional shaping
-            try:
-                alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.2)) if isinstance(self.config, dict) else 0.2
-                beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.3)) if isinstance(self.config, dict) else 0.3
-                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
-            except Exception:
-                alpha, beta, dir_w = 0.2, 0.3, 100.0
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            dsr_val = self.dsr.update(step_return)
-            reward = alpha * dsr_val + beta * pnl + dir_w * float(desired_dir) * float(eff_bar_return)
-            reward -= float(drawdown_penalty) + float(risk_penalty)
-        elif self.env_config.reward_type == 'hybrid2':
-            # Best-practice hybrid: normalized PnL + DSR + drift-neutral directional + activity soft-constraint + churn + dd accel
-            try:
-                alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.15)) if isinstance(self.config, dict) else 0.15
-                beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.25)) if isinstance(self.config, dict) else 0.25
-                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 300.0)) if isinstance(self.config, dict) else 300.0
-                churn_pen = float(self.config.get('env', {}).get('reward', {}).get('churn_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
-                dd_accel_pen = float(self.config.get('env', {}).get('reward', {}).get('dd_accel_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
-            except Exception:
-                alpha, beta, dir_w, churn_pen, dd_accel_pen = 0.15, 0.25, 300.0, 0.0, 0.0
-            # Regime weighting via VIX if available
-            try:
-                vix = float(self.X.loc[ts].get('vix', np.nan))
-                if vix == vix:
-                    vix_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_low', 15.0))
-                    vix_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_high', 25.0))
-                    w_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_low', 0.7))
-                    w_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_high', 1.2))
-                    regime_mult = w_low if vix < vix_low else (w_high if vix > vix_high else 1.0)
-                else:
+                        # Backward-compatible open bonus
+                        open_bonus = float(self.config.get('env', {}).get('reward', {}).get('open_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
+                        if open_bonus > 0 and self.entry_index == self.i:
+                            reward += open_bonus
+                except Exception:
+                    pass
+                reward -= float(drawdown_penalty) + float(risk_penalty)
+            elif self.env_config.reward_type == 'directional':
+                # Pure directional shaping on chosen action (short=-1, hold=0, long=1)
+                # Encourages taking a side even before a position is opened.
+                try:
+                    dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
+                except Exception:
+                    dir_w = 100.0
+                reward = dir_w * float(desired_dir) * float(eff_bar_return)
+                reward -= float(drawdown_penalty) + float(risk_penalty)
+            elif self.env_config.reward_type == 'hybrid':
+                # Hybrid: blend of DSR, PnL, and directional shaping
+                try:
+                    alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.2)) if isinstance(self.config, dict) else 0.2
+                    beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.3)) if isinstance(self.config, dict) else 0.3
+                    dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
+                except Exception:
+                    alpha, beta, dir_w = 0.2, 0.3, 100.0
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                dsr_val = self.dsr.update(step_return)
+                reward = alpha * dsr_val + beta * pnl + dir_w * float(desired_dir) * float(eff_bar_return)
+                reward -= float(drawdown_penalty) + float(risk_penalty)
+            elif self.env_config.reward_type == 'hybrid2':
+                # Best-practice hybrid: normalized PnL + DSR + drift-neutral directional + activity soft-constraint + churn + dd accel
+                try:
+                    alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.15)) if isinstance(self.config, dict) else 0.15
+                    beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.25)) if isinstance(self.config, dict) else 0.25
+                    dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 300.0)) if isinstance(self.config, dict) else 300.0
+                    churn_pen = float(self.config.get('env', {}).get('reward', {}).get('churn_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                    dd_accel_pen = float(self.config.get('env', {}).get('reward', {}).get('dd_accel_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                except Exception:
+                    alpha, beta, dir_w, churn_pen, dd_accel_pen = 0.15, 0.25, 300.0, 0.0, 0.0
+                # Regime weighting via VIX if available
+                try:
+                    vix = float(self.X.loc[ts].get('vix', np.nan))
+                    if vix == vix:
+                        vix_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_low', 15.0))
+                        vix_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_high', 25.0))
+                        w_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_low', 0.7))
+                        w_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_high', 1.2))
+                        regime_mult = w_low if vix < vix_low else (w_high if vix > vix_high else 1.0)
+                    else:
+                        regime_mult = 1.0
+                except Exception:
                     regime_mult = 1.0
-            except Exception:
-                regime_mult = 1.0
-            # Activity term (apply on opens tracked separately below)
-            activity_term = 0.0
-            # Churn penalty: penalize side flips when flat
-            if self.pos == 0 and desired_dir != 0 and self._last_action_dir != 0 and desired_dir != self._last_action_dir:
-                activity_term -= churn_pen
-            # Drawdown acceleration penalty (only penalize positive slope)
-            if self._dd_slope_ema > 0:
-                activity_term -= dd_accel_pen * float(self._dd_slope_ema)
-            # Core blend
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            dsr_val = self.dsr.update(step_return)
-            reward = alpha * dsr_val + beta * pnl_norm + dir_w * regime_mult * float(desired_dir) * float(eff_bar_return) + activity_term
-            reward -= float(drawdown_penalty) + float(risk_penalty)
-        else:  # Default to pnl with penalties
-            reward = pnl - float(drawdown_penalty) - float(risk_penalty)
+                # Activity term (apply on opens tracked separately below)
+                activity_term = 0.0
+                # Churn penalty: penalize side flips when flat
+                if self.pos == 0 and desired_dir != 0 and self._last_action_dir != 0 and desired_dir != self._last_action_dir:
+                    activity_term -= churn_pen
+                # Drawdown acceleration penalty (only penalize positive slope)
+                if self._dd_slope_ema > 0:
+                    activity_term -= dd_accel_pen * float(self._dd_slope_ema)
+                # Core blend
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                dsr_val = self.dsr.update(step_return)
+                reward = alpha * dsr_val + beta * pnl_norm + dir_w * regime_mult * float(desired_dir) * float(eff_bar_return) + activity_term
+                reward -= float(drawdown_penalty) + float(risk_penalty)
+            else:  # Default to pnl with penalties
+                reward = pnl - float(drawdown_penalty) - float(risk_penalty)
+            
+            # Apply reward scaling for non-composite rewards
+            reward *= self.env_config.reward_scaling
+            reward = np.clip(reward, -1, 1)
 
         # Optional hold penalty to discourage persistent inactivity when flat
         try:

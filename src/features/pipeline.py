@@ -661,6 +661,11 @@ class FeaturePipeline:
                     "queue_imbalance": "queue_imbalance_proxy",
                 }
                 resolved = [L1_TO_OHLCV.get(str(f), str(f)) for f in resolved]
+                # Validate that no L1 names remain in resolved list
+                L1_NAMES = {"ofi_best", "spread_bps", "quote_intensity", "queue_imbalance"}
+                remaining_l1 = [f for f in resolved if f in L1_NAMES]
+                if remaining_l1:
+                    raise ValueError(f"L1 feature names still present after remap when HAS_L1=False: {remaining_l1}")
         except Exception:
             pass
         
@@ -811,18 +816,39 @@ class FeaturePipeline:
                 need = {'bid_price','bid_size','ask_price','ask_size'}
                 if need.issubset(set(data.columns)):
                     features['order_flow_imbalance'] = calculate_order_flow_imbalance(
-                        data['bid_price'], data['bid_size'], 
+                        data['bid_price'], data['bid_size'],
                         data['ask_price'], data['ask_size']
                     )
-                    try:
-                        features['ofi_best'] = calculate_ofi_best(
-                            data['bid_price'], data['bid_size'], data['ask_price'], data['ask_size']
-                        )
-                    except Exception as e:
-                        self.logger.warning(f"Failed to compute ofi_best: {e}")
+                    # Only compute ofi_best if L1 data is available
+                    if 'resolved' in locals() and resolved is not None:
+                        # Check if ofi_best or its proxy is in resolved features
+                        if "ofi_best" in resolved or "ofi_proxy" in resolved:
+                            try:
+                                features['ofi_best'] = calculate_ofi_best(
+                                    data['bid_price'], data['bid_size'], data['ask_price'], data['ask_size']
+                                )
+                            except Exception as e:
+                                self.logger.warning(f"Failed to compute ofi_best: {e}")
+                    elif 'ofi_best' in resolved or 'ofi_proxy' in resolved:
+                        # Fallback if resolved is not available in locals
+                        try:
+                            features['ofi_best'] = calculate_ofi_best(
+                                data['bid_price'], data['bid_size'], data['ask_price'], data['ask_size']
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to compute ofi_best: {e}")
+                elif 'resolved' in locals() and resolved is not None:
+                    # If L1 data is not available but ofi_proxy is requested, compute it
+                    if "ofi_proxy" in resolved and "ofi_proxy" not in features.columns:
+                        try:
+                            features['ofi_proxy'] = OHLCV_MICRO['ofi_proxy'](data)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to compute ofi_proxy: {e}")
                 else:
                     missing = sorted(list(need.difference(set(data.columns))))
-                    self.logger.warning(f"Cannot compute ofi_best/OFI: missing raw fields {missing}")
+                    # Only log warning if we're actually trying to compute L1 features
+                    if 'calculate_order_flow_imbalance' in micro_config and micro_config['calculate_order_flow_imbalance']:
+                        self.logger.warning(f"Cannot compute ofi_best/OFI: missing raw fields {missing}")
             
             # Calculate VWAP
             if 'calculate_vwap' in micro_config and micro_config['calculate_vwap']:
@@ -842,16 +868,30 @@ class FeaturePipeline:
                 if {'bid_price','ask_price'}.issubset(data.columns):
                     features['spread_bps'] = compute_spread_bps(bid=data['bid_price'], ask=data['ask_price'])
                 elif {'high','low','close'}.issubset(data.columns):
-                    try:
-                        self.logger.warning("Using HL proxy for spread_bps (quotes unavailable)")
-                    except Exception:
-                        pass
-                    features['spread_bps'] = compute_spread_bps(high=data['high'], low=data['low'], close=data['close'])
+                    # Only compute HL proxy if spread_bps_hl is requested
+                    if 'resolved' in locals() and resolved is not None and "spread_bps_hl" in resolved:
+                        try:
+                            features['spread_bps_hl'] = OHLCV_MICRO['spread_bps_hl'](data)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to compute spread_bps_hl: {e}")
+                    elif 'spread_bps_hl' in resolved:
+                        # Fallback if resolved is not available in locals
+                        try:
+                            features['spread_bps_hl'] = OHLCV_MICRO['spread_bps_hl'](data)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to compute spread_bps_hl: {e}")
                 else:
-                    self.logger.warning("Cannot compute spread_bps: missing both bid/ask and high/low/close for fallback")
+                    # Only log warning if we're actually trying to compute spread_bps
+                    if 'calculate_spread' in micro_config and micro_config['calculate_spread']:
+                        self.logger.warning("Cannot compute spread_bps: missing both bid/ask and high/low/close for fallback")
                 # quote_intensity
                 if 'transactions' in data.columns or 'volume' in data.columns:
-                    features['quote_intensity'] = compute_quote_intensity(data.get('transactions'), data.get('volume'))
+                    # Only compute quote_intensity if it's in resolved features or explicitly requested
+                    if 'resolved' in locals() and resolved is not None and "quote_intensity" in resolved:
+                        features['quote_intensity'] = compute_quote_intensity(data.get('transactions'), data.get('volume'))
+                    elif 'quote_intensity' in resolved:
+                        # Fallback if resolved is not available in locals
+                        features['quote_intensity'] = compute_quote_intensity(data.get('transactions'), data.get('volume'))
                 # queue_imbalance already computed above when bid/ask sizes present
             except Exception:
                 pass
@@ -1363,6 +1403,7 @@ class FeaturePipeline:
             except Exception as e:
                 self.logger.warning(f"Correlation filtering skipped: {e}")
 
+        # Log the final feature count after all processing
         self.logger.info("Extracted %d features", len(features.columns))
 
         # Optional regime features (low-cost tags; causal rolling, t-1)
@@ -1674,6 +1715,9 @@ def build_features_for_window(
 
     try:
         (window_path / 'features_used.txt').write_text("\n".join(curated) + "\n")
+        # Also write to screen_path for consistency
+        if screen_path != window_path:
+            (screen_path / 'features_used.txt').write_text("\n".join(curated) + "\n")
     except Exception:
         pass
 
