@@ -102,6 +102,14 @@ def parse_args():
                         help='Path to a saved SB3 model to load for backtest (skip training)')
     parser.add_argument('--reward-mix', type=str, default=None,
                         help='Reward mix parameters in format ret=1.0,turnover=0.2,inventory=0.05,dsr=0.0')
+    parser.add_argument('--reward-scale', type=float, default=None,
+                        help='Scaling factor applied to composite reward before clipping')
+    parser.add_argument('--risk-per-trade-frac', type=float, default=None,
+                        help='Override risk per trade fraction (e.g., 0.01 == 1% of equity)')
+    parser.add_argument('--max-position-shares', type=int, default=None,
+                        help='Maximum absolute position size in shares')
+    parser.add_argument('--max-daily-loss-pct', type=float, default=None,
+                        help='Maximum daily loss as percent of equity before kill-switch triggers (e.g., 2.0 for 2%)')
     return parser.parse_args()
 
 
@@ -256,6 +264,15 @@ def generate_features(config, args, data):
     
     logger.info(f"Features generated and saved to {features_file}")
     logger.info(f"Features shape: {features.shape}")
+
+    try:
+        feature_pipeline.write_reports(
+            features_path,
+            prefix=f"{args.train_start}_{args.test_end}",
+            features=features
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write feature pipeline reports: {e}")
     
     return features
 
@@ -338,6 +355,48 @@ def run_backtest(config, args, model, trainer, test_data, test_features):
     return backtest_results
 
 
+def check_guardrails(
+    metrics: dict,
+    min_trades: int = 10,
+    max_turnover: float = 10.0,
+    min_dsr: float | None = 0.0,
+) -> bool:
+    """
+    Check if the model performance meets the guardrails.
+
+    Args:
+        metrics: Dictionary of backtest metrics.
+        min_trades: Minimum number of trades.
+        max_turnover: Maximum turnover.
+
+    Returns:
+        True if guardrails are met, False otherwise.
+    """
+    if not metrics:
+        logger.warning("Guardrails check skipped: no metrics provided.")
+        return True
+
+    num_trades = metrics.get('total_trades', 0)
+    dsr = metrics.get('dsr', 0.0)
+    turnover = metrics.get('turnover', 0.0)
+
+    if num_trades < min_trades:
+        logger.error(f"Guardrail failed: number of trades ({num_trades}) is less than {min_trades}.")
+        return False
+
+    if min_dsr is not None and dsr < min_dsr:
+        logger.error(f"Guardrail failed: DSR ({dsr}) is below {min_dsr}.")
+        return False
+
+    if turnover > max_turnover:
+        logger.error(f"Guardrail failed: turnover ({turnover}) is greater than {max_turnover}.")
+        return False
+
+    logger.info("All guardrails passed.")
+    return True
+
+
+
 def main():
     """Main function to run the pipeline."""
     args = parse_args()
@@ -362,8 +421,13 @@ def main():
             reward_params = {}
             for param in args.reward_mix.split(','):
                 key, value = param.split('=')
-                reward_params[key.strip()] = float(value.strip())
-            
+                key = key.strip()
+                raw_val = value.strip()
+                if key == 'include_costs':
+                    reward_params[key] = raw_val.lower() in {"1", "true", "yes", "on"}
+                else:
+                    reward_params[key] = float(raw_val)
+
             # Update config with reward parameters
             config.setdefault('env', {}).setdefault('reward', {})['kind'] = 'composite'
             config.setdefault('env', {}).setdefault('reward', {})['w_ret'] = reward_params.get('ret', 1.0)
@@ -373,6 +437,34 @@ def main():
             config.setdefault('env', {}).setdefault('reward', {})['include_costs'] = reward_params.get('include_costs', True)
         except Exception as e:
             logger.warning(f"Failed to parse reward-mix parameter: {e}")
+
+    if args.reward_scale is not None:
+        try:
+            scale_val = float(args.reward_scale)
+            config.setdefault('env', {})['reward_scaling'] = scale_val
+            reward_settings = config.setdefault('env', {}).setdefault('reward', {})
+            reward_settings.setdefault('kind', 'composite')
+            reward_settings['scale'] = scale_val
+        except Exception as e:
+            logger.warning(f"Failed to apply reward-scale override: {e}")
+
+    # Apply risk overrides when provided
+    risk_cfg = config.setdefault('risk', {})
+    if args.risk_per_trade_frac is not None:
+        try:
+            risk_cfg['risk_per_trade_frac'] = float(args.risk_per_trade_frac)
+        except Exception as e:
+            logger.warning(f"Failed to apply risk-per-trade-frac override: {e}")
+    if args.max_position_shares is not None:
+        try:
+            risk_cfg['max_position_size'] = int(args.max_position_shares)
+        except Exception as e:
+            logger.warning(f"Failed to apply max-position-shares override: {e}")
+    if args.max_daily_loss_pct is not None:
+        try:
+            risk_cfg['max_daily_loss_r'] = float(args.max_daily_loss_pct)
+        except Exception as e:
+            logger.warning(f"Failed to apply max-daily-loss-pct override: {e}")
     
     # Inject portfolio-env flag into config for trainer
     if args.portfolio_env:
@@ -502,6 +594,26 @@ def main():
     if not args.skip_backtest and model is not None and trainer is not None:
         try:
             backtest_results = run_backtest(config, args, model, trainer, test_data, test_features)
+
+            # Check guardrails
+            if backtest_results:
+                metrics = backtest_results.get('portfolio_metrics', {})
+                guard_cfg = {}
+                try:
+                    guard_cfg = ((config.get('evaluation') or {}).get('guardrails') if isinstance(config, dict) else {}) or {}
+                except Exception:
+                    guard_cfg = {}
+                min_trades = int(guard_cfg.get('min_trades', 10))
+                max_turnover = float(guard_cfg.get('max_turnover', 10.0))
+                min_dsr = guard_cfg.get('min_dsr', 0.0)
+                if min_dsr is not None:
+                    try:
+                        min_dsr = float(min_dsr)
+                    except Exception:
+                        min_dsr = 0.0
+                if not check_guardrails(metrics, min_trades=min_trades, max_turnover=max_turnover, min_dsr=min_dsr):
+                    sys.exit(1) # Exit with non-zero code
+
         except Exception as e:
             logger.error(f"Backtest failed: {e}")
             # Provide a clear hint for the common cause (empty/unaligned test split)

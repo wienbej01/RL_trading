@@ -31,6 +31,7 @@ from src.features.packs import get_features_for_pack, MICROSTRUCTURE_OHLCV
 from src.rl.multiticker_trainer import MultiTickerRLTrainer
 from src.utils.feat_cache import feature_cache_path, load_features, save_features
 from src.utils.artifacts import write_backtest_artifacts, BacktestResult
+from src.utils.metrics import DifferentialSharpe
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +59,28 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--early-stop', type=str, default=None, help='Early stop spec: "check_freq=10,min_delta=0.001,patience=5" (ignored in --fast-smoke)')
     ap.add_argument('--no-cache', action='store_true', help='Force recompute features (skip cache LOAD) but still SAVE to cache path')
     return ap.parse_args()
+
+
+def _estimate_dsr_from_portfolio(history_path: Path) -> Optional[float]:
+    if not history_path.exists():
+        return None
+    try:
+        df = pd.read_csv(history_path)
+        if 'equity' not in df.columns:
+            return None
+        equity = pd.to_numeric(df['equity'], errors='coerce').dropna()
+        if len(equity) < 3:
+            return None
+        returns = equity.pct_change(fill_method=None).dropna()
+        if returns.empty:
+            return None
+        dsr_calc = DifferentialSharpe()
+        contributions = [dsr_calc.update(float(r)) for r in returns]
+        if not contributions:
+            return None
+        return float(np.mean(contributions))
+    except Exception:
+        return None
 
 
 def _compute_target_returns(ohlcv: pd.DataFrame) -> pd.Series:
@@ -479,6 +502,11 @@ def main() -> int:
             if 'portfolio_metrics' in pm and isinstance(pm['portfolio_metrics'], dict):
                 # Merge nested metrics into top level
                 pm.update(pm['portfolio_metrics'])
+            if pm.get('dsr') is None:
+                dsr_guess = _estimate_dsr_from_portfolio(wdir / tck / 'backtest' / 'portfolio_history.csv')
+                if dsr_guess is not None:
+                    pm['dsr'] = dsr_guess
+            pm.setdefault('dsr', 0.0)
             # Verify features include microstructure signals used for parity/shorts
             try:
                 feats_used = set(res.feature_names or curated)
@@ -528,6 +556,7 @@ def main() -> int:
                 'long_ret': float(pm.get('long_ret', 0.0)) if pm.get('long_ret') is not None else None,
                 'short_ret': float(pm.get('short_ret', 0.0)) if pm.get('short_ret') is not None else None,
                 'parity_flag': pm.get('parity_flag', None),
+                'dsr': float(pm.get('dsr', 0.0)) if pm.get('dsr') is not None else 0.0,
             }
             # Parity flag refinement
             try:
@@ -562,6 +591,7 @@ def main() -> int:
                 'long_trades': int(dfp.get('long_trades', pd.Series(dtype=float)).sum(skipna=True) if not dfp.empty else 0),
                 'short_trades': int(dfp.get('short_trades', pd.Series(dtype=float)).sum(skipna=True) if not dfp.empty else 0),
                 'tx_costs_total': float(dfp.get('tx_costs_total', pd.Series(dtype=float)).sum(skipna=True) if not dfp.empty else 0.0),
+                'dsr': float(dfp.get('dsr', pd.Series(dtype=float)).mean(skipna=True) if not dfp.empty and 'dsr' in dfp else 0.0),
                 'no_shorts_tickers': int(((dfp.get('short_trades', pd.Series(dtype=float)) == 0) | (dfp.get('short_steps', pd.Series(dtype=float)) == 0)).sum()) if not dfp.empty else 0,
             }
         else:
@@ -605,10 +635,12 @@ def main() -> int:
         'agg_pf': float(dfw.get('profit_factor', pd.Series(dtype=float)).mean(skipna=True) if not dfw.empty else 0.0),
         'agg_ret': float(dfw.get('total_return', pd.Series(dtype=float)).mean(skipna=True) if not dfw.empty else 0.0),
         'agg_maxdd': float(dfw.get('max_drawdown', pd.Series(dtype=float)).min(skipna=True) if not dfw.empty else 0.0),
+        'agg_dsr': float(dfw.get('dsr', pd.Series(dtype=float)).mean(skipna=True) if not dfw.empty and 'dsr' in dfw.columns else 0.0),
         'trades_total': int(dfw.get('total_trades', pd.Series(dtype=float)).sum(skipna=True) if not dfw.empty else 0),
         'long_total': int(dfw.get('long_trades', pd.Series(dtype=float)).sum(skipna=True) if not dfw.empty else 0),
         'short_total': int(dfw.get('short_trades', pd.Series(dtype=float)).sum(skipna=True) if not dfw.empty else 0),
         'costs_total': float(dfw.get('tx_costs_total', pd.Series(dtype=float)).sum(skipna=True) if not dfw.empty else 0.0),
+        'median_dsr': float(dfw.get('dsr', pd.Series(dtype=float)).median(skipna=True) if not dfw.empty and 'dsr' in dfw.columns else 0.0),
         'windows': per_win,
         'tickers': args.tickers,
         'skipped_windows': skipped_windows,

@@ -264,6 +264,10 @@ def _cli_main() -> int:
     ohlcv = pd.concat(frames, axis=0)
     pipe = FeaturePipeline(cfg.get('features', {}))
     feats = pipe.fit_transform(ohlcv)
+    try:
+        pipe.write_reports(out_dir, prefix=args.run_name, features=feats)
+    except Exception as exc:
+        print(f"[screen] feature report export failed: {exc}")
     # Label: signed_ret forward horizon
     by_t = []
     for t in sorted(pd.unique(ohlcv['ticker'])):

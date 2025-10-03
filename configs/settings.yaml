@@ -5,6 +5,14 @@ data:
   # Use chunked loading for memory efficiency
   use_chunked_loading: true
   chunk_size: "1M"
+
+  source:
+    provider: gcs
+    bucket: jwss_data_store
+    base_prefix: stocks
+    project: llm-behavior-trading
+    filename_pattern: "{symbol}/{year}/{symbol}_{year}-{month:02d}.parquet"
+    log_headers: true
   
   # Enable data caching
   enable_caching: true
@@ -222,21 +230,32 @@ environment:
     w_inv: 0.01
     w_dsr: 0.1
     include_costs: true
-  
-  # Risk management
-  risk:
-    max_position_size: 0.2
-    max_portfolio_risk: 0.02
-    stop_loss: 0.05
-    take_profit: 0.1
-    correlation_limit: 0.7
-  
-  # Execution
-  execution:
-    slippage_bps: 5
-    commission_bps: 2
-    market_impact_model: "square_root"
-    fill_probability: 0.95
+
+# Top-level risk management defaults
+risk:
+  risk_per_trade_frac: 0.01
+  stop_r_multiple: 1.0
+  tp_r_multiple: 1.5
+  max_daily_loss_r: 2.0      # 2% of equity
+  max_position_size: 200     # shares
+  max_leverage: 2.0
+  drawdown_limit: 0.10
+  var_confidence: 0.95
+  cvar_confidence: 0.95
+  correlation_limit: 0.7
+
+# Execution defaults for share-based assets (e.g., SPY ETF)
+execution:
+  point_value: 1.0
+  tick_value: 0.01
+  spread_ticks: 1
+  slippage_bps: 0.10
+  impact_bps: 0.05
+  commission_per_contract: 0.0005
+  min_commission: 0.0
+  market_impact_model: "square_root"
+  fill_probability: 0.95
+
 
 # Walk-forward optimization configuration
 walkforward:
@@ -249,10 +268,10 @@ walkforward:
 
 # Tiny-smoke defaults for equities (SPY) — realistic bps-based costs
 costs:
-  commission_bps: 0.2   # 0.20 bps of notional per trade
-  spread_bps: 0.3       # 0.30 bps of notional per trade
-  slippage_bps: 0.2     # 0.20 bps of notional per trade
-  impact_k: 0.0         # additional impact multiplier on notional (0 to disable)
+  commission_bps: 0.0
+  spread_bps: 0.0
+  slippage_bps: 0.0
+  impact_k: 0.0
 
 position:
   unit_size: 1.0        # shares per unit quantity
@@ -486,7 +505,7 @@ secrets:
 rl:
   algo: ppo
   seed: 123
-  n_envs: 8
+  n_envs: 4
   vecnormalize:
     norm_obs: true
     norm_reward: true
@@ -503,9 +522,12 @@ rl:
     max_grad_norm: 0.5
     target_kl: 0.01
     # Schedules and ranges
-    lr_schedule: linear
+    lr_schedule: cosine
     lr_start: 1.5e-4
     lr_end: 1.0e-5
+    ent_coef_schedule: linear
+    ent_coef_start: 0.02
+    ent_coef_end: 0.005
     clip_schedule: linear
     clip_start: 0.15
     clip_end: 0.12
@@ -515,7 +537,8 @@ rl:
       net_arch:
         pi: [256, 256]
         vf: [256, 256]
-      activation_fn: ReLU
+      # activation_fn: "torch.nn.ReLU"
+      lstm_hidden_size: 256
       ortho_init: true
   eval:
     eval_freq: 100000
@@ -571,8 +594,14 @@ env:
     force_warmup_frac: 0.25
     max_entries_per_day: 2
     max_trades_per_hour: 3
-  portfolio:
-    force: true
-    min_hold_minutes: 10
-    max_entries_per_day: 2
-    position_holding_penalty: 0.0001
+portfolio:
+  force: true
+  min_hold_minutes: 10
+  max_entries_per_day: 2
+  position_holding_penalty: 0.0001
+
+evaluation:
+  guardrails:
+    min_trades: 0
+    max_turnover: 10.0
+    min_dsr: null

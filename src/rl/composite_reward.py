@@ -142,3 +142,12 @@ class CompositeReward:
             'negative_returns': int(np.sum(returns < 0)),
             'positive_returns': int(np.sum(returns > 0)),
         }
+
+    def get_final_dsr(self) -> float:
+        if len(self._ret_hist) > 1:
+            returns = np.array(self._ret_hist)
+            mean_returns = np.mean(returns)
+            std_returns = np.std(returns)
+            sharpe = mean_returns / (std_returns + 1e-9)
+            return sharpe
+        return 0.0

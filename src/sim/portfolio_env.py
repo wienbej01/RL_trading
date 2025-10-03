@@ -139,7 +139,12 @@ class PortfolioRLEnv(Env):
                 X = pd.DataFrame({"close": o["close"]}, index=o.index)
             else:
                 X = X.reindex(common_idx).ffill().bfill()
+            bool_cols = X.select_dtypes(include=['bool']).columns
+            if len(bool_cols):
+                X = X.astype({col: np.float32 for col in bool_cols})
             X = X.select_dtypes(include=[np.number]).copy()
+            if not X.empty:
+                X = X.astype(np.float32)
             self.X[t] = X
             feat_sizes.append(X.shape[1])
             valid_tickers.append(t)

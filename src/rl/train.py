@@ -292,6 +292,7 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
         spread_ticks=int(settings.get("execution", "spread_ticks", default=1)),
         impact_bps=float(settings.get("execution", "impact_bps", default=0.5)),
         commission_per_contract=float(settings.get("execution", "commission_per_contract", default=0.0035)),
+        min_commission=float(settings.get("execution", "min_commission", default=0.0)),
     )
 
     # Risk configuration (position sizing & kill-switch thresholds)
@@ -300,6 +301,9 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
         stop_r_multiple=float(settings.get("risk", "stop_r_multiple", default=1.0)),
         tp_r_multiple=float(settings.get("risk", "tp_r_multiple", default=1.5)),
         max_daily_loss_r=float(settings.get("risk", "max_daily_loss_r", default=3.0)),
+        max_position_size=int(settings.get("risk", "max_position_size", default=100)),
+        max_leverage=float(settings.get("risk", "max_leverage", default=1.0)),
+        drawdown_limit=float(settings.get("risk", "drawdown_limit", default=0.15)),
     )
 
     # Instrument point value (SPY ETF should be 1.0; futures differ)
@@ -574,6 +578,19 @@ def train_ppo_lstm(settings: Settings,
     # Save the VecNormalize statistics
     vec_env.save(str(Path(model_path).parent / "vecnormalize.pkl"))
     logger.info(f"VecNormalize statistics saved to {Path(model_path).parent / 'vecnormalize.pkl'}")
+    try:
+        stats_path = Path(model_path).parent / "obs_norm_stats.json"
+        obs_rms = getattr(vec_env, 'obs_rms', None)
+        if obs_rms is not None:
+            stats_payload = {
+                'mean': obs_rms.mean.tolist(),
+                'variance': obs_rms.var.tolist(),
+                'count': float(obs_rms.count),
+            }
+            stats_path.write_text(json.dumps(stats_payload, indent=2))
+            logger.info("VecNormalize observation stats written to %s", stats_path)
+    except Exception as exc:
+        logger.warning("Failed to export VecNormalize stats JSON: %s", exc)
     # Save feature column metadata for parity checks
     try:
         meta = {
@@ -607,6 +624,7 @@ def evaluate_model(model: RecurrentPPO, env: DummyVecEnv, num_episodes: int = 5)
     
     episode_rewards = []
     episode_lengths = []
+    episode_infos = []
     equity_curves = []
     
     # Robust vectorized evaluation: count episode completions per env and stop
@@ -652,6 +670,7 @@ def evaluate_model(model: RecurrentPPO, env: DummyVecEnv, num_episodes: int = 5)
             if d[i]:
                 episode_rewards.append(float(ep_rewards[i]))
                 episode_lengths.append(int(ep_lengths[i]))
+                episode_infos.append(info[i])
                 # Reset per-env counters after completion; DummyVecEnv auto-resets obs
                 ep_rewards[i] = 0.0
                 ep_lengths[i] = 0
@@ -688,6 +707,23 @@ def evaluate_model(model: RecurrentPPO, env: DummyVecEnv, num_episodes: int = 5)
         'win_rate': 0.0,
         'profit_factor': 0.0
     }
+
+    dsr_values = []
+    if episode_infos:
+        for info in episode_infos:
+            try:
+                value = float(info.get('dsr')) if info.get('dsr') is not None else None
+            except Exception:
+                value = None
+            if value is not None and np.isfinite(value):
+                dsr_values.append(value)
+    metrics['dsr'] = float(np.mean(dsr_values)) if dsr_values else 0.0
+
+    all_trades = []
+    for env_instance in env.envs:
+        all_trades.extend(env_instance.get_trades())
+    
+    metrics['total_trades'] = len(all_trades)
     
     # Calculate performance metrics
     if equity_curves:
@@ -840,6 +876,50 @@ def walk_forward_training(settings: Settings,
                 _pd.DataFrame(trades).to_csv(fold_dir / "trades.csv", index=False)
         except Exception:
             pass
+
+    # Create summary DataFrame
+    summary_df = pd.DataFrame([res['test_metrics'] for res in wf_results])
+    summary_df['fold'] = [res['fold'] for res in wf_results]
+    summary_df.to_csv(output_path / "wf_summary.csv", index=False)
+
+    # Check acceptance criteria
+    median_dsr = summary_df['dsr'].median()
+    max_drawdown = summary_df['max_drawdown'].max()
+    
+    # Trades per day calculation
+    total_trades = summary_df['total_trades'].sum()
+    total_days = sum([(res['test_end'] - res['test_start']).days for res in wf_results])
+    trades_per_day = total_trades / total_days if total_days > 0 else 0
+
+    decision = {
+        'decision': 'go',
+        'rationale': [],
+        'metrics': {
+            'median_dsr': median_dsr,
+            'max_drawdown': max_drawdown,
+            'trades_per_day': trades_per_day,
+        }
+    }
+
+    if median_dsr <= 0:
+        decision['decision'] = 'no-go'
+        decision['rationale'].append(f"Median DSR ({median_dsr:.4f}) is not positive.")
+
+    if max_drawdown > 0.05:
+        decision['decision'] = 'no-go'
+        decision['rationale'].append(f"Max drawdown ({max_drawdown:.4f}) is greater than 5%.")
+
+    if trades_per_day < 0.5:
+        decision['decision'] = 'no-go'
+        decision['rationale'].append(f"Trades per day ({trades_per_day:.4f}) is less than 0.5.")
+
+    if not decision['rationale']:
+        decision['rationale'].append("All acceptance criteria met.")
+
+    with open(output_path / "decision.json", 'w') as f:
+        json.dump(decision, f, indent=2)
+
+    return wf_results
 
 
 

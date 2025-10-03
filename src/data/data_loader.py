@@ -4,9 +4,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
+
+import fsspec
 
 try:
     # Project-local Settings loader
@@ -267,6 +269,37 @@ class UnifiedDataLoader:
         )
         logger.info("Data directories: [%s]", self.paths.polygon_raw_dir)
 
+        provider = self._get_cfg("data", "source", "provider", default=self.data_source)
+        self.source_provider = (provider or self.data_source or "polygon").lower()
+        self._log_partition_headers = bool(self._get_cfg("data", "source", "log_headers", default=False))
+
+        self._gcs_fs = None
+        self._gcs_storage_base: Optional[str] = None
+        self._gcs_uri_base: Optional[str] = None
+        self._gcs_pattern: str = self._get_cfg(
+            "data",
+            "source",
+            "filename_pattern",
+            default="{symbol}/{year}/{symbol}_{year}-{month:02d}.parquet",
+        )
+
+        if self.source_provider == "gcs":
+            bucket = self._get_cfg("data", "source", "bucket", default=None)
+            if not bucket:
+                raise DataLoaderError("GCS data source requires 'bucket' in config")
+            base_prefix = self._get_cfg("data", "source", "base_prefix", default="") or ""
+            project = self._get_cfg("data", "source", "project", default=None)
+            token = self._get_cfg("data", "source", "token", default=None)
+            try:
+                self._gcs_fs = fsspec.filesystem("gcs", project=project, token=token)
+            except Exception as exc:  # pragma: no cover - environment specific
+                raise DataLoaderError(f"Failed to initialize GCS filesystem: {exc}") from exc
+
+            storage_base = f"{bucket}/{base_prefix}" if base_prefix else str(bucket)
+            storage_base = storage_base.strip("/")
+            self._gcs_storage_base = storage_base
+            self._gcs_uri_base = f"gs://{storage_base}" if storage_base else f"gs://{bucket}"
+
         # Config: RTH/resample/prune behavior (off by default to preserve behavior)
         self.session_tz = self._get_cfg("data", "session", "tz", default="America/New_York")
         self.rth_start = self._get_cfg("data", "session", "rth_start", default="09:30")
@@ -326,6 +359,19 @@ class UnifiedDataLoader:
         # Build from RAW
         file_paths = self._enumerate_raw_paths(symbol, start, end)
         df = self._load_raw_partitions(file_paths, market_tz=self.session_tz)
+
+        if not df.empty:
+            start_local = pd.Timestamp(start)
+            end_local = pd.Timestamp(end)
+            if start_local.tzinfo is None:
+                start_local = start_local.tz_localize(self.session_tz)
+            else:
+                start_local = start_local.tz_convert(self.session_tz)
+            if end_local.tzinfo is None:
+                end_local = end_local.tz_localize(self.session_tz)
+            else:
+                end_local = end_local.tz_convert(self.session_tz)
+            df = df[(df.index >= start_local) & (df.index <= end_local)]
 
         if self.apply_rth_resample:
             df = _enforce_rth_resample(
@@ -502,18 +548,22 @@ class UnifiedDataLoader:
         name = f"{symbol}_{start_key}_{end_key}_ohlcv_{timeframe}.parquet"
         return self.paths.cache_dir / name
 
-    def _enumerate_raw_paths(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> List[Path]:
+    def _enumerate_raw_paths(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> List[Union[Path, str]]:
         """
-        Enumerate daily parquet files under:
-        polygon_raw_dir/symbol=SYMBOL/year=YYYY/month=MM/day=DD/data.parquet
-        for each day in [start, end] (inclusive).
+        Enumerate raw parquet files for the configured source.
+
+        - Local polygon layout: symbol=SYMBOL/year=YYYY/month=MM/day=DD/data.parquet
+        - Remote GCS layout driven by filename_pattern when provider == "gcs"
         """
+        if self.source_provider == "gcs":
+            return self._enumerate_gcs_paths(symbol, start, end)
+
         start_d = pd.Timestamp(start).normalize()
         end_d = pd.Timestamp(end).normalize()
         days = pd.date_range(start_d, end_d, freq="D")
 
         base = self.paths.polygon_raw_dir
-        out: List[Path] = []
+        out: List[Union[Path, str]] = []
         for d in days:
             y = d.year
             m = f"{d.month:02d}"
@@ -523,9 +573,46 @@ class UnifiedDataLoader:
                 out.append(path)
         return out
 
+    def _enumerate_gcs_paths(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> List[str]:
+        if self._gcs_fs is None or not self._gcs_storage_base:
+            raise DataLoaderError("GCS filesystem not configured")
+
+        start_period = pd.Timestamp(start).to_period("M")
+        end_period = pd.Timestamp(end).to_period("M")
+        periods = pd.period_range(start_period, end_period, freq="M")
+
+        paths: List[str] = []
+        for period in periods:
+            rel_path = self._gcs_pattern.format(
+                symbol=symbol,
+                year=period.year,
+                month=f"{period.month:02d}",
+                month_num=period.month,
+            ).strip("/")
+
+            storage_path = f"{self._gcs_storage_base}/{rel_path}" if rel_path else self._gcs_storage_base
+            storage_path = storage_path.strip("/")
+            uri = storage_path if storage_path.startswith("gs://") else f"gs://{storage_path}"
+
+            try:
+                exists = self._gcs_fs.exists(storage_path)
+            except Exception as exc:  # pragma: no cover - depends on network
+                logger.warning("GCS: failed existence check for %s: %s", uri, exc)
+                exists = False
+
+            if exists:
+                paths.append(uri)
+            else:
+                logger.warning("GCS: missing partition for %s at %s", symbol, uri)
+
+        if not paths:
+            logger.warning("GCS: no partitions found for %s between %s and %s", symbol, start, end)
+
+        return paths
+
     def _load_raw_partitions(
         self,
-        file_paths: Sequence[Path],
+        file_paths: Sequence[Union[Path, str]],
         *,
         market_tz: str | None = None,
         log_prefix: str = "RAW",
@@ -540,19 +627,31 @@ class UnifiedDataLoader:
         total = 0
         bad = 0
 
+        header_logged = False
+
         for path in file_paths:
             total += 1
+            path_str = str(path)
             try:
-                part = pd.read_parquet(path)
+                part = pd.read_parquet(path_str)
                 part = _canonicalize_timestamp(part, market_tz=tz)  # << critical
                 if not part.empty:
+                    if self._log_partition_headers and not header_logged:
+                        logger.info("%s: columns=%s", log_prefix, list(part.columns))
+                        header_logged = True
+                    required = {"open", "high", "low", "close", "volume"}
+                    missing_cols = required - set(part.columns)
+                    if missing_cols:
+                        raise SchemaValidationError(
+                            f"Missing required columns {sorted(missing_cols)} in partition {path_str}"
+                        )
                     parts.append(part)
                 else:
                     bad += 1
-                    logger.warning("%s: empty frame after canonicalization: %s", log_prefix, path)
+                    logger.warning("%s: empty frame after canonicalization: %s", log_prefix, path_str)
             except Exception as e:
                 bad += 1
-                logger.warning("%s: failed to load %s: %s", log_prefix, path, e)
+                logger.warning("%s: failed to load %s: %s", log_prefix, path_str, e)
 
         if not parts:
             empty = pd.DataFrame(index=pd.DatetimeIndex([], tz="UTC", name="timestamp"))

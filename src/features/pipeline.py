@@ -5,6 +5,8 @@ This module provides a comprehensive feature engineering pipeline
 that combines technical indicators, microstructure features, and time-based features.
 Supports both Polygon and Databento data formats with automatic column mapping.
 """
+import json
+import re
 import numpy as np
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
@@ -109,6 +111,7 @@ class FeaturePipeline:
             'size': 'size'
         }
     }
+    LEAKAGE_PATTERN = re.compile(r'\b(lead|future|forward|next|target|t\+?\d+)\b', re.IGNORECASE)
 
     def __init__(self, config: Dict[str, Any]):
         """
@@ -144,10 +147,67 @@ class FeaturePipeline:
         self.scaler = None
         self.feature_selector: Optional[SelectKBest] = None
         self.selected_features = None
+        self.feature_scores_: Optional[pd.DataFrame] = None
+        self.normalization_stats: Optional[Dict[str, Any]] = None
+        self._audit_reports: List[pd.DataFrame] = []
 
         # Get logger
         self.logger = get_logger(__name__)
 
+    def _check_for_leakage(self, ohlcv: pd.DataFrame, features: pd.DataFrame):
+        """Check for data leakage by comparing timestamps."""
+
+        def _validate_index(frame: pd.DataFrame, label: str) -> None:
+            idx = frame.index
+            if isinstance(idx, pd.MultiIndex) and 'timestamp' in idx.names:
+                idx = idx.get_level_values('timestamp')
+            if not isinstance(idx, pd.DatetimeIndex):
+                return
+            if not idx.is_monotonic_increasing:
+                raise ValueError(f"{label} index is not monotonic increasing.")
+
+        has_ticker_col = 'ticker' in ohlcv.columns
+        has_ticker_index = isinstance(ohlcv.index, pd.MultiIndex) and 'ticker' in ohlcv.index.names
+
+        if has_ticker_col or has_ticker_index:
+            if has_ticker_col:
+                ohlcv_groups = ohlcv.groupby('ticker')
+            else:
+                tickers = ohlcv.index.get_level_values('ticker').unique()
+                ohlcv_groups = ((t, ohlcv.xs(t, level='ticker')) for t in tickers)
+            for ticker, group in ohlcv_groups:
+                _validate_index(group, f"OHLCV ({ticker})")
+        else:
+            _validate_index(ohlcv, "OHLCV")
+
+        has_feat_ticker_col = 'ticker' in features.columns
+        has_feat_ticker_index = isinstance(features.index, pd.MultiIndex) and 'ticker' in features.index.names
+
+        if has_feat_ticker_col or has_feat_ticker_index:
+            if has_feat_ticker_col:
+                feature_groups = features.groupby('ticker')
+            else:
+                tickers = features.index.get_level_values('ticker').unique()
+                feature_groups = ((t, features.xs(t, level='ticker')) for t in tickers)
+            for ticker, group in feature_groups:
+                _validate_index(group, f"Features ({ticker})")
+        else:
+            _validate_index(features, "Features")
+
+        # Compare max timestamps on aligned axes (use overall maxima).
+        ohlcv_max = None
+        feature_max = None
+        for frame, store in ((ohlcv, 'ohlcv_max'), (features, 'feature_max')):
+            idx = frame.index
+            if isinstance(idx, pd.MultiIndex) and 'timestamp' in idx.names:
+                idx = idx.get_level_values('timestamp')
+            if isinstance(idx, pd.DatetimeIndex):
+                if store == 'ohlcv_max':
+                    ohlcv_max = idx.max()
+                else:
+                    feature_max = idx.max()
+        if ohlcv_max is not None and feature_max is not None and ohlcv_max < feature_max:
+            raise ValueError("Feature leakage detected: features have future timestamps.")
     def _detect_data_source(self, data: pd.DataFrame) -> str:
         """
         Detect the data source based on column names and data characteristics.
@@ -348,6 +408,10 @@ class FeaturePipeline:
         Returns:
             Self
         """
+        self.feature_scores_ = None
+        self.selected_features = None
+        self.normalization_stats = None
+        self._audit_reports = []
         # Multi-ticker aware fitting: if a 'ticker' column is present, compute features per ticker
         features: pd.DataFrame
         if 'ticker' in data.columns or (
@@ -365,10 +429,18 @@ class FeaturePipeline:
                 if self._detect_data_source(df_local) == 'polygon' and self.polygon_quality_checks:
                     df_local = self._validate_polygon_data_quality(df_local)
                 f_local = self._extract_features(df_local)
+                try:
+                    f_local = f_local.drop(columns=['ticker'], errors='ignore')
+                except Exception:
+                    pass
                 f_local['ticker'] = t
                 parts.append(f_local)
             if parts:
                 features = pd.concat(parts, axis=0)
+                try:
+                    features = features.sort_index()
+                except Exception:
+                    pass
             else:
                 features = pd.DataFrame(index=data.index)
         else:
@@ -404,8 +476,15 @@ class FeaturePipeline:
             features = self._merge_external_vix(features)
         except Exception:
             pass
+        if self.selected_features is None:
+            self.selected_features = [col for col in features.columns if col != 'ticker']
+        try:
+            self.audit_features(features, stage='fit')
+        except ValueError as exc:
+            self.logger.error("Feature audit failed during fit: %s", exc)
+            raise
         return self
-    
+
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Transform data using fitted pipeline.
@@ -510,9 +589,20 @@ class FeaturePipeline:
                             save_features(f_local, cache_path)
                     except Exception:
                         pass
+                try:
+                    f_local = f_local.drop(columns=['ticker'], errors='ignore')
+                except Exception:
+                    pass
                 f_local['ticker'] = t
                 parts.append(f_local)
-            features = pd.concat(parts, axis=0) if parts else pd.DataFrame(index=data.index)
+            if parts:
+                features = pd.concat(parts, axis=0)
+                try:
+                    features = features.sort_index()
+                except Exception:
+                    pass
+            else:
+                features = pd.DataFrame(index=data.index)
         else:
             data = self._map_columns(data, 'ohlcv')
             data_source = self._detect_data_source(data)
@@ -609,6 +699,25 @@ class FeaturePipeline:
             features = self._merge_external_vix(features)
         except Exception:
             pass
+        if self.selected_features is None:
+            self.selected_features = [col for col in features.columns if col != 'ticker']
+
+        if self.selected_features:
+            missing = [col for col in self.selected_features if col not in features.columns]
+            for col in missing:
+                features[col] = np.nan
+            ordered = [c for c in self.selected_features if c in features.columns and c != 'ticker']
+            if 'ticker' in features.columns:
+                features = features.loc[:, ['ticker'] + ordered]
+            else:
+                features = features.loc[:, ordered]
+
+        try:
+            self.audit_features(features, stage='transform')
+        except ValueError as exc:
+            self.logger.error("Feature audit failed during transform: %s", exc)
+            raise
+
         return features
     
     def fit_transform(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -621,7 +730,9 @@ class FeaturePipeline:
         Returns:
             Transformed features
         """
-        return self.fit(data).transform(data)
+        transformed_data = self.fit(data).transform(data)
+        self._check_for_leakage(data, transformed_data)
+        return transformed_data
     
     def _extract_features(self, data: pd.DataFrame) -> pd.DataFrame:
         """Extract features based on configuration."""
@@ -819,24 +930,12 @@ class FeaturePipeline:
                         data['bid_price'], data['bid_size'],
                         data['ask_price'], data['ask_size']
                     )
-                    # Only compute ofi_best if L1 data is available
-                    if 'resolved' in locals() and resolved is not None:
-                        # Check if ofi_best or its proxy is in resolved features
-                        if "ofi_best" in resolved or "ofi_proxy" in resolved:
-                            try:
-                                features['ofi_best'] = calculate_ofi_best(
-                                    data['bid_price'], data['bid_size'], data['ask_price'], data['ask_size']
-                                )
-                            except Exception as e:
-                                self.logger.warning(f"Failed to compute ofi_best: {e}")
-                    elif 'ofi_best' in resolved or 'ofi_proxy' in resolved:
-                        # Fallback if resolved is not available in locals
-                        try:
-                            features['ofi_best'] = calculate_ofi_best(
-                                data['bid_price'], data['bid_size'], data['ask_price'], data['ask_size']
-                            )
-                        except Exception as e:
-                            self.logger.warning(f"Failed to compute ofi_best: {e}")
+                    try:
+                        features['ofi_best'] = calculate_ofi_best(
+                            data['bid_price'], data['bid_size'], data['ask_price'], data['ask_size']
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to compute ofi_best: {e}")
                 elif 'resolved' in locals() and resolved is not None:
                     # If L1 data is not available but ofi_proxy is requested, compute it
                     if "ofi_proxy" in resolved and "ofi_proxy" not in features.columns:
@@ -868,18 +967,11 @@ class FeaturePipeline:
                 if {'bid_price','ask_price'}.issubset(data.columns):
                     features['spread_bps'] = compute_spread_bps(bid=data['bid_price'], ask=data['ask_price'])
                 elif {'high','low','close'}.issubset(data.columns):
-                    # Only compute HL proxy if spread_bps_hl is requested
-                    if 'resolved' in locals() and resolved is not None and "spread_bps_hl" in resolved:
-                        try:
-                            features['spread_bps_hl'] = OHLCV_MICRO['spread_bps_hl'](data)
-                        except Exception as e:
-                            self.logger.warning(f"Failed to compute spread_bps_hl: {e}")
-                    elif 'spread_bps_hl' in resolved:
-                        # Fallback if resolved is not available in locals
-                        try:
-                            features['spread_bps_hl'] = OHLCV_MICRO['spread_bps_hl'](data)
-                        except Exception as e:
-                            self.logger.warning(f"Failed to compute spread_bps_hl: {e}")
+                    try:
+                        features['spread_bps'] = OHLCV_MICRO['spread_bps_hl'](data)
+                        self.logger.warning("Using HL proxy for spread_bps; level-1 quotes missing")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to compute spread_bps via HL proxy: {e}")
                 else:
                     # Only log warning if we're actually trying to compute spread_bps
                     if 'calculate_spread' in micro_config and micro_config['calculate_spread']:
@@ -889,7 +981,7 @@ class FeaturePipeline:
                     # Only compute quote_intensity if it's in resolved features or explicitly requested
                     if 'resolved' in locals() and resolved is not None and "quote_intensity" in resolved:
                         features['quote_intensity'] = compute_quote_intensity(data.get('transactions'), data.get('volume'))
-                    elif 'quote_intensity' in resolved:
+                    elif resolved and 'quote_intensity' in resolved:
                         # Fallback if resolved is not available in locals
                         features['quote_intensity'] = compute_quote_intensity(data.get('transactions'), data.get('volume'))
                 # queue_imbalance already computed above when bid/ask sizes present
@@ -998,6 +1090,13 @@ class FeaturePipeline:
                 # Handle test case where session_features is used instead
                 session_features = extract_session_features(data.index)
                 features = pd.concat([features, session_features], axis=1)
+
+        # One-hot encode session_phase
+        if 'session_phase' in features.columns:
+            features = pd.concat([
+                features.drop(columns=['session_phase']),
+                pd.get_dummies(features['session_phase'], prefix='session')
+            ], axis=1)
         
         # Add VIX data and derived features
         if 'vix' in self.config and self.config['vix'].get('enabled', False):
@@ -1489,6 +1588,12 @@ class FeaturePipeline:
                     # Fill NaN values with mean before fitting
                     numeric_features_filled = numeric_features.fillna(numeric_features.mean())
                     self.scaler.fit(numeric_features_filled)
+                    self.normalization_stats = {
+                        'method': 'standardize',
+                        'columns': list(numeric_features.columns),
+                        'mean': {col: float(val) for col, val in zip(numeric_features.columns, self.scaler.mean_)},
+                        'scale': {col: float(val) for col, val in zip(numeric_features.columns, getattr(self.scaler, 'scale_', np.ones_like(self.scaler.mean_)))},
+                    }
             
             # Transform numeric features
             numeric_features = features.select_dtypes(include=[np.number])
@@ -1509,6 +1614,12 @@ class FeaturePipeline:
                     # Fill NaN values with mean before fitting
                     numeric_features_filled = numeric_features.fillna(numeric_features.mean())
                     self.scaler.fit(numeric_features_filled)
+                    self.normalization_stats = {
+                        'method': 'minmax',
+                        'columns': list(numeric_features.columns),
+                        'min': {col: float(val) for col, val in zip(numeric_features.columns, getattr(self.scaler, 'data_min_', np.zeros(len(numeric_features.columns))))},
+                        'max': {col: float(val) for col, val in zip(numeric_features.columns, getattr(self.scaler, 'data_max_', np.ones(len(numeric_features.columns))))},
+                    }
             
             # Transform numeric features
             numeric_features = features.select_dtypes(include=[np.number])
@@ -1517,7 +1628,7 @@ class FeaturePipeline:
                 numeric_features_filled = numeric_features.fillna(numeric_features.mean())
                 normalized_values = self.scaler.transform(numeric_features_filled)
                 features[numeric_features.columns] = normalized_values
-        
+
         return features
 
     def _select_features(self, features: pd.DataFrame) -> pd.DataFrame:
@@ -1530,6 +1641,8 @@ class FeaturePipeline:
         Returns:
             Selected features
         """
+        # Reset per-fit importance capture
+        self.feature_scores_ = None
         # Backward-compat: map alternate keys
         if 'selection_method' in self.feature_selection_config and 'method' not in self.feature_selection_config:
             self.feature_selection_config['method'] = self.feature_selection_config['selection_method']
@@ -1567,8 +1680,16 @@ class FeaturePipeline:
                 y_clean = y[mask]
                 
                 if len(X_clean) > 0 and len(y_clean) > 0:
-                    selected_features = self.feature_selector.fit_transform(X_clean, y_clean)
+                    _ = self.feature_selector.fit(X_clean, y_clean)
                     self.selected_features = X_clean.columns[self.feature_selector.get_support()].tolist()
+                    scores = getattr(self.feature_selector, 'scores_', None)
+                    pvalues = getattr(self.feature_selector, 'pvalues_', None)
+                    if scores is not None:
+                        df_scores = pd.DataFrame({'feature': X_clean.columns, 'score': scores})
+                        if pvalues is not None:
+                            df_scores['pvalue'] = pvalues
+                        df_scores = df_scores.sort_values('score', ascending=False)
+                        self.feature_scores_ = df_scores.reset_index(drop=True)
                 else:
                     # If no valid data after cleaning, select all features
                     self.selected_features = features.columns.tolist()
@@ -1602,6 +1723,141 @@ class FeaturePipeline:
             return features[keep_cols]
         else:
             return features
+
+    def audit_features(self, features: pd.DataFrame, *, stage: str = 'manual') -> pd.DataFrame:
+        """Run feature audit and append to internal report list."""
+        report = self._run_feature_audit(features, stage=stage)
+        self._audit_reports.append(report)
+        return report
+
+    def _run_feature_audit(self, features: pd.DataFrame, stage: str) -> pd.DataFrame:
+        """Inspect features for NaNs, constants, and potential leakage."""
+        if features.empty:
+            return pd.DataFrame(columns=['feature', 'nan_ratio', 'inf_ratio', 'is_constant', 'head_nan_ratio', 'tail_nan_ratio', 'dtype', 'stage'])
+
+        has_ticker_column = 'ticker' in features.columns
+        has_ticker_index = isinstance(features.index, pd.MultiIndex) and 'ticker' in features.index.names
+
+        if has_ticker_column or has_ticker_index:
+            if has_ticker_column:
+                grouped = features.groupby('ticker')
+            else:
+                tickers = features.index.get_level_values('ticker').unique()
+                grouped = ((t, features.xs(t, level='ticker')) for t in tickers)
+
+            for ticker, frame in grouped:
+                if frame.empty:
+                    continue
+                idx = frame.index
+                if isinstance(idx, pd.MultiIndex) and 'timestamp' in idx.names:
+                    ts_idx = idx.get_level_values('timestamp')
+                elif isinstance(idx, pd.DatetimeIndex):
+                    ts_idx = idx
+                else:
+                    # Unable to validate index for this group; continue best-effort
+                    continue
+                if not ts_idx.is_monotonic_increasing:
+                    raise ValueError(
+                        f"Feature index is not monotonically increasing for ticker {ticker}; potential misalignment detected"
+                    )
+                if ts_idx.duplicated().any():
+                    raise ValueError(
+                        f"Feature index contains duplicates for ticker {ticker}; potential leakage or alignment issue"
+                    )
+        else:
+            ts_index: Optional[pd.Index] = None
+            if isinstance(features.index, pd.MultiIndex) and 'timestamp' in features.index.names:
+                ts_index = features.index.get_level_values('timestamp')
+            elif isinstance(features.index, pd.DatetimeIndex):
+                ts_index = features.index
+
+            if ts_index is not None:
+                if not ts_index.is_monotonic_increasing:
+                    raise ValueError("Feature index is not monotonically increasing; potential misalignment detected")
+                if ts_index.duplicated().any():
+                    raise ValueError("Feature index contains duplicates; potential leakage or alignment issue")
+
+        rows: List[Dict[str, Any]] = []
+        suspicious_names: List[str] = []
+        suspicious_trailing: List[str] = []
+        window = min(len(features), 10)
+
+        for col in features.columns:
+            if col == 'ticker':
+                continue
+            series = features[col]
+            nan_ratio = float(series.isna().mean())
+            inf_ratio = float(np.isinf(series).mean()) if series.dtype.kind in {'f', 'i'} else 0.0
+            is_constant = bool(series.nunique(dropna=True) <= 1)
+            head_slice = series.head(window)
+            tail_slice = series.tail(window)
+            head_nan_ratio = float(head_slice.isna().mean()) if len(head_slice) else 0.0
+            tail_nan_ratio = float(tail_slice.isna().mean()) if len(tail_slice) else 0.0
+
+            if self.LEAKAGE_PATTERN.search(str(col)):
+                suspicious_names.append(col)
+            if tail_nan_ratio >= 0.8 and head_nan_ratio <= 0.2:
+                suspicious_trailing.append(col)
+
+            rows.append({
+                'feature': col,
+                'nan_ratio': nan_ratio,
+                'inf_ratio': inf_ratio,
+                'is_constant': is_constant,
+                'head_nan_ratio': head_nan_ratio,
+                'tail_nan_ratio': tail_nan_ratio,
+                'dtype': str(series.dtype),
+                'stage': stage,
+            })
+
+        if suspicious_names:
+            raise ValueError(f"Potential look-ahead feature names detected: {suspicious_names}")
+        if suspicious_trailing:
+            raise ValueError(
+                "Features with trailing NaNs detected (possible forward shift): "
+                f"{suspicious_trailing}"
+            )
+
+        report = pd.DataFrame(rows).sort_values('feature').reset_index(drop=True)
+        return report
+
+    def write_reports(
+        self,
+        output_dir: Union[str, Path],
+        *,
+        prefix: Optional[str] = None,
+        features: Optional[pd.DataFrame] = None,
+    ) -> Path:
+        """Persist selected features, audit reports, and normalization stats."""
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        prefix_str = f"{prefix}_" if prefix else ""
+
+        if features is not None:
+            self.audit_features(features, stage='export')
+
+        selected = list(self.selected_features or [])
+        if not selected and features is not None:
+            selected = [col for col in features.columns if col != 'ticker']
+        selected_df = pd.DataFrame({'feature': selected})
+        selected_df.to_csv(output_path / f"{prefix_str}features_selected.csv", index=False)
+
+        if self.feature_scores_ is not None and not self.feature_scores_.empty:
+            scores_df = self.feature_scores_.copy()
+            scores_df['selected'] = scores_df['feature'].isin(selected)
+            scores_df.to_csv(output_path / f"{prefix_str}feature_importances.csv", index=False)
+
+        if self._audit_reports:
+            audit_df = pd.concat(self._audit_reports, ignore_index=True)
+            audit_df = audit_df.drop_duplicates(subset=['stage', 'feature']).sort_values(['stage', 'feature'])
+            audit_df.to_csv(output_path / f"{prefix_str}feature_audit.csv", index=False)
+
+        if self.normalization_stats:
+            norm_path = output_path / f"{prefix_str}normalization_stats.json"
+            with norm_path.open('w', encoding='utf-8') as fh:
+                json.dump(self.normalization_stats, fh, indent=2)
+
+        return output_path
 
 
 def build_features_for_window(

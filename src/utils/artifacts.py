@@ -16,6 +16,7 @@ class BacktestResult:
     metrics: Optional[Dict[str, Any]] = None  # summary.json payload
     feature_names: Optional[list[str]] = None # for features_used.txt
     baselines: Optional[Dict[str, Dict[str, float]]] = None
+    reward_breakdown: Optional[pd.DataFrame] = None  # per-episode reward component stats
 
 
 def _ensure_dir(p: Path) -> None:
@@ -72,6 +73,13 @@ def write_backtest_artifacts(base_dir: Path, ticker: str, res: BacktestResult) -
         eq.to_csv(tdir / "portfolio_history.csv")
     except Exception as e:
         failures.append(f"portfolio_history.csv write failed: {e!r}")
+
+    # 2b) reward_breakdown.csv (optional)
+    try:
+        if res.reward_breakdown is not None and not res.reward_breakdown.empty:
+            res.reward_breakdown.to_csv(tdir / "reward_breakdown.csv", index=False)
+    except Exception as e:
+        failures.append(f"reward_breakdown.csv write failed: {e!r}")
 
     # 3) steps.parquet: always write or fail loudly
     try:
@@ -148,4 +156,3 @@ def write_backtest_artifacts(base_dir: Path, ticker: str, res: BacktestResult) -
     # 7) FAIL marker
     if failures:
         (tdir / "FAIL.txt").write_text("\n".join(failures))
-

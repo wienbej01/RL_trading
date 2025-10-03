@@ -458,7 +458,7 @@ class MarketDataFeed:
             if signal == 0:  # Flat
                 if self.current_position != 0:
                     # Close position
-                    await self._close_position()
+                    await self._close_position(reason="signal_flat")
                 return
             
             # Calculate position size
@@ -534,7 +534,7 @@ class MarketDataFeed:
         # Return position size based on signal
         return max_contracts if signal == 1 else -max_contracts
     
-    async def _close_position(self):
+    async def _close_position(self, reason: str = "manual"):
         """Close current position."""
         try:
             if self.current_position > 0:
@@ -553,9 +553,11 @@ class MarketDataFeed:
                     abs(self.current_position),
                     order_type="MKT"
                 )
+            else:
+                order_id = None
             
             if order_id:
-                logger.info(f"Position closed: {self.current_position} {self.config.trading_symbol}")
+                logger.info(f"Position closed: {self.current_position} {self.config.trading_symbol}, Reason: {reason}")
             
         except Exception as e:
             logger.error(f"Error closing position: {e}")
@@ -587,7 +589,7 @@ class MarketDataFeed:
             # Check daily loss limit
             if self.daily_pnl < -self.max_daily_loss:
                 logger.warning(f"Daily loss limit exceeded: {self.daily_pnl:.2f}")
-                await self._close_position()
+                await self._close_position(reason="kill_switch_daily_loss")
             
             # Update performance metrics
             if len(self.equity_curve) > 1:
@@ -722,7 +724,7 @@ class MarketDataFeed:
                 await asyncio.sleep(self.config.update_frequency)
             
             # Close position at end of session
-            await self._close_position()
+            await self._close_position(reason="session_end")
             
             # Save results
             await self._save_results()
@@ -757,7 +759,7 @@ class MarketDataFeed:
         logger.info("Stopping trading session...")
         
         # Close position
-        await self._close_position()
+        await self._close_position(reason="manual_stop")
         
         # Save results
         await self._save_results()

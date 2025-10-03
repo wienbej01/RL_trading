@@ -39,7 +39,7 @@ from ..sim.execution import ExecParams
 from ..sim.risk import RiskConfig
 from .train import evaluate_model  # reuse existing evaluator
 from .callbacks import KLStopCallback, AdaptiveLRByKL, LiveLRBump
-from ..utils.callbacks import EarlyStopNoImprove
+from ..utils.callbacks import EarlyStopNoImprove, EntropyCollapseWarning
 from ..utils.artifacts import BacktestResult
 
 
@@ -65,6 +65,16 @@ def linear_schedule(start: float, end: float):
     end = float(end)
     def fn(progress_remaining: float) -> float:
         return end + (start - end) * float(progress_remaining)
+    return fn
+
+
+def cosine_schedule(start: float, end: float):
+    """Return a callable for SB3 that maps progress_remaining (1->0) to value."""
+    start = float(start)
+    end = float(end)
+    def fn(progress_remaining: float) -> float:
+        import math
+        return end + 0.5 * (start - end) * (1 + math.cos(math.pi * (1 - progress_remaining)))
     return fn
 
 
@@ -167,6 +177,37 @@ def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_index().tz_convert('America/New_York')
 
 
+def _sanitize_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert feature frame to numeric float32 columns with bool flags preserved."""
+    if df is None:
+        return pd.DataFrame()
+    if df.empty:
+        return df.astype(np.float32, copy=False)
+
+    out = df.copy()
+    # Promote boolean flags to floats so they survive numeric filtering later
+    bool_cols = out.select_dtypes(include=['bool']).columns
+    if len(bool_cols):
+        cast_map = {col: np.float32 for col in bool_cols}
+        out = out.astype(cast_map)
+
+    # Coerce remaining columns to numeric when possible; drop stubborn non-numeric cols
+    drop_cols: List[str] = []
+    for col in out.columns:
+        if np.issubdtype(out[col].dtype, np.number):
+            continue
+        coerced = pd.to_numeric(out[col], errors='coerce')
+        if coerced.isna().all():
+            drop_cols.append(col)
+        else:
+            out[col] = coerced
+
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+
+    return out.astype(np.float32, copy=False)
+
+
 def _build_env_from_frames(
     settings: Settings,
     ohlcv: pd.DataFrame,
@@ -174,6 +215,7 @@ def _build_env_from_frames(
     *,
     point_value: float = 1.0,
     max_episode_bars: int | None = None,
+    required_feature_columns: Optional[List[str]] = None,
 ) -> IntradayRLEnv:
     """Create an IntradayRLEnv from aligned OHLCV and features frames."""
     # Execution and risk parameters from settings with safe defaults
@@ -182,12 +224,16 @@ def _build_env_from_frames(
         spread_ticks=int(settings.get("execution", "spread_ticks", default=1)),
         impact_bps=float(settings.get("execution", "impact_bps", default=0.5)),
         commission_per_contract=float(settings.get("execution", "commission_per_contract", default=0.0035)),
+        min_commission=float(settings.get("execution", "min_commission", default=0.0)),
     )
     risk_cfg = RiskConfig(
         risk_per_trade_frac=float(settings.get("risk", "risk_per_trade_frac", default=0.02)),
         stop_r_multiple=float(settings.get("risk", "stop_r_multiple", default=1.0)),
         tp_r_multiple=float(settings.get("risk", "tp_r_multiple", default=1.5)),
         max_daily_loss_r=float(settings.get("risk", "max_daily_loss_r", default=3.0)),
+        max_position_size=int(settings.get("risk", "max_position_size", default=100)),
+        max_leverage=float(settings.get("risk", "max_leverage", default=1.0)),
+        drawdown_limit=float(settings.get("risk", "drawdown_limit", default=0.15)),
     )
     reward_type = str(settings.get("env", "reward", "kind", default="dsr"))
     reward_scaling = float(settings.get("env", "reward_scaling", default=0.1))
@@ -211,6 +257,21 @@ def _build_env_from_frames(
     # Align indices and columns
     o = _ensure_dt_index(ohlcv)
     X = _ensure_dt_index(features)
+
+    # Align feature columns to the required training schema when provided
+    if required_feature_columns:
+        req = [c for c in required_feature_columns if c != 'ticker']
+        aligned = pd.DataFrame(index=X.index, columns=req, dtype=np.float32)
+        for col in req:
+            if col in X.columns:
+                aligned[col] = pd.to_numeric(X[col], errors='coerce')
+            else:
+                aligned[col] = 0.0
+        X = aligned
+    else:
+        # Drop non-numeric columns (e.g., ticker identifiers) to keep observations float32-compatible
+        X = _sanitize_feature_frame(X)
+
     X = X.reindex(o.index).ffill().bfill()
     o = o.dropna(subset=[c for c in ["open","high","low","close"] if c in o.columns])
     return IntradayRLEnv(
@@ -307,14 +368,18 @@ class MultiTickerRLTrainer:
 
     def __init__(self, config: Dict[str, Any]):
         self.cfg = config
-        # Gracefully construct Settings; allow passing a config dict only
-        try:
-            # If a config file path is embedded in meta, use that
-            cfg_file = (config.get('__meta__') or {}).get('config_file')
-            self.settings = Settings.from_yaml(cfg_file) if cfg_file else Settings.from_yaml()
-        except Exception:
-            # Fallback: create with overrides from cfg['paths'] if present
-            self.settings = Settings.from_paths(paths=config.get('paths', {}))
+        # Gracefully construct Settings; honour in-memory overrides when a dict is provided
+        if isinstance(config, dict):
+            try:
+                self.settings = Settings(config_path=config, use_cache=False)
+            except Exception:
+                # Fallback: create with overrides from cfg['paths'] if present
+                self.settings = Settings.from_paths(paths=config.get('paths', {}))
+        else:
+            try:
+                self.settings = Settings.from_yaml()
+            except Exception:
+                self.settings = Settings.from_paths()
         self.hp = _read_hparams(config)
         self.model: Optional[RecurrentPPO] = None
         self._train_tickers: Optional[List[str]] = None
@@ -359,7 +424,7 @@ class MultiTickerRLTrainer:
 
         if len(tickers) > 1 or force_port:
             o_map = {t: _slice_by_ticker(data, t) for t in tickers}
-            X_map = {t: _slice_by_ticker(features, t) for t in tickers}
+            X_map = {t: _sanitize_feature_frame(_slice_by_ticker(features, t)) for t in tickers}
             # Optional: add ticker identity one-hot columns for embedding-like signal
             try:
                 id_cfg = (self.cfg.get('features', {}).get('ticker_identity', {}) if isinstance(self.cfg, dict) else {}) or {}
@@ -371,7 +436,7 @@ class MultiTickerRLTrainer:
                             continue
                         for col in id_cols:
                             X_t[col] = 1.0 if col == f'id_{t}' else 0.0
-                        X_map[t] = X_t
+                        X_map[t] = X_t.astype(np.float32)
                         logger.debug("Added ticker identity columns to features for %s", t)
             except Exception:
                 pass
@@ -403,16 +468,35 @@ class MultiTickerRLTrainer:
                 )
             # Portfolio env is stateful across tickers; keep single process for correctness
             vec_env = DummyVecEnv([make_port_env])
+            n_envs = 1
         else:
             # Parallelize single-ticker via SubprocVecEnv when multiple envs requested
             n_envs = int(self.cfg.get('rl', {}).get('n_envs', 1) if isinstance(self.cfg, dict) else 1)
             n_envs = max(1, n_envs)
             fns = []
+            single_ticker = tickers[0]
+            if single_ticker not in self._train_feat_cols or not self._train_feat_cols[single_ticker]:
+                sanitized = _sanitize_feature_frame(_slice_by_ticker(features, single_ticker))
+                self._train_feat_cols[single_ticker] = list(sanitized.columns)
+            required_cols = list(self._train_feat_cols.get(single_ticker, []))
             def make_single():
-                return _build_env_from_frames(self.settings, data, features, max_episode_bars=(2500 if self.fast_smoke else None))
+                return _build_env_from_frames(
+                    self.settings,
+                    data,
+                    features,
+                    max_episode_bars=(2500 if self.fast_smoke else None),
+                    required_feature_columns=required_cols,
+                )
             for _ in range(n_envs):
                 fns.append(make_single)
-            vec_env = SubprocVecEnv(fns) if n_envs > 1 else DummyVecEnv([make_single])
+            if n_envs > 1:
+                try:
+                    vec_env = SubprocVecEnv(fns)
+                except Exception as exc:
+                    logger.warning(f"SubprocVecEnv initialization failed ({exc}); falling back to DummyVecEnv.")
+                    vec_env = DummyVecEnv(fns)
+            else:
+                vec_env = DummyVecEnv([make_single])
 
         if self.fast_smoke:
             policy_kwargs = dict(
@@ -447,6 +531,10 @@ class MultiTickerRLTrainer:
             lr_start = float(ppo_cfg.get('lr_start', 1.5e-4))
             lr_end = float(ppo_cfg.get('lr_end', 1.0e-5))
             lr_sched = linear_schedule(lr_start, lr_end)
+        elif str(ppo_cfg.get('lr_schedule', '')).startswith('cosine'):
+            lr_start = float(ppo_cfg.get('lr_start', 1.5e-4))
+            lr_end = float(ppo_cfg.get('lr_end', 1.0e-5))
+            lr_sched = cosine_schedule(lr_start, lr_end)
         else:
             lr_sched = self.hp.learning_rate
         if str(ppo_cfg.get('clip_schedule', '')).startswith('linear'):
@@ -455,6 +543,16 @@ class MultiTickerRLTrainer:
             clip_sched = linear_schedule(clip_start, clip_end)
         else:
             clip_sched = self.hp.clip_range
+
+        ent_sched_fn = None
+        if str(ppo_cfg.get('ent_coef_schedule', '')).startswith('linear'):
+            ent_start = float(ppo_cfg.get('ent_coef_start', 0.02))
+            ent_end = float(ppo_cfg.get('ent_coef_end', 0.005))
+            ent_sched_fn = linear_schedule(ent_start, ent_end)
+            ent_coef_value = float(ent_sched_fn(1.0))
+        else:
+            ent_coef_value = float(self.cfg.get('rl', {}).get('ppo', {}).get('ent_coef', self.hp.ent_coef)) if isinstance(self.cfg, dict) else float(self.hp.ent_coef)
+
 
         if self.fast_smoke:
             # Standard PPO with MLP policy, no LSTM
@@ -468,7 +566,7 @@ class MultiTickerRLTrainer:
                 gae_lambda=self.hp.gae_lambda,
                 clip_range=clip_sched,
                 vf_coef=self.hp.vf_coef,
-                ent_coef=float(self.cfg.get('rl', {}).get('ppo', {}).get('ent_coef', self.hp.ent_coef)) if isinstance(self.cfg, dict) else self.hp.ent_coef,
+                ent_coef=ent_coef_value,
                 max_grad_norm=self.hp.max_grad_norm,
                 n_epochs=self.hp.n_epochs,
                 target_kl=float(ppo_cfg.get('target_kl', self.hp.target_kl)) if isinstance(self.cfg, dict) else self.hp.target_kl,
@@ -536,7 +634,7 @@ class MultiTickerRLTrainer:
                 gae_lambda=self.hp.gae_lambda,
                 clip_range=clip_sched,
                 vf_coef=self.hp.vf_coef,
-                ent_coef=float(self.cfg.get('rl', {}).get('ppo', {}).get('ent_coef', self.hp.ent_coef)) if isinstance(self.cfg, dict) else self.hp.ent_coef,
+                ent_coef=ent_coef_value,
                 max_grad_norm=self.hp.max_grad_norm,
                 n_epochs=self.hp.n_epochs,
                 target_kl=float(ppo_cfg.get('target_kl', self.hp.target_kl)) if isinstance(self.cfg, dict) else self.hp.target_kl,
@@ -563,8 +661,15 @@ class MultiTickerRLTrainer:
                 else:
                     d_eval = data.tail(1000)
                     X_eval = features.tail(1000)
+                req_eval_cols = list(self._train_feat_cols.get(tickers[0], []))
                 def _make_eval():
-                    return _build_env_from_frames(self.settings, d_eval, X_eval, max_episode_bars=(2500 if self.fast_smoke else None))
+                    return _build_env_from_frames(
+                        self.settings,
+                        d_eval,
+                        X_eval,
+                        max_episode_bars=(2500 if self.fast_smoke else None),
+                        required_feature_columns=req_eval_cols,
+                    )
                 eval_env = DummyVecEnv([_make_eval])
                 eval_cb = EvalAndLrCallback(eval_env=eval_env,
                                             eval_freq=int(self.cfg.get('rl', {}).get('eval', {}).get('eval_freq', 100000)),
@@ -582,6 +687,7 @@ class MultiTickerRLTrainer:
             AdaptiveLRByKL(low=0.003, high=float(ppo_cfg.get('target_kl', 0.01)) if isinstance(ppo_cfg, dict) else 0.01,
                            up=1.15, down=0.7, min_lr=2e-5, max_lr=2e-4),
             LiveLRBump(run_dir=str(output_dir.resolve()), bump_factor=1.25),
+            EntropyCollapseWarning(threshold=0.05, patience=500),
         ]
         # Optional: EarlyStopNoImprove unless in fast-smoke
         try:
@@ -674,7 +780,7 @@ class MultiTickerRLTrainer:
             train_tickers = list(self._train_tickers) if getattr(self, '_train_tickers', None) else list(_extract_tickers(data))
             # Slice frames per ticker
             raw_o_map = {t: _slice_by_ticker(data, t) for t in train_tickers}
-            raw_X_map = {t: _slice_by_ticker(features, t) for t in train_tickers}
+            raw_X_map = {t: _sanitize_feature_frame(_slice_by_ticker(features, t)) for t in train_tickers}
             # Determine common index from tickers that have data; prefer allowed tickers if provided
             prefer = set(allowed_tickers) if allowed_tickers is not None else set(train_tickers)
             idx_sources = [raw_o_map[t].index for t in train_tickers if (t in prefer and not raw_o_map[t].empty)]
@@ -725,7 +831,7 @@ class MultiTickerRLTrainer:
                     common_cols = [c for c in cols if c in rawX.columns]
                     if common_cols:
                         try:
-                            X_aligned.loc[:, common_cols] = rawX[common_cols].astype(float).values
+                            X_aligned.loc[:, common_cols] = rawX[common_cols].astype(np.float32).values
                         except Exception:
                             pass
                 X_map[t] = X_aligned
@@ -745,6 +851,14 @@ class MultiTickerRLTrainer:
                 )
                 return PortfolioRLEnv(ohlcv_map=o_map, features_map=X_map, settings=self.settings, env_cfg=env_cfg)
             vec_env = DummyVecEnv([make_env])
+
+            # Load VecNormalize stats if they exist
+            vecnorm_path = output_dir / 'checkpoints' / 'vecnorm.pkl'
+            if vecnorm_path.exists():
+                vec_env = VecNormalize.load(str(vecnorm_path), vec_env)
+                vec_env.training = False
+                vec_env.norm_reward = False
+
             metrics = evaluate_model(model, vec_env, num_episodes=max(1, eval_episodes))
             # Persist equity/history and recompute metrics from equity curve
             try:
@@ -951,7 +1065,24 @@ class MultiTickerRLTrainer:
 
         else:
             # Single-ticker evaluation
-            single_env = DummyVecEnv([lambda: _build_env_from_frames(self.settings, data, features)])
+            single_ticker = tickers[0]
+            req_cols = list(self._train_feat_cols.get(single_ticker, []))
+            single_env = DummyVecEnv([
+                lambda: _build_env_from_frames(
+                    self.settings,
+                    data,
+                    features,
+                    required_feature_columns=req_cols,
+                )
+            ])
+
+            # Load VecNormalize stats if they exist
+            vecnorm_path = output_dir / 'checkpoints' / 'vecnorm.pkl'
+            if vecnorm_path.exists():
+                single_env = VecNormalize.load(str(vecnorm_path), single_env)
+                single_env.training = False
+                single_env.norm_reward = False
+
             metrics = evaluate_model(model, single_env, num_episodes=max(1, eval_episodes))
             summary = {
                 'tickers': tickers,
@@ -1132,6 +1263,52 @@ class MultiTickerRLTrainer:
                             df_steps[_col] = ser.reindex(df_steps.index)
             except Exception:
                 pass
+
+            # Reward component breakdowns (per-episode aggregates)
+            reward_breakdown_df = None
+            if env_ref is not None and hasattr(env_ref, 'get_reward_breakdown'):
+                try:
+                    reward_breakdown_df = env_ref.get_reward_breakdown()
+                except Exception:
+                    reward_breakdown_df = None
+            if isinstance(reward_breakdown_df, _pd.DataFrame) and not reward_breakdown_df.empty:
+                try:
+                    reward_breakdown_df.to_csv(output_dir / 'reward_breakdown.csv', index=False)
+                except Exception as rb_exc:
+                    logger.warning(f"Failed to write reward_breakdown.csv: {rb_exc}")
+                try:
+                    comp_metrics = metrics.setdefault('reward_components', {})
+                    mean_cols = {
+                        col: float(reward_breakdown_df[col].mean())
+                        for col in reward_breakdown_df.columns
+                        if col.endswith('_mean')
+                    }
+                    std_cols = {
+                        col: float(reward_breakdown_df[col].mean())
+                        for col in reward_breakdown_df.columns
+                        if col.endswith('_std')
+                    }
+                    if mean_cols:
+                        comp_metrics['episode_means'] = mean_cols
+                    if std_cols:
+                        comp_metrics['episode_stds'] = std_cols
+                except Exception as stats_exc:
+                    logger.warning(f"Failed to summarise reward breakdown stats: {stats_exc}")
+
+            if env_ref is not None and getattr(env_ref, 'composite_reward', None) is not None:
+                comp = env_ref.composite_reward
+                try:
+                    metrics['reward_mix'] = {
+                        'ret': float(getattr(comp, 'w_ret', 1.0)),
+                        'turnover': float(getattr(comp, 'w_turnover', 0.0)),
+                        'inventory': float(getattr(comp, 'w_inv', 0.0)),
+                        'dsr': float(getattr(comp, 'w_dsr', 0.0)),
+                    }
+                except Exception:
+                    pass
+                metrics['reward_kind'] = 'composite'
+                metrics['reward_scale'] = float(getattr(getattr(env_ref, 'env_config', None), 'reward_scaling', 1.0))
+                metrics['reward_include_costs'] = bool(getattr(env_ref, 'include_costs', True))
             # Always write steps.parquet (may be minimal if little info available)
             try:
                 df_steps = df_steps.sort_index()
@@ -1503,6 +1680,15 @@ class MultiTickerRLTrainer:
         metrics_dict = summary if isinstance(summary, dict) else {}
         feature_names = [c for c in features.columns if c != 'ticker']
 
+        reward_breakdown_path = output_dir / 'reward_breakdown.csv'
+        if reward_breakdown_path.exists():
+            try:
+                reward_breakdown_df = _pd.read_csv(reward_breakdown_path)
+            except Exception:
+                reward_breakdown_df = _pd.DataFrame()
+        else:
+            reward_breakdown_df = None
+
         return BacktestResult(
             trades=trades_df,
             equity=equity_df,
@@ -1510,4 +1696,5 @@ class MultiTickerRLTrainer:
             metrics=metrics_dict,
             feature_names=feature_names,
             baselines={},
+            reward_breakdown=reward_breakdown_df if reward_breakdown_df is not None and not getattr(reward_breakdown_df, 'empty', False) else None,
         )

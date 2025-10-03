@@ -89,3 +89,47 @@ class EarlyStopNoImprove(BaseCallback):
             return False
         return True
 
+
+class EntropyCollapseWarning(BaseCallback):
+    """
+    Callback to monitor policy entropy and log a warning if it collapses.
+    """
+
+    def __init__(self, threshold: float = 0.1, patience: int = 100, verbose: int = 0):
+        super().__init__(verbose)
+        self.threshold = threshold
+        self.patience = patience
+        self.consecutive_low_entropy = 0
+
+    def _on_step(self) -> bool:
+        try:
+            entropy = None
+            # Stable-Baselines3 exposes helper to retrieve running mean logs when available
+            if hasattr(self.logger, "get_mean_log"):
+                entropy = self.logger.get_mean_log("train/entropy_loss")
+            if entropy is None:
+                log_dict = getattr(self.logger, "get_log_dict", lambda: {})()
+                value = log_dict.get("train/entropy_loss")
+                if isinstance(value, (list, tuple)) and value:
+                    entropy = value[-1]
+                elif value is not None:
+                    entropy = value
+
+            if entropy is not None:
+                entropy = float(entropy)
+                if entropy < self.threshold:
+                    self.consecutive_low_entropy += 1
+                else:
+                    self.consecutive_low_entropy = 0
+
+                if self.consecutive_low_entropy >= self.patience:
+                    if self.verbose > 0:
+                        print(
+                            f"Warning: Policy entropy has been below {self.threshold} "
+                            f"for {self.patience} consecutive steps."
+                        )
+                    self.consecutive_low_entropy = 0  # Reset after warning
+        except Exception:
+            # Logger interface can change between SB3 versions; ignore unexpected issues silently
+            self.consecutive_low_entropy = 0
+        return True
