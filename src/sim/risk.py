@@ -507,7 +507,7 @@ class RiskManager:
         self.daily_pnl = []
         self.daily_loss_count = 0
         self.consecutive_losses = 0
-        logger.info("Daily risk metrics reset")
+        logger.debug("Daily risk metrics reset")
     
     def save_risk_report(self, filepath: str) -> None:
         """Save risk report to file."""

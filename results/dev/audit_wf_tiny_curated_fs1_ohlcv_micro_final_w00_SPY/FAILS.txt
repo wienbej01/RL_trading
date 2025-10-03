@@ -1,0 +1,3 @@
+steps.parquet missing at results/wf/wf_tiny_curated_fs1_ohlcv_micro_final/window_00/SPY/steps.parquet
+summary.json missing
+trades.csv missing

@@ -743,7 +743,7 @@ def calculate_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
     return rsi
 
 
-def calculate_macd(prices: pd.Series, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> Dict[str, pd.Series]:
+def calculate_macd(prices: pd.Series, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9):
     """
     Calculate MACD (Moving Average Convergence Divergence).
 
@@ -754,7 +754,7 @@ def calculate_macd(prices: pd.Series, fast_period: int = 12, slow_period: int = 
         signal_period: Signal line EMA period
 
     Returns:
-        Dictionary with MACD line, signal line, and histogram
+        Tuple (macd_line, signal_line, histogram) for compatibility
     """
     # Calculate EMAs
     ema_fast = prices.ewm(span=fast_period).mean()
@@ -769,14 +769,10 @@ def calculate_macd(prices: pd.Series, fast_period: int = 12, slow_period: int = 
     # Calculate histogram
     histogram = macd_line - signal_line
 
-    return {
-        'macd': macd_line,
-        'signal': signal_line,
-        'histogram': histogram
-    }
+    return macd_line, signal_line, histogram
 
 
-def calculate_bollinger_bands(prices: pd.Series, window: int = 20, num_std: float = 2.0) -> Dict[str, pd.Series]:
+def calculate_bollinger_bands(prices: pd.Series, window: int = 20, num_std: float = 2.0):
     """
     Calculate Bollinger Bands.
 
@@ -786,7 +782,7 @@ def calculate_bollinger_bands(prices: pd.Series, window: int = 20, num_std: floa
         num_std: Number of standard deviations
 
     Returns:
-        Dictionary with upper band, middle band, lower band, and width
+        Tuple (upper_band, rolling_mean, lower_band) for compatibility
     """
     rolling_mean = prices.rolling(window=window).mean()
     rolling_std = prices.rolling(window=window).std()
@@ -795,16 +791,12 @@ def calculate_bollinger_bands(prices: pd.Series, window: int = 20, num_std: floa
     lower_band = rolling_mean - (rolling_std * num_std)
     bb_width = (upper_band - lower_band) / rolling_mean
 
-    return {
-        'upper': upper_band,
-        'middle': rolling_mean,
-        'lower': lower_band,
-        'width': bb_width
-    }
+    return upper_band, rolling_mean, lower_band
 
 
 def calculate_stochastic_oscillator(high: pd.Series, low: pd.Series, close: pd.Series,
-                                  k_period: int = 14, d_period: int = 3) -> Dict[str, pd.Series]:
+                                  k_period: int = 14, d_period: int = 3,
+                                  **kwargs):
     """
     Calculate Stochastic Oscillator.
 
@@ -816,17 +808,23 @@ def calculate_stochastic_oscillator(high: pd.Series, low: pd.Series, close: pd.S
         d_period: Period for %D calculation
 
     Returns:
-        Dictionary with %K and %D series
+        Tuple (%K, %D) for compatibility
     """
     low_min = low.rolling(window=k_period).min()
     high_max = high.rolling(window=k_period).max()
     k_percent = 100 * ((close - low_min) / (high_max - low_min))
     d_percent = k_percent.rolling(window=d_period).mean()
 
-    return {
-        'k': k_percent,
-        'd': d_percent
-    }
+    # Alias support for tests using k_window/d_window
+    if 'k_window' in kwargs:
+        kw = int(kwargs.get('k_window') or k_period)
+        low_min = low.rolling(window=kw).min()
+        high_max = high.rolling(window=kw).max()
+        k_percent = 100 * ((close - low_min) / (high_max - low_min))
+    if 'd_window' in kwargs:
+        dw = int(kwargs.get('d_window') or d_period)
+        d_percent = k_percent.rolling(window=dw).mean()
+    return k_percent, d_percent
 
 
 def calculate_williams_r(high: pd.Series, low: pd.Series, close: pd.Series, 

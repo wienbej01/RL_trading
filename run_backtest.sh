@@ -12,4 +12,4 @@ python /home/jacobw/RL_trading/rl-intraday/scripts/walkforward_train_eval.py \
     --data /home/jacobw/RL_trading/rl-intraday/data/raw/BBVA_1min.parquet \
     --features /home/jacobw/RL_trading/rl-intraday/data/features/BBVA_features.parquet \
     --output /home/jacobw/RL_trading/rl-intraday/runs/wf_bbva_debug \
-    --train-days 5 --test-days 2
+    --train-days 5 --test-days 2 --n-envs 1 --total-steps 100

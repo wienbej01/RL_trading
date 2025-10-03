@@ -70,8 +70,15 @@ def _normalize_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
     # If not found, try the index
     if ts_col is None:
         if isinstance(df.index, pd.DatetimeIndex):
-            df = df.reset_index().rename(columns={"index": "timestamp"})
-            ts_col = "timestamp"
+            df = df.reset_index()
+            if "index" in df.columns:
+                df = df.rename(columns={"index": "timestamp"})
+                ts_col = "timestamp"
+            else:
+                # Use the former index name (now the first column)
+                first_col = df.columns[0]
+                df = df.rename(columns={first_col: "timestamp"})
+                ts_col = "timestamp"
         else:
             # If any column is already datetime dtype, use that
             for c in df.columns:

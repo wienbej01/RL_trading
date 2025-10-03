@@ -292,6 +292,7 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
         spread_ticks=int(settings.get("execution", "spread_ticks", default=1)),
         impact_bps=float(settings.get("execution", "impact_bps", default=0.5)),
         commission_per_contract=float(settings.get("execution", "commission_per_contract", default=0.0035)),
+        min_commission=float(settings.get("execution", "min_commission", default=0.0)),
     )
 
     # Risk configuration (position sizing & kill-switch thresholds)
@@ -300,6 +301,9 @@ def build_env(settings: Settings, data_path: str, features_path: str) -> Intrada
         stop_r_multiple=float(settings.get("risk", "stop_r_multiple", default=1.0)),
         tp_r_multiple=float(settings.get("risk", "tp_r_multiple", default=1.5)),
         max_daily_loss_r=float(settings.get("risk", "max_daily_loss_r", default=3.0)),
+        max_position_size=int(settings.get("risk", "max_position_size", default=100)),
+        max_leverage=float(settings.get("risk", "max_leverage", default=1.0)),
+        drawdown_limit=float(settings.get("risk", "drawdown_limit", default=0.15)),
     )
 
     # Instrument point value (SPY ETF should be 1.0; futures differ)
@@ -447,26 +451,71 @@ def train_ppo_lstm(settings: Settings,
 
     lr_param = make_lr_schedule(training_config.learning_rate)
 
-    model = RecurrentPPO(
-        'MlpLstmPolicy',
-        vec_env,
-        learning_rate=lr_param,
-        n_steps=training_config.n_steps,
-        batch_size=training_config.batch_size,
-        gamma=training_config.gamma,
-        gae_lambda=training_config.gae_lambda,
-        clip_range=training_config.clip_range,
-        vf_coef=training_config.vf_coef,
-        ent_coef=training_config.ent_coef,
-        max_grad_norm=training_config.max_grad_norm,
-        n_epochs=training_config.n_epochs,
-        target_kl=training_config.target_kl,
-        tensorboard_log=training_config.tensorboard_log,
-        policy_kwargs=policy_kwargs,
-        device=effective_device,
-        verbose=training_config.verbose,
-        seed=training_config.seed
-    )
+    # Optional: Behavior Cloning warm-start (load prior checkpoint)
+    bc_enabled = False
+    bc_path = None
+    aux_enabled = False
+    try:
+        bc_enabled = bool(settings.get('train', 'bc', 'enabled', default=False))
+        bc_path = settings.get('train', 'bc', 'init_from', default=None)
+        aux_enabled = bool(settings.get('train', 'aux_head', 'enabled', default=False))
+    except Exception:
+        pass
+
+    model: RecurrentPPO
+    if bc_enabled and bc_path:
+        try:
+            logger.info(f"BC warm-start enabled; attempting to load checkpoint from: {bc_path}")
+            model = RecurrentPPO.load(bc_path, env=vec_env, device=effective_device, print_system_info=False)
+            # Ensure verbosity and seed reflect current training config
+            model.verbose = training_config.verbose
+            logger.info("Warm-start successful; continuing PPO training from loaded policy.")
+        except Exception as e:
+            logger.warning(f"Failed to warm-start from '{bc_path}' ({e}); initializing fresh PPO model.")
+            model = RecurrentPPO(
+                'MlpLstmPolicy',
+                vec_env,
+                learning_rate=lr_param,
+                n_steps=training_config.n_steps,
+                batch_size=training_config.batch_size,
+                gamma=training_config.gamma,
+                gae_lambda=training_config.gae_lambda,
+                clip_range=training_config.clip_range,
+                vf_coef=training_config.vf_coef,
+                ent_coef=training_config.ent_coef,
+                max_grad_norm=training_config.max_grad_norm,
+                n_epochs=training_config.n_epochs,
+                target_kl=training_config.target_kl,
+                tensorboard_log=training_config.tensorboard_log,
+                policy_kwargs=policy_kwargs,
+                device=effective_device,
+                verbose=training_config.verbose,
+                seed=training_config.seed
+            )
+    else:
+        model = RecurrentPPO(
+            'MlpLstmPolicy',
+            vec_env,
+            learning_rate=lr_param,
+            n_steps=training_config.n_steps,
+            batch_size=training_config.batch_size,
+            gamma=training_config.gamma,
+            gae_lambda=training_config.gae_lambda,
+            clip_range=training_config.clip_range,
+            vf_coef=training_config.vf_coef,
+            ent_coef=training_config.ent_coef,
+            max_grad_norm=training_config.max_grad_norm,
+            n_epochs=training_config.n_epochs,
+            target_kl=training_config.target_kl,
+            tensorboard_log=training_config.tensorboard_log,
+            policy_kwargs=policy_kwargs,
+            device=effective_device,
+            verbose=training_config.verbose,
+            seed=training_config.seed
+        )
+
+    if aux_enabled:
+        logger.info("Auxiliary head is enabled in config (placeholder). No-op in current phase.")
     
     # Hint to PyTorch threading; respect config if provided, otherwise keep library defaults
     try:
@@ -515,14 +564,33 @@ def train_ppo_lstm(settings: Settings,
     )
     logger.info("Model training complete.")
     
-    # Save model
+    # Save model (work around SB3 gym version probe in some environments)
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import gym as _gym  # type: ignore
+        if not hasattr(_gym, "__version__"):
+            setattr(_gym, "__version__", "0.0.0")
+    except Exception:
+        pass
     model.save(model_path)
     logger.info(f"Model saved to {model_path}")
 
     # Save the VecNormalize statistics
     vec_env.save(str(Path(model_path).parent / "vecnormalize.pkl"))
     logger.info(f"VecNormalize statistics saved to {Path(model_path).parent / 'vecnormalize.pkl'}")
+    try:
+        stats_path = Path(model_path).parent / "obs_norm_stats.json"
+        obs_rms = getattr(vec_env, 'obs_rms', None)
+        if obs_rms is not None:
+            stats_payload = {
+                'mean': obs_rms.mean.tolist(),
+                'variance': obs_rms.var.tolist(),
+                'count': float(obs_rms.count),
+            }
+            stats_path.write_text(json.dumps(stats_payload, indent=2))
+            logger.info("VecNormalize observation stats written to %s", stats_path)
+    except Exception as exc:
+        logger.warning("Failed to export VecNormalize stats JSON: %s", exc)
     # Save feature column metadata for parity checks
     try:
         meta = {
@@ -556,28 +624,71 @@ def evaluate_model(model: RecurrentPPO, env: DummyVecEnv, num_episodes: int = 5)
     
     episode_rewards = []
     episode_lengths = []
+    episode_infos = []
     equity_curves = []
     
-    for episode in range(num_episodes):
-        obs = env.reset()
-        state = None
-        episode_start = np.ones((env.num_envs,), dtype=bool)
-        done = np.array([False])
-        episode_reward = 0.0
-        episode_length = 0
+    # Robust vectorized evaluation: count episode completions per env and stop
+    # when total completed episodes reaches num_episodes * n_envs.
+    obs = env.reset()
+    # Sanitize observations to avoid NaNs/Infs reaching the policy
+    try:
+        import numpy as _np
+        if isinstance(obs, (list, tuple)):
+            obs = [_np.nan_to_num(o, nan=0.0, posinf=0.0, neginf=0.0) for o in obs]
+        else:
+            obs = _np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        pass
+    state = None
+    n_envs = int(getattr(env, 'num_envs', 1))
+    episode_start = np.ones((n_envs,), dtype=bool)
+    # Track per-env accumulators until each completes one episode, then reset counters
+    ep_rewards = np.zeros((n_envs,), dtype=float)
+    ep_lengths = np.zeros((n_envs,), dtype=int)
+    completed = 0
+    target = max(1, num_episodes) * n_envs
 
-        while not done.all():
-            action, state = model.predict(
-                obs, state=state, episode_start=episode_start, deterministic=True
-            )
-            obs, reward, done, info = env.step(action)
-            episode_start = done
-            episode_reward += float(np.array(reward).sum())
-            episode_length += 1
-
-        episode_rewards.append(episode_reward)
-        episode_lengths.append(episode_length)
-        equity_curves.append(env.envs[0].get_equity_curve())
+    while completed < target:
+        action, state = model.predict(
+            obs, state=state, episode_start=episode_start, deterministic=True
+        )
+        obs, reward, done, info = env.step(action)
+        try:
+            if isinstance(obs, (list, tuple)):
+                obs = [np.nan_to_num(o, nan=0.0, posinf=0.0, neginf=0.0) for o in obs]
+            else:
+                obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        except Exception:
+            pass
+        # Convert to numpy arrays
+        r = np.asarray(reward, dtype=float).reshape(-1)
+        d = np.asarray(done).reshape(-1)
+        ep_rewards += r
+        ep_lengths += 1
+        # Handle each env completion independently
+        for i in range(n_envs):
+            if d[i]:
+                episode_rewards.append(float(ep_rewards[i]))
+                episode_lengths.append(int(ep_lengths[i]))
+                episode_infos.append(info[i])
+                # Reset per-env counters after completion; DummyVecEnv auto-resets obs
+                ep_rewards[i] = 0.0
+                ep_lengths[i] = 0
+                completed += 1
+        episode_start = d
+    # Best-effort equity curve from the first env or _last_equity_curve snapshot
+    try:
+        if hasattr(env.envs[0], '_last_equity_curve') and env.envs[0]._last_equity_curve is not None:
+            import pandas as _pd
+            ec = env.envs[0]._last_equity_curve
+            if isinstance(ec, _pd.Series):
+                equity_curves.append(ec)
+            else:
+                equity_curves.append(_pd.Series(ec))
+        else:
+            equity_curves.append(env.envs[0].get_equity_curve())
+    except Exception:
+        pass
     
     # Calculate metrics
     metrics = {
@@ -596,6 +707,23 @@ def evaluate_model(model: RecurrentPPO, env: DummyVecEnv, num_episodes: int = 5)
         'win_rate': 0.0,
         'profit_factor': 0.0
     }
+
+    dsr_values = []
+    if episode_infos:
+        for info in episode_infos:
+            try:
+                value = float(info.get('dsr')) if info.get('dsr') is not None else None
+            except Exception:
+                value = None
+            if value is not None and np.isfinite(value):
+                dsr_values.append(value)
+    metrics['dsr'] = float(np.mean(dsr_values)) if dsr_values else 0.0
+
+    all_trades = []
+    for env_instance in env.envs:
+        all_trades.extend(env_instance.get_trades())
+    
+    metrics['total_trades'] = len(all_trades)
     
     # Calculate performance metrics
     if equity_curves:
@@ -748,6 +876,50 @@ def walk_forward_training(settings: Settings,
                 _pd.DataFrame(trades).to_csv(fold_dir / "trades.csv", index=False)
         except Exception:
             pass
+
+    # Create summary DataFrame
+    summary_df = pd.DataFrame([res['test_metrics'] for res in wf_results])
+    summary_df['fold'] = [res['fold'] for res in wf_results]
+    summary_df.to_csv(output_path / "wf_summary.csv", index=False)
+
+    # Check acceptance criteria
+    median_dsr = summary_df['dsr'].median()
+    max_drawdown = summary_df['max_drawdown'].max()
+    
+    # Trades per day calculation
+    total_trades = summary_df['total_trades'].sum()
+    total_days = sum([(res['test_end'] - res['test_start']).days for res in wf_results])
+    trades_per_day = total_trades / total_days if total_days > 0 else 0
+
+    decision = {
+        'decision': 'go',
+        'rationale': [],
+        'metrics': {
+            'median_dsr': median_dsr,
+            'max_drawdown': max_drawdown,
+            'trades_per_day': trades_per_day,
+        }
+    }
+
+    if median_dsr <= 0:
+        decision['decision'] = 'no-go'
+        decision['rationale'].append(f"Median DSR ({median_dsr:.4f}) is not positive.")
+
+    if max_drawdown > 0.05:
+        decision['decision'] = 'no-go'
+        decision['rationale'].append(f"Max drawdown ({max_drawdown:.4f}) is greater than 5%.")
+
+    if trades_per_day < 0.5:
+        decision['decision'] = 'no-go'
+        decision['rationale'].append(f"Trades per day ({trades_per_day:.4f}) is less than 0.5.")
+
+    if not decision['rationale']:
+        decision['rationale'].append("All acceptance criteria met.")
+
+    with open(output_path / "decision.json", 'w') as f:
+        json.dump(decision, f, indent=2)
+
+    return wf_results
 
 
 

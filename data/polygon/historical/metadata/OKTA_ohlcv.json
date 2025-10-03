@@ -1,0 +1,11 @@
+{
+  "symbol": "OKTA",
+  "data_type": "ohlcv",
+  "last_update": "2025-09-13T11:44:52.417975",
+  "date_range_start": "2020-10-01T00:00:00",
+  "date_range_end": "2025-06-30T00:00:00",
+  "total_records": 10000,
+  "last_successful_fetch": "2025-06-30T00:00:00",
+  "error_count": 0,
+  "last_error": null
+}

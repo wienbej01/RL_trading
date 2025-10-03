@@ -580,39 +580,40 @@ def extract_session_features(timestamps: pd.DatetimeIndex) -> pd.DataFrame:
     """
     features = pd.DataFrame(index=timestamps)
     
-    # Ensure timestamps are timezone-naive for consistent calculations
-    if timestamps.tz is not None:
-        timestamps = timestamps.tz_convert('UTC').tz_localize(None)
-    
+    # Ensure timestamps are timezone-aware for consistent calculations
+    if timestamps.tz is None:
+        timestamps = timestamps.tz_localize('UTC')
+    timestamps_ny = timestamps.tz_convert('America/New_York')
+
     # Market hours (9:30 AM - 4:00 PM EST)
     market_open = time(9, 30)
     market_close = time(16, 0)
     
-    # Initialize features
-    features['is_market_open'] = False
-    features['time_from_open'] = np.nan
-    features['time_to_close'] = np.nan
-    features['session_progress'] = np.nan
+    time_ny = timestamps_ny.time
+    features['is_market_open'] = (time_ny >= market_open) & (time_ny <= market_close)
     
-    for i, ts in enumerate(timestamps):
-        ts_time = ts.time()
-        ts_date = ts.date()
-        
-        # Create timezone-naive datetime objects for comparison
-        open_datetime = datetime.combine(ts_date, market_open)
-        close_datetime = datetime.combine(ts_date, market_close)
-        
-        # Check if current time is within market hours
-        if open_datetime.time() <= ts_time <= close_datetime.time():
-            features.iloc[i, features.columns.get_loc('is_market_open')] = True
-            features.iloc[i, features.columns.get_loc('time_from_open')] = (ts - open_datetime).total_seconds() / 60
-            features.iloc[i, features.columns.get_loc('time_to_close')] = (close_datetime - ts).total_seconds() / 60
-            
-            # Calculate session progress (0 to 1)
-            total_session_minutes = (close_datetime - open_datetime).total_seconds() / 60
-            if total_session_minutes > 0:
-                progress = (ts - open_datetime).total_seconds() / 60 / total_session_minutes
-                features.iloc[i, features.columns.get_loc('session_progress')] = progress
+    open_datetime = timestamps_ny.normalize() + pd.Timedelta(hours=9, minutes=30)
+    close_datetime = timestamps_ny.normalize() + pd.Timedelta(hours=16)
+
+    time_from_open_delta = (timestamps_ny - open_datetime)
+    time_to_close_delta = (close_datetime - timestamps_ny)
+
+    time_from_open = time_from_open_delta / np.timedelta64(1, 'm')
+    time_to_close = time_to_close_delta / np.timedelta64(1, 'm')
+    
+    features['time_from_open'] = time_from_open.where(features['is_market_open'])
+    features['time_to_close'] = time_to_close.where(features['is_market_open'])
+    
+    total_session_minutes = (16 - 9.5) * 60
+    features['session_progress'] = (features['time_from_open'] / total_session_minutes).where(features['is_market_open'])
+
+    # Session phase
+    features['session_phase'] = pd.cut(
+        features['time_from_open'],
+        bins=[-1, 60, 330, 391],
+        labels=['open', 'mid', 'power_hour'],
+        right=False
+    )
     
     return features
 

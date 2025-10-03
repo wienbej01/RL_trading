@@ -1,0 +1,81 @@
+{
+  "agg_sharpe": -0.03068651151817383,
+  "agg_pf": 0.7958164110330272,
+  "agg_ret": -0.0006687380000109259,
+  "agg_maxdd": -0.027224884596388055,
+  "trades_total": 307,
+  "long_total": 169,
+  "short_total": 138,
+  "costs_total": 30700.0,
+  "windows": [
+    {
+      "window": 0,
+      "sharpe_ratio": -0.15126173933535034,
+      "profit_factor": 0.8419507007858252,
+      "total_return": -0.011642720000008558,
+      "max_drawdown": -0.014549145589647594,
+      "total_trades": 76,
+      "long_trades": 3,
+      "short_trades": 73,
+      "tx_costs_total": 7600.0,
+      "no_shorts_tickers": 0
+    },
+    {
+      "window": 1,
+      "sharpe_ratio": -0.1278536240515301,
+      "profit_factor": 0.6467156439066485,
+      "total_return": -0.005210250000002707,
+      "max_drawdown": -0.007420030785465381,
+      "total_trades": 76,
+      "long_trades": 11,
+      "short_trades": 65,
+      "tx_costs_total": 7600.0,
+      "no_shorts_tickers": 0
+    },
+    {
+      "window": 2,
+      "sharpe_ratio": 0.0,
+      "profit_factor": 0.0,
+      "total_return": 0.0,
+      "max_drawdown": 0.0,
+      "total_trades": 0,
+      "long_trades": 0,
+      "short_trades": 0,
+      "tx_costs_total": 0.0,
+      "no_shorts_tickers": 1
+    },
+    {
+      "window": 3,
+      "sharpe_ratio": 0.015512282555095857,
+      "profit_factor": 0.9144728246938468,
+      "total_return": 0.0027656699999589183,
+      "max_drawdown": -0.027224884596388055,
+      "total_trades": 77,
+      "long_trades": 77,
+      "short_trades": 0,
+      "tx_costs_total": 7700.0,
+      "no_shorts_tickers": 1
+    },
+    {
+      "window": 4,
+      "sharpe_ratio": 0.11017052324091546,
+      "profit_factor": 1.575942885778816,
+      "total_return": 0.010743609999997716,
+      "max_drawdown": -0.005955638526961127,
+      "total_trades": 78,
+      "long_trades": 78,
+      "short_trades": 0,
+      "tx_costs_total": 7800.0,
+      "no_shorts_tickers": 1
+    }
+  ],
+  "tickers": [
+    "SPY",
+    "AAPL"
+  ],
+  "skipped_windows": [],
+  "no_shorts_windows": 3,
+  "no_shorts_tickers_total": 3,
+  "parity_violations": [],
+  "parity_ok": true
+}

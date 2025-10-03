@@ -1,0 +1,62 @@
+{
+  "agg_sharpe": 0.18544168738603595,
+  "agg_pf": 2.7266699610800486,
+  "agg_ret": 0.007104617499995329,
+  "agg_maxdd": -0.043599573274358816,
+  "trades_total": 43,
+  "long_total": 43,
+  "short_total": 0,
+  "costs_total": 8600.0,
+  "windows": [
+    {
+      "window": 0,
+      "sharpe_ratio": 0.25723070541254156,
+      "profit_factor": 1.2319995656659088,
+      "total_return": 0.007874839999991527,
+      "max_drawdown": -0.006247897548894987,
+      "total_trades": 15,
+      "long_trades": 15,
+      "short_trades": 0,
+      "tx_costs_total": 3000.0
+    },
+    {
+      "window": 1,
+      "sharpe_ratio": 0.0,
+      "profit_factor": 0.0,
+      "total_return": 0.0,
+      "max_drawdown": 0.0,
+      "total_trades": 0,
+      "long_trades": 0,
+      "short_trades": 0,
+      "tx_costs_total": 0.0
+    },
+    {
+      "window": 2,
+      "sharpe_ratio": -0.2035271023215877,
+      "profit_factor": 0.5111022970029748,
+      "total_return": -0.018337150000003893,
+      "max_drawdown": -0.043599573274358816,
+      "total_trades": 14,
+      "long_trades": 14,
+      "short_trades": 0,
+      "tx_costs_total": 2800.0
+    },
+    {
+      "window": 3,
+      "sharpe_ratio": 0.6880631464531899,
+      "profit_factor": 9.163577981651311,
+      "total_return": 0.03888077999999368,
+      "max_drawdown": -0.0052322753893119245,
+      "total_trades": 14,
+      "long_trades": 14,
+      "short_trades": 0,
+      "tx_costs_total": 2800.0
+    }
+  ],
+  "tickers": [
+    "SPY",
+    "AAPL"
+  ],
+  "skipped_windows": []
+}
+

@@ -1,0 +1,40 @@
+{
+  "tickers": [
+    "CRWD",
+    "DDOG",
+    "DOCU",
+    "ENPH",
+    "ETSY",
+    "FSLR",
+    "LYFT",
+    "MDB",
+    "NET",
+    "OKTA",
+    "PINS",
+    "PLUG",
+    "ROKU",
+    "RUN",
+    "SNAP",
+    "SQ",
+    "TWLO",
+    "UAL",
+    "UBER",
+    "ZM"
+  ],
+  "portfolio_metrics": {
+    "mean_reward": -3760.328306322912,
+    "std_reward": 0.0,
+    "mean_length": 1922.0,
+    "std_length": 0.0,
+    "max_reward": -3760.328306322912,
+    "min_reward": -3760.328306322912,
+    "total_return": -0.07078678400000703,
+    "annual_return": -0.00951962309503629,
+    "annual_volatility": 0.011021804819547726,
+    "sharpe_ratio": -0.8678290853950731,
+    "max_drawdown": -0.08536597081511721,
+    "calmar_ratio": -0.11204749056791169,
+    "win_rate": 0.4630593132154006,
+    "profit_factor": 0.8391790874698047
+  }
+}

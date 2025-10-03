@@ -936,3 +936,46 @@ class TestPolygonCompatibility:
 
         # Should have reasonable number of features
         assert features.shape[1] > 10
+
+    def test_pipeline_reports_written(self, tmp_path):
+        config = {
+            'technical': {
+                'sma_windows': [5],
+                'calculate_returns': True,
+            },
+            'feature_selection': {
+                'method': 'univariate',
+                'k': 5,
+            },
+            'normalization': {
+                'method': 'standardize',
+                'fit_on_train': True,
+            },
+        }
+        data = self.polygon_ohlcv.copy()
+        data['ticker'] = 'TEST'
+        pipeline = FeaturePipeline(config)
+        features = pipeline.fit_transform(data)
+        pipeline.write_reports(tmp_path, prefix='unit', features=features)
+
+        selected_path = tmp_path / 'unit_features_selected.csv'
+        audit_path = tmp_path / 'unit_feature_audit.csv'
+        norm_path = tmp_path / 'unit_normalization_stats.json'
+        importance_path = tmp_path / 'unit_feature_importances.csv'
+
+        assert selected_path.exists()
+        assert audit_path.exists()
+        assert norm_path.exists()
+        df_selected = pd.read_csv(selected_path)
+        assert not df_selected.empty
+        df_audit = pd.read_csv(audit_path)
+        assert 'feature' in df_audit.columns
+        df_scores = pd.read_csv(importance_path)
+        assert 'score' in df_scores.columns
+
+    def test_pipeline_leak_detection(self):
+        pipeline = FeaturePipeline({})
+        idx = pd.date_range('2023-01-01', periods=5, freq='T', tz='UTC')
+        suspicious = pd.DataFrame({'future_price': np.arange(5)}, index=idx)
+        with pytest.raises(ValueError):
+            pipeline.audit_features(suspicious, stage='test')

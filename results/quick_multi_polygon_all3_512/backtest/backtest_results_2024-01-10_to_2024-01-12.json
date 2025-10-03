@@ -1,0 +1,57 @@
+{
+  "tickers": [
+    "AAPL",
+    "MSFT",
+    "NVDA"
+  ],
+  "per_ticker_metrics": {
+    "AAPL": {
+      "mean_reward": -0.6282701028540032,
+      "std_reward": 0.0,
+      "mean_length": 715.0,
+      "std_length": 0.0,
+      "max_reward": -0.6282701028540032,
+      "min_reward": -0.6282701028540032,
+      "total_return": 0.0,
+      "annual_return": 0.0,
+      "annual_volatility": 0.0,
+      "sharpe_ratio": 0.0,
+      "max_drawdown": 0.0,
+      "calmar_ratio": 0.0,
+      "win_rate": 0.0,
+      "profit_factor": 0.0
+    },
+    "MSFT": {
+      "mean_reward": 2.0094704266812187,
+      "std_reward": 0.0,
+      "mean_length": 391.0,
+      "std_length": 0.0,
+      "max_reward": 2.0094704266812187,
+      "min_reward": 2.0094704266812187,
+      "total_return": 0.0,
+      "annual_return": 0.0,
+      "annual_volatility": 0.0,
+      "sharpe_ratio": 0.0,
+      "max_drawdown": 0.0,
+      "calmar_ratio": 0.0,
+      "win_rate": 0.0,
+      "profit_factor": 0.0
+    },
+    "NVDA": {
+      "mean_reward": -0.1482955715296157,
+      "std_reward": 0.0,
+      "mean_length": 748.0,
+      "std_length": 0.0,
+      "max_reward": -0.1482955715296157,
+      "min_reward": -0.1482955715296157,
+      "total_return": 0.0,
+      "annual_return": 0.0,
+      "annual_volatility": 0.0,
+      "sharpe_ratio": 0.0,
+      "max_drawdown": 0.0,
+      "calmar_ratio": 0.0,
+      "win_rate": 0.0,
+      "profit_factor": 0.0
+    }
+  }
+}

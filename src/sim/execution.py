@@ -50,21 +50,35 @@ class ExecutionEngine:
             # Use dict.get() method for dictionary config
             transaction_cost = config.get('transaction_cost', 2.5) if isinstance(config, dict) else 2.5
             slippage = config.get('slippage', 0.01) if isinstance(config, dict) else 0.01
-            
+            commission_per_share = config.get('commission_per_contract', config.get('commission_per_share', transaction_cost))
+            tick_value = float(config.get('tick_value', 1.25)) if isinstance(config, dict) else 1.25
+            spread_ticks = int(config.get('spread_ticks', 1)) if isinstance(config, dict) else 1
+            impact_bps = float(config.get('impact_bps', 0.5)) if isinstance(config, dict) else 0.5
+            min_commission = float(config.get('min_commission', 1.0)) if isinstance(config, dict) else 1.0
+
             self.exec_params = ExecParams(
-                tick_value=1.25,
-                spread_ticks=1,
-                impact_bps=0.5,
-                commission_per_contract=transaction_cost,
-                min_commission=1.0,
-                slippage_bps=slippage * 100,  # Convert to bps
-                liquidity_threshold=1000
+                tick_value=tick_value,
+                spread_ticks=spread_ticks,
+                impact_bps=impact_bps,
+                commission_per_contract=float(commission_per_share),
+                min_commission=min_commission,
+                slippage_bps=float(config.get('slippage_bps', slippage * 100)),
+                liquidity_threshold=float(config.get('liquidity_threshold', 1000))
             )
         else:
             # Use settings for production
             self.settings = settings
             # Use keyword default to avoid treating the default as a key (unhashable)
             self.config = settings.get('execution', default={}) if settings else {}
+            # Optional bps-based costs + position sizing
+            try:
+                self.costs_cfg = settings.get('costs', default={}) if settings else {}
+            except Exception:
+                self.costs_cfg = {}
+            try:
+                self.position_cfg = settings.get('position', default={}) if settings else {}
+            except Exception:
+                self.position_cfg = {}
             # Filter only fields supported by ExecParams; map slippage (fraction) -> slippage_bps when present
             allowed = {
                 'tick_value', 'spread_ticks', 'impact_bps',
@@ -106,27 +120,54 @@ class ExecutionEngine:
             Dictionary with cost breakdown
         """
         # Base commission
-        commission = max(
-            self.exec_params.commission_per_contract * abs(quantity),
-            self.exec_params.min_commission
-        )
-        
+        commission = self.exec_params.commission_per_contract * abs(quantity)
+        commission = max(commission, self.exec_params.min_commission) if self.exec_params.min_commission else commission
+
         # Slippage cost
         slippage_cost = (
             price * abs(quantity) * 
             self.exec_params.slippage_bps / 10000
         )
-        
-        # Market impact cost
+
+        # Spread cost in notional dollars (tick value already expressed in $)
+        spread_cost = abs(quantity) * self.exec_params.spread_ticks * self.exec_params.tick_value
+
+        # If a bps-based costs config is present, use notional-based model
+        try:
+            if isinstance(self.costs_cfg, dict) and any(k in self.costs_cfg for k in ('commission_bps', 'spread_bps', 'slippage_bps', 'impact_k')):
+                unit_size = float(self.position_cfg.get('unit_size', 1.0)) if isinstance(self.position_cfg, dict) else 1.0
+                shares = abs(quantity) * unit_size
+                notional = float(price) * float(shares)
+                commission_bps = float(self.costs_cfg.get('commission_bps', 0.0))
+                spread_bps = float(self.costs_cfg.get('spread_bps', 0.0))
+                slippage_bps = float(self.costs_cfg.get('slippage_bps', 0.0))
+                impact_k = float(self.costs_cfg.get('impact_k', 0.0))
+                commission = notional * commission_bps / 10000.0
+                spread_cost = notional * spread_bps / 10000.0
+                slippage_cost = notional * slippage_bps / 10000.0
+                impact_cost = notional * impact_k
+                total_cost = commission + spread_cost + slippage_cost + impact_cost
+                return {
+                    'commission': commission,
+                    'spread': spread_cost,
+                    'slippage': slippage_cost,
+                    'impact': impact_cost,
+                    'total': total_cost,
+                    'cost_per_contract': total_cost / abs(quantity) if quantity != 0 else 0
+                }
+        except Exception:
+            # Fall back to classic model below
+            pass
+
+        # Market impact cost (classic model)
         impact_cost = self._estimate_market_impact(quantity, price)
-        
         # Total cost
-        total_cost = commission + slippage_cost + impact_cost
-        
+        total_cost = commission + slippage_cost + impact_cost + spread_cost
         return {
             'commission': commission,
             'slippage': slippage_cost,
             'impact': impact_cost,
+            'spread': spread_cost,
             'total': total_cost,
             'cost_per_contract': total_cost / abs(quantity) if quantity != 0 else 0
         }
@@ -460,7 +501,11 @@ def estimate_tc(position: int, price: float, exec_sim: ExecutionEngine) -> float
     commission = float(costs.get('commission', 0.0))
     slippage = float(costs.get('slippage', 0.0))
     impact = float(costs.get('impact', 0.0))
-    return commission + slippage + impact
+    spread = float(costs.get('spread', 0.0))
+    total = float(costs.get('total', commission + slippage + impact + spread))
+    if total != 0.0:
+        return total
+    return commission + slippage + impact + spread
 
 
 @dataclass

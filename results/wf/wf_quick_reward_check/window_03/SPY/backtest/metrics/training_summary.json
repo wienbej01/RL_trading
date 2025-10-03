@@ -1,0 +1,8 @@
+{
+  "seed": 123,
+  "total_timesteps": 10000,
+  "saved": "results/wf/wf_quick_reward_check/window_03/SPY/backtest/checkpoints/model_last",
+  "best_model": "results/wf/wf_quick_reward_check/window_03/SPY/backtest/checkpoints/best_model.zip",
+  "vecnorm": "results/wf/wf_quick_reward_check/window_03/SPY/backtest/checkpoints/vecnorm.pkl",
+  "timestamp": 1759388710.0521452
+}

@@ -33,7 +33,7 @@ def main():
     print(f"Loaded {len(df)} rows from {df.index.min()} to {df.index.max()}")
 
     # Instantiate pipeline
-    pipeline = FeaturePipeline(settings.get("features", {}))
+    pipeline = FeaturePipeline(settings.get("features", default={}))
 
     # Generate features
     print("Generating features...")

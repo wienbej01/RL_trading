@@ -1,0 +1,49 @@
+{
+  "windows": [
+    {
+      "status": "ok",
+      "metrics": {
+        "trades_per_day": 0.0
+      },
+      "gates": {
+        "cadence_min_1": false,
+        "action_diversity": false,
+        "expectancy_pos": false,
+        "max_dd_lt_20pct": true
+      },
+      "summary": {
+        "tickers": [
+          "SPY"
+        ],
+        "per_ticker_metrics": {
+          "SPY": {
+            "mean_reward": -1.7276441839057952,
+            "std_reward": 0.0,
+            "mean_length": 391.0,
+            "std_length": 0.0,
+            "max_reward": -1.7276441839057952,
+            "min_reward": -1.7276441839057952,
+            "total_return": 0.0,
+            "annual_return": 0.0,
+            "annual_volatility": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+            "calmar_ratio": 0.0,
+            "win_rate": 0.0,
+            "profit_factor": 0.0
+          }
+        }
+      },
+      "window": {
+        "start": "2024-01-02 04:00:00-05:00",
+        "end": "2024-06-11 13:25:00-04:00"
+      }
+    }
+  ],
+  "aggregate": {
+    "median_sharpe": null,
+    "median_trades_per_day": 0.0,
+    "worst_quintile_avg_pnl": null,
+    "max_drawdown_worst": null
+  }
+}

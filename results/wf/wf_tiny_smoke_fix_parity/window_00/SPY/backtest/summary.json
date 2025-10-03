@@ -1,0 +1,64 @@
+{
+  "tickers": [
+    "SPY"
+  ],
+  "portfolio_metrics": {
+    "mean_reward": 1477.2720031654462,
+    "std_reward": 0.0,
+    "mean_length": 3414.0,
+    "std_length": 0.0,
+    "max_reward": 1477.2720031654462,
+    "min_reward": 1477.2720031654462,
+    "total_return": 0.014772719999992842,
+    "annual_return": 0.0010858887066012013,
+    "annual_volatility": 0.0023902258376169347,
+    "sharpe_ratio": 0.4540583022253764,
+    "max_drawdown": -0.0034975949435728237,
+    "calmar_ratio": 0.310299480208786,
+    "win_rate": 0.6666666666666666,
+    "profit_factor": 6.623711340206544,
+    "sortino_ratio": 0.8380857275399292,
+    "total_trades": 12,
+    "long_trades": 6,
+    "short_trades": 6,
+    "avg_duration_minutes": 119.83333333333333,
+    "avg_duration_minutes_long": 87.5,
+    "avg_duration_minutes_short": 152.16666666666666,
+    "avg_pnl": 45.458333333332725,
+    "avg_pnl_long": 60.49999999999803,
+    "avg_pnl_short": 30.416666666667425,
+    "long_steps": 525,
+    "short_steps": 913,
+    "flat_steps": 1976,
+    "flips": 6,
+    "turnover": 0.0,
+    "exposure_pct": 0.22410403963870912,
+    "tx_costs_total": 2400.0,
+    "tx_costs_per_trade": 200.0,
+    "daily_sharpe_proxy": 9.057742094696273,
+    "intraday_max_drawdown": -0.0034975949435728237,
+    "entries": 0,
+    "exits": 0,
+    "avg_abs_pos": 0.0,
+    "avg_abs_dpos": 0.0,
+    "baselines": {
+      "no_trade": {
+        "sharpe": 0.0,
+        "pf": 0.0,
+        "ret": 0.0,
+        "maxdd": 0.0
+      },
+      "vwap_fade": {
+        "sharpe": 0.22697499284957176,
+        "pf": 1.0642899479857741,
+        "ret": 0.015466971110299488,
+        "maxdd": -0.018261624740116944
+      }
+    },
+    "long_pf": 14.444444444444379,
+    "short_pf": 3.607142857143125,
+    "long_ret": 0.0011309115832761798,
+    "short_ret": 0.0005684171839522733
+  },
+  "parity_flag": "BOTH"
+}

@@ -57,8 +57,8 @@ class TestSettings:
     def test_get_with_default(self):
         """Test getting value with default fallback."""
         settings = Settings(self.test_config)
-        assert settings.get("nonexistent", "default_value") == "default_value"
-        assert settings.get("data", "nonexistent", "default") == "default"
+        assert settings.get("nonexistent", default="default_value") == "default_value"
+        assert settings.get("data", "nonexistent", default="default") == "default"
     
     def test_get_list_value(self):
         """Test getting list configuration value."""

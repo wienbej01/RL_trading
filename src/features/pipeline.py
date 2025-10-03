@@ -5,13 +5,17 @@ This module provides a comprehensive feature engineering pipeline
 that combines technical indicators, microstructure features, and time-based features.
 Supports both Polygon and Databento data formats with automatic column mapping.
 """
+import json
+import re
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Union, Any
+pd.set_option('future.no_silent_downcasting', True)
+from typing import Dict, List, Optional, Union, Any, Tuple
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.feature_selection import SelectKBest, f_regression
 import logging
 import os
+from pathlib import Path
 
 # Import technical indicator functions
 from .technical_indicators import (
@@ -24,15 +28,28 @@ from ta.trend import ADXIndicator
 from .microstructure_features import (
     calculate_spread, calculate_microprice, calculate_queue_imbalance,
     calculate_order_flow_imbalance, calculate_vwap, calculate_twap,
-    calculate_price_impact, calculate_fvg
+    calculate_price_impact, calculate_fvg,
+    calculate_ofi_best, compute_bar_imbalance, compute_signed_vol_delta,
+    compute_spread_bps, compute_quote_intensity,
 )
 from .time_features import (
     extract_time_of_day_features, extract_day_of_week_features,
     extract_session_features, is_market_hours, get_time_from_open,
     get_time_to_close
 )
+try:
+    from .microstructure_ohlcv import OHLCV_MICRO  # preferred shim path
+except Exception:
+    from .microstructure import OHLCV_MICRO  # fallback
 
 from ..utils.logging import get_logger
+from ..utils.feat_cache import feature_cache_path, save_features, load_features, augment_cfg_hash
+from .packs import (
+    resolve_feature_pack,
+    LAST_CURATED_CACHE_TOKEN,
+    resolve_curated_pack,
+    MICROSTRUCTURE_OHLCV,
+)
 
 
 class FeaturePipeline:
@@ -94,6 +111,7 @@ class FeaturePipeline:
             'size': 'size'
         }
     }
+    LEAKAGE_PATTERN = re.compile(r'\b(lead|future|forward|next|target|t\+?\d+)\b', re.IGNORECASE)
 
     def __init__(self, config: Dict[str, Any]):
         """
@@ -113,6 +131,8 @@ class FeaturePipeline:
         self.ict_config = config.get('ict', {})
         self.vol_config = config.get('volatility', {})
         self.smt_config = config.get('smt', {})
+        # Optional: regime tags (rolling, leak‑safe)
+        self.regime_config = config.get('regime', {})
 
         # Data source detection and column mapping
         self.data_source = config.get('data_source', 'auto')
@@ -127,10 +147,67 @@ class FeaturePipeline:
         self.scaler = None
         self.feature_selector: Optional[SelectKBest] = None
         self.selected_features = None
+        self.feature_scores_: Optional[pd.DataFrame] = None
+        self.normalization_stats: Optional[Dict[str, Any]] = None
+        self._audit_reports: List[pd.DataFrame] = []
 
         # Get logger
         self.logger = get_logger(__name__)
 
+    def _check_for_leakage(self, ohlcv: pd.DataFrame, features: pd.DataFrame):
+        """Check for data leakage by comparing timestamps."""
+
+        def _validate_index(frame: pd.DataFrame, label: str) -> None:
+            idx = frame.index
+            if isinstance(idx, pd.MultiIndex) and 'timestamp' in idx.names:
+                idx = idx.get_level_values('timestamp')
+            if not isinstance(idx, pd.DatetimeIndex):
+                return
+            if not idx.is_monotonic_increasing:
+                raise ValueError(f"{label} index is not monotonic increasing.")
+
+        has_ticker_col = 'ticker' in ohlcv.columns
+        has_ticker_index = isinstance(ohlcv.index, pd.MultiIndex) and 'ticker' in ohlcv.index.names
+
+        if has_ticker_col or has_ticker_index:
+            if has_ticker_col:
+                ohlcv_groups = ohlcv.groupby('ticker')
+            else:
+                tickers = ohlcv.index.get_level_values('ticker').unique()
+                ohlcv_groups = ((t, ohlcv.xs(t, level='ticker')) for t in tickers)
+            for ticker, group in ohlcv_groups:
+                _validate_index(group, f"OHLCV ({ticker})")
+        else:
+            _validate_index(ohlcv, "OHLCV")
+
+        has_feat_ticker_col = 'ticker' in features.columns
+        has_feat_ticker_index = isinstance(features.index, pd.MultiIndex) and 'ticker' in features.index.names
+
+        if has_feat_ticker_col or has_feat_ticker_index:
+            if has_feat_ticker_col:
+                feature_groups = features.groupby('ticker')
+            else:
+                tickers = features.index.get_level_values('ticker').unique()
+                feature_groups = ((t, features.xs(t, level='ticker')) for t in tickers)
+            for ticker, group in feature_groups:
+                _validate_index(group, f"Features ({ticker})")
+        else:
+            _validate_index(features, "Features")
+
+        # Compare max timestamps on aligned axes (use overall maxima).
+        ohlcv_max = None
+        feature_max = None
+        for frame, store in ((ohlcv, 'ohlcv_max'), (features, 'feature_max')):
+            idx = frame.index
+            if isinstance(idx, pd.MultiIndex) and 'timestamp' in idx.names:
+                idx = idx.get_level_values('timestamp')
+            if isinstance(idx, pd.DatetimeIndex):
+                if store == 'ohlcv_max':
+                    ohlcv_max = idx.max()
+                else:
+                    feature_max = idx.max()
+        if ohlcv_max is not None and feature_max is not None and ohlcv_max < feature_max:
+            raise ValueError("Feature leakage detected: features have future timestamps.")
     def _detect_data_source(self, data: pd.DataFrame) -> str:
         """
         Detect the data source based on column names and data characteristics.
@@ -195,12 +272,69 @@ class FeaturePipeline:
         # Ensure timestamp is the index if it's a column
         if 'timestamp' in mapped_data.columns:
             if not isinstance(mapped_data.index, pd.DatetimeIndex):
-                # Convert timestamp to datetime index
-                mapped_data['timestamp'] = pd.to_datetime(mapped_data['timestamp'], unit='ms' if data_source == 'polygon' else 'ns')
+                # Convert timestamp to datetime index (Polygon aggregates: ms; quotes/trades: ns)
+                if data_source == 'polygon':
+                    unit = 'ns' if data_type in ('quotes', 'trades') else 'ms'
+                else:
+                    unit = 'ns'
+                mapped_data['timestamp'] = pd.to_datetime(mapped_data['timestamp'], unit=unit)
                 mapped_data.set_index('timestamp', inplace=True)
                 self.logger.debug("Set timestamp as DatetimeIndex")
 
         return mapped_data
+
+    def _merge_external_vix(self, features: pd.DataFrame) -> pd.DataFrame:
+        """
+        Optionally merge an external VIX series as a feature if configured.
+
+        Expects a parquet/csv at path with a DatetimeIndex and a column named one of
+        ['vix', 'close', 'VIX']. Produces columns 'vix' and 'vix_z' aligned to
+        features' index (America/New_York), forward-filled and lagged by 1 bar to
+        avoid lookahead.
+        """
+        try:
+            ext = self.vol_config.get('external_vix_path') if isinstance(self.vol_config, dict) else None
+            if not ext:
+                return features
+            import pandas as _pd
+            p = str(ext)
+            if p.lower().endswith('.parquet'):
+                v = _pd.read_parquet(p)
+            else:
+                v = _pd.read_csv(p)
+            # Normalize index
+            if 'timestamp' in v.columns:
+                v['timestamp'] = _pd.to_datetime(v['timestamp'], utc=True, errors='coerce')
+                v = v.loc[v['timestamp'].notna()].set_index('timestamp')
+            if not isinstance(v.index, _pd.DatetimeIndex):
+                v.index = _pd.to_datetime(v.index, utc=True, errors='coerce')
+            if v.index.tz is None:
+                v.index = v.index.tz_localize('UTC')
+            v = v.sort_index().tz_convert('America/New_York')
+            # Choose a usable column
+            col = None
+            for c in ['vix', 'VIX', 'close', 'Close']:
+                if c in v.columns:
+                    col = c
+                    break
+            if col is None and v.shape[1] >= 1:
+                col = v.columns[0]
+            if col is None:
+                return features
+            ser = _pd.to_numeric(v[col], errors='coerce').rename('vix')
+            # Align to feature index, ffill, and lag by 1 bar
+            aligned = ser.reindex(features.index).ffill().shift(1)
+            out = features.copy()
+            out['vix'] = aligned.astype(float)
+            try:
+                z = (aligned - aligned.rolling(60, min_periods=10).mean()) / (aligned.rolling(60, min_periods=10).std() + 1e-6)
+                out['vix_z'] = z.astype(float)
+            except Exception:
+                pass
+            return out
+        except Exception:
+            # Never break pipeline on optional external data
+            return features
 
     def _validate_polygon_data_quality(self, data: pd.DataFrame) -> pd.DataFrame:
         """
@@ -274,27 +408,83 @@ class FeaturePipeline:
         Returns:
             Self
         """
-        # Map columns to standard format
-        data = self._map_columns(data, 'ohlcv')  # Assume OHLCV for fitting
-
-        # Apply data quality checks for Polygon data
-        data_source = self._detect_data_source(data)
-        if data_source == 'polygon' and self.polygon_quality_checks:
-            data = self._validate_polygon_data_quality(data)
-
-        features = self._extract_features(data)
+        self.feature_scores_ = None
+        self.selected_features = None
+        self.normalization_stats = None
+        self._audit_reports = []
+        # Multi-ticker aware fitting: if a 'ticker' column is present, compute features per ticker
+        features: pd.DataFrame
+        if 'ticker' in data.columns or (
+            isinstance(data.index, pd.MultiIndex) and 'ticker' in data.index.names
+        ):
+            parts = []
+            if 'ticker' in data.columns:
+                grouped = data.groupby('ticker')
+            else:
+                grouped = data.groupby(level='ticker')
+            for t, df in grouped:
+                df_local = df.copy()
+                # Map columns and validate per group
+                df_local = self._map_columns(df_local, 'ohlcv')
+                if self._detect_data_source(df_local) == 'polygon' and self.polygon_quality_checks:
+                    df_local = self._validate_polygon_data_quality(df_local)
+                f_local = self._extract_features(df_local)
+                try:
+                    f_local = f_local.drop(columns=['ticker'], errors='ignore')
+                except Exception:
+                    pass
+                f_local['ticker'] = t
+                parts.append(f_local)
+            if parts:
+                features = pd.concat(parts, axis=0)
+                try:
+                    features = features.sort_index()
+                except Exception:
+                    pass
+            else:
+                features = pd.DataFrame(index=data.index)
+        else:
+            # Single-ticker path (original behavior)
+            data = self._map_columns(data, 'ohlcv')  # Assume OHLCV for fitting
+            data_source = self._detect_data_source(data)
+            if data_source == 'polygon' and self.polygon_quality_checks:
+                data = self._validate_polygon_data_quality(data)
+            features = self._extract_features(data)
 
         # Apply normalization if configured
         if self.normalization_config:
+            # Do not normalize non-numeric/ticker label
             features = self._normalize_features(features)
 
-        # Apply feature selection if configured
-        if self.feature_selection_config and 'method' in self.feature_selection_config:
+        # Apply feature selection if configured (support both 'method' and 'selection_method')
+        if self.feature_selection_config and (
+            'method' in self.feature_selection_config or 'selection_method' in self.feature_selection_config
+        ):
             features = self._select_features(features)
 
+        # If input carried a 'timestamp' column (Polygon-style) and did not use it as index,
+        # restore a simple RangeIndex so external comparisons by position align.
+        if 'timestamp' in data.columns and not isinstance(data.index, pd.DatetimeIndex):
+            try:
+                features = features.reset_index(drop=True)
+            except Exception:
+                pass
+
         self.is_fitted = True
+        # Optionally merge external VIX features
+        try:
+            features = self._merge_external_vix(features)
+        except Exception:
+            pass
+        if self.selected_features is None:
+            self.selected_features = [col for col in features.columns if col != 'ticker']
+        try:
+            self.audit_features(features, stage='fit')
+        except ValueError as exc:
+            self.logger.error("Feature audit failed during fit: %s", exc)
+            raise
         return self
-    
+
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Transform data using fitted pipeline.
@@ -310,23 +500,223 @@ class FeaturePipeline:
             self.logger.warning("Pipeline not fitted, fitting on transform data")
             self.fit(data)
 
-        # Map columns to standard format
-        data = self._map_columns(data, 'ohlcv')  # Assume OHLCV for transformation
-
-        # Apply data quality checks for Polygon data
-        data_source = self._detect_data_source(data)
-        if data_source == 'polygon' and self.polygon_quality_checks:
-            data = self._validate_polygon_data_quality(data)
-
-        features = self._extract_features(data)
+        # Track original timestamp-column presence before mapping
+        _orig_ts_col_present = ('timestamp' in data.columns)
+        _orig_index_is_dt = isinstance(data.index, pd.DatetimeIndex)
+        # Multi-ticker aware transform
+        if 'ticker' in data.columns or (
+            isinstance(data.index, pd.MultiIndex) and 'ticker' in data.index.names
+        ):
+            parts = []
+            if 'ticker' in data.columns:
+                grouped = data.groupby('ticker')
+            else:
+                grouped = data.groupby(level='ticker')
+            for t, df in grouped:
+                df_local = df.copy()
+                df_local = self._map_columns(df_local, 'ohlcv')
+                if self._detect_data_source(df_local) == 'polygon' and self.polygon_quality_checks:
+                    df_local = self._validate_polygon_data_quality(df_local)
+                # Optional cache: attempt HIT before computing
+                f_local = None
+                try:
+                    if bool(self.config.get('enable_caching', False)):
+                        run_name = str(self.config.get('cache_run', 'default'))
+                        # Window keys
+                        idx = df_local.index if isinstance(df_local.index, pd.DatetimeIndex) else pd.to_datetime(df_local.index, errors='coerce')
+                        start = pd.Timestamp(idx.min()) if len(idx) else pd.Timestamp(0, unit='s')
+                        end = pd.Timestamp(idx.max()) if len(idx) else pd.Timestamp(0, unit='s')
+                        # Approximate pack identifiers
+                        feature_pack = ','.join(self.config.get('packs', [])) if bool(self.config.get('use_pack', False)) else 'manual'
+                        feature_screen_run = str(self.config.get('feature_screen_run', self.config.get('override_list_path', 'NA')))
+                        base_hash = f"{feature_pack}|{feature_screen_run}|{t}|{start}|{end}"
+                        # If user provided a manual selected_features list, we can use it for hash
+                        final_hint = None
+                        try:
+                            sel = self.feature_selection_config.get('selected_features', None)
+                            if isinstance(sel, (list, tuple)):
+                                final_hint = [str(x) for x in sel]
+                        except Exception:
+                            pass
+                        cfg_hash = augment_cfg_hash(
+                            base_hash,
+                            run_name=run_name,
+                            features=final_hint,
+                            micro_module_path=Path('src/features/microstructure_ohlcv.py'),
+                            curated_token=LAST_CURATED_CACHE_TOKEN,
+                        )
+                        cache_path = feature_cache_path(
+                            run_name=run_name,
+                            ticker=str(t),
+                            split=f"{start:%Y-%m-%d}_{end:%Y-%m-%d}",
+                            cfg_hash=cfg_hash,
+                        )
+                        if cache_path.exists():
+                            try:
+                                self.logger.info(f"Feature cache HIT -> {cache_path}")
+                            except Exception:
+                                pass
+                            f_local = load_features(cache_path)
+                except Exception:
+                    f_local = None
+                if f_local is None:
+                    f_local = self._extract_features(df_local)
+                    # Save to cache if enabled
+                    try:
+                        if bool(self.config.get('enable_caching', False)):
+                            # Build hash with the actual resolved features list to tie data to key
+                            run_name = str(self.config.get('cache_run', 'default'))
+                            idx = df_local.index if isinstance(df_local.index, pd.DatetimeIndex) else pd.to_datetime(df_local.index, errors='coerce')
+                            start = pd.Timestamp(idx.min()) if len(idx) else pd.Timestamp(0, unit='s')
+                            end = pd.Timestamp(idx.max()) if len(idx) else pd.Timestamp(0, unit='s')
+                            feature_pack = ','.join(self.config.get('packs', [])) if bool(self.config.get('use_pack', False)) else 'manual'
+                            feature_screen_run = str(self.config.get('feature_screen_run', self.config.get('override_list_path', 'NA')))
+                            base_hash = f"{feature_pack}|{feature_screen_run}|{t}|{start}|{end}"
+                            final_cols = [str(c) for c in f_local.columns]
+                            cfg_hash = augment_cfg_hash(
+                                base_hash,
+                                run_name=run_name,
+                                features=final_cols,
+                                micro_module_path=Path('src/features/microstructure_ohlcv.py'),
+                                curated_token=LAST_CURATED_CACHE_TOKEN,
+                            )
+                            cache_path = feature_cache_path(
+                                run_name=run_name,
+                                ticker=str(t),
+                                split=f"{start:%Y-%m-%d}_{end:%Y-%m-%d}",
+                                cfg_hash=cfg_hash,
+                            )
+                            save_features(f_local, cache_path)
+                    except Exception:
+                        pass
+                try:
+                    f_local = f_local.drop(columns=['ticker'], errors='ignore')
+                except Exception:
+                    pass
+                f_local['ticker'] = t
+                parts.append(f_local)
+            if parts:
+                features = pd.concat(parts, axis=0)
+                try:
+                    features = features.sort_index()
+                except Exception:
+                    pass
+            else:
+                features = pd.DataFrame(index=data.index)
+        else:
+            data = self._map_columns(data, 'ohlcv')
+            data_source = self._detect_data_source(data)
+            if data_source == 'polygon' and self.polygon_quality_checks:
+                data = self._validate_polygon_data_quality(data)
+            # Optional cache HIT before compute (single-ticker or unlabeled)
+            features = None
+            try:
+                if bool(self.config.get('enable_caching', False)):
+                    run_name = str(self.config.get('cache_run', 'default'))
+                    idx = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, errors='coerce')
+                    start = pd.Timestamp(idx.min()) if len(idx) else pd.Timestamp(0, unit='s')
+                    end = pd.Timestamp(idx.max()) if len(idx) else pd.Timestamp(0, unit='s')
+                    t = str(self.config.get('single_ticker', 'UNKNOWN'))
+                    feature_pack = ','.join(self.config.get('packs', [])) if bool(self.config.get('use_pack', False)) else 'manual'
+                    feature_screen_run = str(self.config.get('feature_screen_run', self.config.get('override_list_path', 'NA')))
+                    base_hash = f"{feature_pack}|{feature_screen_run}|{t}|{start}|{end}"
+                    final_hint = None
+                    try:
+                        sel = self.feature_selection_config.get('selected_features', None)
+                        if isinstance(sel, (list, tuple)):
+                            final_hint = [str(x) for x in sel]
+                    except Exception:
+                        pass
+                    cfg_hash = augment_cfg_hash(
+                        base_hash,
+                        run_name=run_name,
+                        features=final_hint,
+                        micro_module_path=Path('src/features/microstructure_ohlcv.py'),
+                        curated_token=LAST_CURATED_CACHE_TOKEN,
+                    )
+                    cache_path = feature_cache_path(
+                        run_name=run_name,
+                        ticker=str(t),
+                        split=f"{start:%Y-%m-%d}_{end:%Y-%m-%d}",
+                        cfg_hash=cfg_hash,
+                    )
+                    if cache_path.exists():
+                        try:
+                            self.logger.info(f"Feature cache HIT -> {cache_path}")
+                        except Exception:
+                            pass
+                        features = load_features(cache_path)
+            except Exception:
+                features = None
+            if features is None:
+                features = self._extract_features(data)
+                # Save to cache if enabled
+                try:
+                    if bool(self.config.get('enable_caching', False)):
+                        run_name = str(self.config.get('cache_run', 'default'))
+                        idx = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, errors='coerce')
+                        start = pd.Timestamp(idx.min()) if len(idx) else pd.Timestamp(0, unit='s')
+                        end = pd.Timestamp(idx.max()) if len(idx) else pd.Timestamp(0, unit='s')
+                        t = str(self.config.get('single_ticker', 'UNKNOWN'))
+                        feature_pack = ','.join(self.config.get('packs', [])) if bool(self.config.get('use_pack', False)) else 'manual'
+                        feature_screen_run = str(self.config.get('feature_screen_run', self.config.get('override_list_path', 'NA')))
+                        base_hash = f"{feature_pack}|{feature_screen_run}|{t}|{start}|{end}"
+                        final_cols = [str(c) for c in features.columns]
+                        cfg_hash = augment_cfg_hash(
+                            base_hash,
+                            run_name=run_name,
+                            features=final_cols,
+                            micro_module_path=Path('src/features/microstructure_ohlcv.py'),
+                            curated_token=LAST_CURATED_CACHE_TOKEN,
+                        )
+                        cache_path = feature_cache_path(
+                            run_name=run_name,
+                            ticker=str(t),
+                            split=f"{start:%Y-%m-%d}_{end:%Y-%m-%d}",
+                            cfg_hash=cfg_hash,
+                        )
+                        save_features(features, cache_path)
+                except Exception:
+                    pass
 
         # Apply normalization if configured
         if self.normalization_config:
             features = self._normalize_features(features)
 
-        # Apply feature selection if configured
-        if self.feature_selection_config and 'method' in self.feature_selection_config:
+        # Apply feature selection if configured (also recognize 'selection_method')
+        if self.feature_selection_config and (
+            'method' in self.feature_selection_config or 'selection_method' in self.feature_selection_config
+        ):
             features = self._select_features(features)
+        # If original input had a 'timestamp' column and was not indexed by it, restore RangeIndex
+        if _orig_ts_col_present and not _orig_index_is_dt:
+            try:
+                features = features.reset_index(drop=True)
+            except Exception:
+                pass
+        # Optionally merge external VIX features after selection to ensure retention
+        try:
+            features = self._merge_external_vix(features)
+        except Exception:
+            pass
+        if self.selected_features is None:
+            self.selected_features = [col for col in features.columns if col != 'ticker']
+
+        if self.selected_features:
+            missing = [col for col in self.selected_features if col not in features.columns]
+            for col in missing:
+                features[col] = np.nan
+            ordered = [c for c in self.selected_features if c in features.columns and c != 'ticker']
+            if 'ticker' in features.columns:
+                features = features.loc[:, ['ticker'] + ordered]
+            else:
+                features = features.loc[:, ordered]
+
+        try:
+            self.audit_features(features, stage='transform')
+        except ValueError as exc:
+            self.logger.error("Feature audit failed during transform: %s", exc)
+            raise
 
         return features
     
@@ -340,11 +730,55 @@ class FeaturePipeline:
         Returns:
             Transformed features
         """
-        return self.fit(data).transform(data)
+        transformed_data = self.fit(data).transform(data)
+        self._check_for_leakage(data, transformed_data)
+        return transformed_data
     
     def _extract_features(self, data: pd.DataFrame) -> pd.DataFrame:
         """Extract features based on configuration."""
         features = pd.DataFrame(index=data.index)
+
+        # Optional: resolve requested features list for this extraction
+        resolved: List[str] | None = None
+        try:
+            # Use curated resolved list if present
+            from .packs import LAST_CURATED_RESOLVED  # local import
+            if LAST_CURATED_RESOLVED:
+                resolved = list(LAST_CURATED_RESOLVED)
+        except Exception:
+            pass
+        # Manual selected_features override
+        try:
+            sel = self.feature_selection_config.get('selected_features', None)
+            if isinstance(sel, (list, tuple)) and sel:
+                resolved = list(sel)
+        except Exception:
+            pass
+        # microstructure.names fallback for proxies
+        try:
+            names = (self.config.get('microstructure', {}) or {}).get('names', None)
+            if isinstance(names, (list, tuple)) and names:
+                resolved = list(dict.fromkeys(list(resolved or []) + list(names)))
+        except Exception:
+            pass
+        # If L1 quotes are absent, remap L1 names in resolved to OHLCV proxies
+        try:
+            HAS_L1 = all(c in data.columns for c in ("bid_price", "ask_price", "bid_size", "ask_size"))
+            if resolved is not None and not HAS_L1:
+                L1_TO_OHLCV = {
+                    "ofi_best": "ofi_proxy",
+                    "spread_bps": "spread_bps_hl",
+                    "quote_intensity": "quote_intensity_proxy",
+                    "queue_imbalance": "queue_imbalance_proxy",
+                }
+                resolved = [L1_TO_OHLCV.get(str(f), str(f)) for f in resolved]
+                # Validate that no L1 names remain in resolved list
+                L1_NAMES = {"ofi_best", "spread_bps", "quote_intensity", "queue_imbalance"}
+                remaining_l1 = [f for f in resolved if f in L1_NAMES]
+                if remaining_l1:
+                    raise ValueError(f"L1 feature names still present after remap when HAS_L1=False: {remaining_l1}")
+        except Exception:
+            pass
         
         # Extract technical indicators
         if 'technical' in self.config:
@@ -384,41 +818,62 @@ class FeaturePipeline:
             # Calculate MACD
             if 'calculate_macd' in tech_config and tech_config['calculate_macd']:
                 macd_config = tech_config.get('macd_config', {})
-                macd = calculate_macd(
+                macd_res = calculate_macd(
                     data['close'],
                     fast_period=macd_config.get('fast_period', 12),
                     slow_period=macd_config.get('slow_period', 26),
                     signal_period=macd_config.get('signal_period', 9)
                 )
-                features['macd'] = macd['macd']
-                features['macd_signal'] = macd['signal']
-                features['macd_histogram'] = macd['histogram']
-                # MACD line for trend bias
-                features['macd_line'] = macd['macd'] - macd['signal']
+                try:
+                    macd_line, signal_line, histogram = macd_res  # tuple form
+                except Exception:
+                    # dict form fallback
+                    macd_line = macd_res['macd']
+                    signal_line = macd_res['signal']
+                    histogram = macd_res['histogram']
+                features['macd'] = macd_line
+                features['macd_signal'] = signal_line
+                features['macd_histogram'] = histogram
+                features['macd_line'] = macd_line - signal_line
             
             # Calculate Bollinger Bands
             if 'calculate_bollinger_bands' in tech_config and tech_config['calculate_bollinger_bands']:
                 bb_config = tech_config.get('bollinger_config', {})
-                bb = calculate_bollinger_bands(
+                bb_res = calculate_bollinger_bands(
                     data['close'],
                     window=bb_config.get('window', 20),
                     num_std=bb_config.get('num_std', 2)
                 )
-                features['bb_upper'] = bb['upper']
-                features['bb_middle'] = bb['middle']
-                features['bb_lower'] = bb['lower']
-                features['bb_width'] = bb['width']
+                try:
+                    upper_band, middle_band, lower_band = bb_res  # tuple form
+                except Exception:
+                    upper_band = bb_res['upper']
+                    middle_band = bb_res['middle']
+                    lower_band = bb_res['lower']
+                features['bb_upper'] = upper_band
+                features['bb_middle'] = middle_band
+                features['bb_lower'] = lower_band
+                # width derived if needed
+                try:
+                    features['bb_width'] = (upper_band - lower_band) / (middle_band.replace(0, np.nan))
+                except Exception:
+                    pass
             
             # Calculate Stochastic Oscillator
             if 'calculate_stochastic' in tech_config and tech_config['calculate_stochastic']:
                 stoch_config = tech_config.get('stochastic_config', {})
-                stoch = calculate_stochastic_oscillator(
+                stoch_res = calculate_stochastic_oscillator(
                     data['high'], data['low'], data['close'],
                     k_period=stoch_config.get('k_period', 14),
                     d_period=stoch_config.get('d_period', 3)
                 )
-                features['stoch_k'] = stoch['k']
-                features['stoch_d'] = stoch['d']
+                try:
+                    k_ser, d_ser = stoch_res
+                except Exception:
+                    k_ser = stoch_res['k']
+                    d_ser = stoch_res['d']
+                features['stoch_k'] = k_ser
+                features['stoch_d'] = d_ser
 
             # Calculate Williams %R
             if 'calculate_williams_r' in tech_config and tech_config['calculate_williams_r']:
@@ -441,7 +896,7 @@ class FeaturePipeline:
             if 'calculate_spread' in micro_config and micro_config['calculate_spread']:
                 # Check if we have bid/ask columns or use high/low as fallback
                 if 'bid_price' in data.columns and 'ask_price' in data.columns:
-                    features['spread'] = calculate_spread(data['ask_price'], data['bid_price'])
+                    features['spread'] = calculate_spread(data['bid_price'], data['ask_price'])
                 else:
                     features['spread'] = calculate_spread(data['high'], data['low'])
             
@@ -467,14 +922,32 @@ class FeaturePipeline:
                         data['bid_size'], data['ask_size']
                     )
             
-            # Calculate order flow imbalance
+            # Calculate order flow imbalance (z-scored) and ofi_best (raw best-level proxy)
             if 'calculate_order_flow_imbalance' in micro_config and micro_config['calculate_order_flow_imbalance']:
-                if 'bid_price' in data.columns and 'bid_size' in data.columns and \
-                   'ask_price' in data.columns and 'ask_size' in data.columns:
+                need = {'bid_price','bid_size','ask_price','ask_size'}
+                if need.issubset(set(data.columns)):
                     features['order_flow_imbalance'] = calculate_order_flow_imbalance(
-                        data['bid_price'], data['bid_size'], 
+                        data['bid_price'], data['bid_size'],
                         data['ask_price'], data['ask_size']
                     )
+                    try:
+                        features['ofi_best'] = calculate_ofi_best(
+                            data['bid_price'], data['bid_size'], data['ask_price'], data['ask_size']
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to compute ofi_best: {e}")
+                elif 'resolved' in locals() and resolved is not None:
+                    # If L1 data is not available but ofi_proxy is requested, compute it
+                    if "ofi_proxy" in resolved and "ofi_proxy" not in features.columns:
+                        try:
+                            features['ofi_proxy'] = OHLCV_MICRO['ofi_proxy'](data)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to compute ofi_proxy: {e}")
+                else:
+                    missing = sorted(list(need.difference(set(data.columns))))
+                    # Only log warning if we're actually trying to compute L1 features
+                    if 'calculate_order_flow_imbalance' in micro_config and micro_config['calculate_order_flow_imbalance']:
+                        self.logger.warning(f"Cannot compute ofi_best/OFI: missing raw fields {missing}")
             
             # Calculate VWAP
             if 'calculate_vwap' in micro_config and micro_config['calculate_vwap']:
@@ -483,6 +956,37 @@ class FeaturePipeline:
                 if self.use_polygon_vwap and 'vwap' in data.columns:
                     polygon_vwap = data['vwap']
                 features['vwap'] = calculate_vwap(data['close'], data['volume'], polygon_vwap)
+
+            # Additional microstructure/features by name when possible
+            try:
+                # bar_imbalance, signed_vol_delta
+                if 'open' in data.columns and 'close' in data.columns and 'volume' in data.columns:
+                    features['bar_imbalance'] = compute_bar_imbalance(data['open'], data['close'], data['volume'])
+                    features['signed_vol_delta'] = compute_signed_vol_delta(data['close'], data['volume'])
+                # spread_bps from quotes or OHLC
+                if {'bid_price','ask_price'}.issubset(data.columns):
+                    features['spread_bps'] = compute_spread_bps(bid=data['bid_price'], ask=data['ask_price'])
+                elif {'high','low','close'}.issubset(data.columns):
+                    try:
+                        features['spread_bps'] = OHLCV_MICRO['spread_bps_hl'](data)
+                        self.logger.warning("Using HL proxy for spread_bps; level-1 quotes missing")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to compute spread_bps via HL proxy: {e}")
+                else:
+                    # Only log warning if we're actually trying to compute spread_bps
+                    if 'calculate_spread' in micro_config and micro_config['calculate_spread']:
+                        self.logger.warning("Cannot compute spread_bps: missing both bid/ask and high/low/close for fallback")
+                # quote_intensity
+                if 'transactions' in data.columns or 'volume' in data.columns:
+                    # Only compute quote_intensity if it's in resolved features or explicitly requested
+                    if 'resolved' in locals() and resolved is not None and "quote_intensity" in resolved:
+                        features['quote_intensity'] = compute_quote_intensity(data.get('transactions'), data.get('volume'))
+                    elif resolved and 'quote_intensity' in resolved:
+                        # Fallback if resolved is not available in locals
+                        features['quote_intensity'] = compute_quote_intensity(data.get('transactions'), data.get('volume'))
+                # queue_imbalance already computed above when bid/ask sizes present
+            except Exception:
+                pass
             
             # Calculate TWAP
             if 'calculate_twap' in micro_config and micro_config['calculate_twap']:
@@ -500,6 +1004,65 @@ class FeaturePipeline:
                     else:
                         # Fallback: simple price impact approximation using close vs open
                         features['price_impact'] = (data['close'] - data['open']) / data['open']
+
+            # Resolve and compute explicit OHLCV microstructure names if requested
+            try:
+                requested_names = micro_config.get('names', None)
+                # Also allow computing OHLCV proxies if present in resolved list
+                if 'resolved' in locals() and resolved is not None:
+                    extra = [n for n in resolved if isinstance(n, str) and n in OHLCV_MICRO]
+                    if extra:
+                        if requested_names is None:
+                            requested_names = list(extra)
+                        else:
+                            requested_names = list(dict.fromkeys(list(requested_names) + extra))
+                if requested_names is not None:
+                    if not isinstance(requested_names, (list, tuple)):
+                        raise ValueError("microstructure.names must be a list of feature names")
+                    known = set(OHLCV_MICRO.keys())
+                    unknown = [n for n in requested_names if n not in known]
+                    if unknown:
+                        raise ValueError(
+                            f"Unknown microstructure feature name(s): {unknown}. "
+                            f"Known OHLCV-only names: {sorted(known)}"
+                        )
+                    # Compute each requested OHLCV-only micro feature without relying on bid/ask
+                    # Use only standard OHLCV columns; functions will validate required fields.
+                    df_ohlcv = data.copy()
+                    for name in requested_names:
+                        func = OHLCV_MICRO[name]
+                        try:
+                            ser = func(df_ohlcv)
+                            # Attach with the exact requested name (override if exists)
+                            features[name] = ser
+                        except Exception as e:
+                            raise ValueError(f"Failed to compute microstructure feature '{name}': {e}")
+            except Exception as e:
+                # Surface configuration/unknown-name errors clearly
+                if isinstance(e, ValueError):
+                    raise
+                # Non-fatal runtime errors should not kill the whole pipeline
+                self.logger.warning(f"microstructure.names computation skipped: {e}")
+
+        # If we have a resolved list and proxies are requested (and L1 may be absent), compute them
+        try:
+            if 'resolved' in locals() and resolved is not None:
+                for name in resolved:
+                    if isinstance(name, str) and name in OHLCV_MICRO and name not in features.columns:
+                        try:
+                            features[name] = OHLCV_MICRO[name](data)
+                        except Exception:
+                            pass
+                # Assert required proxies if they were requested
+                required = [f for f in ("ofi_proxy", "signed_vol_delta") if f in resolved]
+                missing = [f for f in required if f not in features.columns]
+                if missing:
+                    raise AssertionError(f"Requested micro proxies missing from features: {missing}")
+        except Exception as e:
+            try:
+                self.logger.warning(str(e))
+            except Exception:
+                pass
         
         # Extract time features
         if 'time' in self.config:
@@ -527,6 +1090,13 @@ class FeaturePipeline:
                 # Handle test case where session_features is used instead
                 session_features = extract_session_features(data.index)
                 features = pd.concat([features, session_features], axis=1)
+
+        # One-hot encode session_phase
+        if 'session_phase' in features.columns:
+            features = pd.concat([
+                features.drop(columns=['session_phase']),
+                pd.get_dummies(features['session_phase'], prefix='session')
+            ], axis=1)
         
         # Add VIX data and derived features
         if 'vix' in self.config and self.config['vix'].get('enabled', False):
@@ -673,7 +1243,7 @@ class FeaturePipeline:
 
         # VPA enhancements
         try:
-            if self.vpa_config.get('enabled', True):
+            if self.vpa_config.get('enabled', False):
                 # Climax volume flag via RVOL threshold
                 if 'rvol' in features.columns:
                     thr = float(self.vpa_config.get('climax_rvol_threshold', 3.0))
@@ -682,7 +1252,10 @@ class FeaturePipeline:
                 # Churn index and z-score
                 tr = (data['high'] - data['low']).abs()
                 churn = (data['volume'] / (tr.replace(0, pd.NA)))
-                features['churn'] = churn.ffill().fillna(0.0).astype(float)
+                churn = churn.ffill().fillna(0.0)
+                # Opt in to future behavior explicitly to avoid downcasting warning
+                churn = churn.infer_objects(copy=False)
+                features['churn'] = churn.astype(float)
                 zwin = int(self.vpa_config.get('zscore_window', 100))
                 mu = features['churn'].rolling(zwin, min_periods=10).mean()
                 sd = features['churn'].rolling(zwin, min_periods=10).std()
@@ -929,7 +1502,30 @@ class FeaturePipeline:
             except Exception as e:
                 self.logger.warning(f"Correlation filtering skipped: {e}")
 
+        # Log the final feature count after all processing
         self.logger.info("Extracted %d features", len(features.columns))
+
+        # Optional regime features (low-cost tags; causal rolling, t-1)
+        try:
+            if isinstance(self.regime_config, dict) and self.regime_config.get('enabled', False):
+                vol_win = int(self.regime_config.get('vol_window', 60))
+                trend_win = int(self.regime_config.get('trend_window', 60))
+                # Rolling volatility on close returns
+                r = data['close'].pct_change().fillna(0.0)
+                vol = r.rolling(vol_win, min_periods=max(5, vol_win//5)).std().shift(1)
+                features['regime_vol'] = vol.astype(float)
+                # Tercile buckets (0,1,2) using expanding quantiles (causal)
+                q1 = vol.expanding(min_periods=10).quantile(1/3)
+                q2 = vol.expanding(min_periods=10).quantile(2/3)
+                bucket = (vol > q2).astype(int) * 2 + ((vol > q1) & (vol <= q2)).astype(int)
+                features['regime_vol_bucket'] = bucket.fillna(0).astype(int)
+                # Trend slope via rolling linear regression proxy: EMA of returns
+                trend = r.ewm(span=max(3, trend_win//6), adjust=False).mean().shift(1)
+                features['regime_trend'] = trend.astype(float)
+                features['regime_trend_sign'] = np.sign(trend).fillna(0).astype(int)
+        except Exception:
+            # Never break the pipeline on optional tags
+            pass
 
         # Note: Warmup bars are kept to maintain alignment with OHLCV data
         # The training process will handle any necessary warmup period
@@ -992,6 +1588,12 @@ class FeaturePipeline:
                     # Fill NaN values with mean before fitting
                     numeric_features_filled = numeric_features.fillna(numeric_features.mean())
                     self.scaler.fit(numeric_features_filled)
+                    self.normalization_stats = {
+                        'method': 'standardize',
+                        'columns': list(numeric_features.columns),
+                        'mean': {col: float(val) for col, val in zip(numeric_features.columns, self.scaler.mean_)},
+                        'scale': {col: float(val) for col, val in zip(numeric_features.columns, getattr(self.scaler, 'scale_', np.ones_like(self.scaler.mean_)))},
+                    }
             
             # Transform numeric features
             numeric_features = features.select_dtypes(include=[np.number])
@@ -1012,6 +1614,12 @@ class FeaturePipeline:
                     # Fill NaN values with mean before fitting
                     numeric_features_filled = numeric_features.fillna(numeric_features.mean())
                     self.scaler.fit(numeric_features_filled)
+                    self.normalization_stats = {
+                        'method': 'minmax',
+                        'columns': list(numeric_features.columns),
+                        'min': {col: float(val) for col, val in zip(numeric_features.columns, getattr(self.scaler, 'data_min_', np.zeros(len(numeric_features.columns))))},
+                        'max': {col: float(val) for col, val in zip(numeric_features.columns, getattr(self.scaler, 'data_max_', np.ones(len(numeric_features.columns))))},
+                    }
             
             # Transform numeric features
             numeric_features = features.select_dtypes(include=[np.number])
@@ -1020,7 +1628,7 @@ class FeaturePipeline:
                 numeric_features_filled = numeric_features.fillna(numeric_features.mean())
                 normalized_values = self.scaler.transform(numeric_features_filled)
                 features[numeric_features.columns] = normalized_values
-        
+
         return features
 
     def _select_features(self, features: pd.DataFrame) -> pd.DataFrame:
@@ -1033,11 +1641,20 @@ class FeaturePipeline:
         Returns:
             Selected features
         """
+        # Reset per-fit importance capture
+        self.feature_scores_ = None
+        # Backward-compat: map alternate keys
+        if 'selection_method' in self.feature_selection_config and 'method' not in self.feature_selection_config:
+            self.feature_selection_config['method'] = self.feature_selection_config['selection_method']
+        if 'max_features' in self.feature_selection_config and 'k' not in self.feature_selection_config:
+            # unify to k for univariate and variance-based selection
+            self.feature_selection_config['k'] = int(self.feature_selection_config['max_features'])
         method = self.feature_selection_config.get('method', 'univariate')
         
-        if method == 'univariate':
+        if method in ('univariate', 'k_best'):
             if self.feature_selector is None:
-                self.feature_selector = SelectKBest(score_func=f_regression, k=10)
+                k = int(self.feature_selection_config.get('k', 10))
+                self.feature_selector = SelectKBest(score_func=f_regression, k=k)
             
             # Calculate returns if not already present
             if 'returns' not in features.columns:
@@ -1051,7 +1668,10 @@ class FeaturePipeline:
             
             if len(features_clean) > 0:
                 # Prepare features and target for selection
+                # Drop the synthetic target and restrict to numeric columns only for selector
                 X = features_clean.drop(columns=['returns'])
+                # Ensure non-numeric labels like 'ticker' are excluded from selector input
+                X = X.select_dtypes(include=[np.number])
                 y = features_clean['returns'].shift(-1).ffill()
                 
                 # Remove any remaining NaN values
@@ -1060,8 +1680,16 @@ class FeaturePipeline:
                 y_clean = y[mask]
                 
                 if len(X_clean) > 0 and len(y_clean) > 0:
-                    selected_features = self.feature_selector.fit_transform(X_clean, y_clean)
+                    _ = self.feature_selector.fit(X_clean, y_clean)
                     self.selected_features = X_clean.columns[self.feature_selector.get_support()].tolist()
+                    scores = getattr(self.feature_selector, 'scores_', None)
+                    pvalues = getattr(self.feature_selector, 'pvalues_', None)
+                    if scores is not None:
+                        df_scores = pd.DataFrame({'feature': X_clean.columns, 'score': scores})
+                        if pvalues is not None:
+                            df_scores['pvalue'] = pvalues
+                        df_scores = df_scores.sort_values('score', ascending=False)
+                        self.feature_scores_ = df_scores.reset_index(drop=True)
                 else:
                     # If no valid data after cleaning, select all features
                     self.selected_features = features.columns.tolist()
@@ -1069,6 +1697,16 @@ class FeaturePipeline:
                 # If no valid data, select all features
                 self.selected_features = features.columns.tolist()
             
+        elif method == 'variance':
+            # Select top-k features by variance (drop non-numeric)
+            k = int(self.feature_selection_config.get('k', 10))
+            num = features.select_dtypes(include=[np.number])
+            if num.empty:
+                self.selected_features = features.columns.tolist()
+            else:
+                vars_ = num.var(axis=0).sort_values(ascending=False)
+                top = vars_.index[:k].tolist()
+                self.selected_features = top
         elif method == 'manual':
             if 'selected_features' in self.feature_selection_config:
                 self.selected_features = self.feature_selection_config['selected_features']
@@ -1077,4 +1715,270 @@ class FeaturePipeline:
                 raise ValueError("Manual selection requires 'selected_features' parameter")
         
         self.logger.info("Selected features: %s", self.selected_features)
-        return features[[col for col in features.columns if col in self.selected_features]]
+        if self.selected_features is not None:
+            keep_cols = [col for col in features.columns if col in self.selected_features]
+            # Always preserve 'ticker' label if present for multi-ticker flows
+            if 'ticker' in features.columns and 'ticker' not in keep_cols:
+                keep_cols.append('ticker')
+            return features[keep_cols]
+        else:
+            return features
+
+    def audit_features(self, features: pd.DataFrame, *, stage: str = 'manual') -> pd.DataFrame:
+        """Run feature audit and append to internal report list."""
+        report = self._run_feature_audit(features, stage=stage)
+        self._audit_reports.append(report)
+        return report
+
+    def _run_feature_audit(self, features: pd.DataFrame, stage: str) -> pd.DataFrame:
+        """Inspect features for NaNs, constants, and potential leakage."""
+        if features.empty:
+            return pd.DataFrame(columns=['feature', 'nan_ratio', 'inf_ratio', 'is_constant', 'head_nan_ratio', 'tail_nan_ratio', 'dtype', 'stage'])
+
+        has_ticker_column = 'ticker' in features.columns
+        has_ticker_index = isinstance(features.index, pd.MultiIndex) and 'ticker' in features.index.names
+
+        if has_ticker_column or has_ticker_index:
+            if has_ticker_column:
+                grouped = features.groupby('ticker')
+            else:
+                tickers = features.index.get_level_values('ticker').unique()
+                grouped = ((t, features.xs(t, level='ticker')) for t in tickers)
+
+            for ticker, frame in grouped:
+                if frame.empty:
+                    continue
+                idx = frame.index
+                if isinstance(idx, pd.MultiIndex) and 'timestamp' in idx.names:
+                    ts_idx = idx.get_level_values('timestamp')
+                elif isinstance(idx, pd.DatetimeIndex):
+                    ts_idx = idx
+                else:
+                    # Unable to validate index for this group; continue best-effort
+                    continue
+                if not ts_idx.is_monotonic_increasing:
+                    raise ValueError(
+                        f"Feature index is not monotonically increasing for ticker {ticker}; potential misalignment detected"
+                    )
+                if ts_idx.duplicated().any():
+                    raise ValueError(
+                        f"Feature index contains duplicates for ticker {ticker}; potential leakage or alignment issue"
+                    )
+        else:
+            ts_index: Optional[pd.Index] = None
+            if isinstance(features.index, pd.MultiIndex) and 'timestamp' in features.index.names:
+                ts_index = features.index.get_level_values('timestamp')
+            elif isinstance(features.index, pd.DatetimeIndex):
+                ts_index = features.index
+
+            if ts_index is not None:
+                if not ts_index.is_monotonic_increasing:
+                    raise ValueError("Feature index is not monotonically increasing; potential misalignment detected")
+                if ts_index.duplicated().any():
+                    raise ValueError("Feature index contains duplicates; potential leakage or alignment issue")
+
+        rows: List[Dict[str, Any]] = []
+        suspicious_names: List[str] = []
+        suspicious_trailing: List[str] = []
+        window = min(len(features), 10)
+
+        for col in features.columns:
+            if col == 'ticker':
+                continue
+            series = features[col]
+            nan_ratio = float(series.isna().mean())
+            inf_ratio = float(np.isinf(series).mean()) if series.dtype.kind in {'f', 'i'} else 0.0
+            is_constant = bool(series.nunique(dropna=True) <= 1)
+            head_slice = series.head(window)
+            tail_slice = series.tail(window)
+            head_nan_ratio = float(head_slice.isna().mean()) if len(head_slice) else 0.0
+            tail_nan_ratio = float(tail_slice.isna().mean()) if len(tail_slice) else 0.0
+
+            if self.LEAKAGE_PATTERN.search(str(col)):
+                suspicious_names.append(col)
+            if tail_nan_ratio >= 0.8 and head_nan_ratio <= 0.2:
+                suspicious_trailing.append(col)
+
+            rows.append({
+                'feature': col,
+                'nan_ratio': nan_ratio,
+                'inf_ratio': inf_ratio,
+                'is_constant': is_constant,
+                'head_nan_ratio': head_nan_ratio,
+                'tail_nan_ratio': tail_nan_ratio,
+                'dtype': str(series.dtype),
+                'stage': stage,
+            })
+
+        if suspicious_names:
+            raise ValueError(f"Potential look-ahead feature names detected: {suspicious_names}")
+        if suspicious_trailing:
+            raise ValueError(
+                "Features with trailing NaNs detected (possible forward shift): "
+                f"{suspicious_trailing}"
+            )
+
+        report = pd.DataFrame(rows).sort_values('feature').reset_index(drop=True)
+        return report
+
+    def write_reports(
+        self,
+        output_dir: Union[str, Path],
+        *,
+        prefix: Optional[str] = None,
+        features: Optional[pd.DataFrame] = None,
+    ) -> Path:
+        """Persist selected features, audit reports, and normalization stats."""
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        prefix_str = f"{prefix}_" if prefix else ""
+
+        if features is not None:
+            self.audit_features(features, stage='export')
+
+        selected = list(self.selected_features or [])
+        if not selected and features is not None:
+            selected = [col for col in features.columns if col != 'ticker']
+        selected_df = pd.DataFrame({'feature': selected})
+        selected_df.to_csv(output_path / f"{prefix_str}features_selected.csv", index=False)
+
+        if self.feature_scores_ is not None and not self.feature_scores_.empty:
+            scores_df = self.feature_scores_.copy()
+            scores_df['selected'] = scores_df['feature'].isin(selected)
+            scores_df.to_csv(output_path / f"{prefix_str}feature_importances.csv", index=False)
+
+        if self._audit_reports:
+            audit_df = pd.concat(self._audit_reports, ignore_index=True)
+            audit_df = audit_df.drop_duplicates(subset=['stage', 'feature']).sort_values(['stage', 'feature'])
+            audit_df.to_csv(output_path / f"{prefix_str}feature_audit.csv", index=False)
+
+        if self.normalization_stats:
+            norm_path = output_path / f"{prefix_str}normalization_stats.json"
+            with norm_path.open('w', encoding='utf-8') as fh:
+                json.dump(self.normalization_stats, fh, indent=2)
+
+        return output_path
+
+
+def build_features_for_window(
+    *,
+    ohlcv: pd.DataFrame,
+    base_features: pd.DataFrame,
+    run_name: str,
+    ticker: str,
+    window_k: int,
+    window_dir: Union[str, os.PathLike[str], Path],
+    screen_dir: Optional[Union[str, os.PathLike[str], Path]],
+    feature_pack: Optional[str],
+    start: Union[pd.Timestamp, str],
+    end: Union[pd.Timestamp, str],
+    use_cache: bool = True,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Resolve curated features for a single walk-forward window.
+
+    This helper selects the curated subset for a window, persists bookkeeping, and
+    serves feature caches. It assumes ``base_features`` already contains the
+    computed indicators for the requested ticker/window span.
+    """
+
+    log = logger or logging.getLogger("features.window")
+
+    window_path = Path(window_dir)
+    window_path.mkdir(parents=True, exist_ok=True)
+
+    screen_path = Path(screen_dir) if screen_dir is not None else window_path
+    screen_path.mkdir(parents=True, exist_ok=True)
+
+    has_l1 = all(col in ohlcv.columns for col in ("bid_price", "ask_price", "bid_size", "ask_size"))
+
+    curated_from_screen = resolve_curated_pack(
+        screen_path,
+        has_l1=has_l1,
+        logger=log,
+        window_k=window_k,
+        ticker=ticker,
+    )
+
+    available = [col for col in base_features.columns if col != "ticker"]
+    pack_keys: List[str] = []
+    if feature_pack:
+        pack_keys = [p.strip() for p in str(feature_pack).split(",") if p.strip()]
+
+    resolved = resolve_feature_pack(available, pack_keys, curated=curated_from_screen) if pack_keys else curated_from_screen
+    if not resolved:
+        resolved = available
+
+    resolved_order = dict.fromkeys(resolved)
+    final_cols = [col for col in base_features.columns if col != "ticker" and col in resolved_order]
+    if not final_cols:
+        final_cols = available
+
+    base_hash = (
+        f"{run_name}|{ticker}|{pd.Timestamp(start):%Y%m%d}-{pd.Timestamp(end):%Y%m%d}|"
+        f"{','.join(pack_keys) or 'manual'}|{screen_path}"
+    )
+    cfg_hash = augment_cfg_hash(
+        base_hash,
+        run_name=run_name,
+        features=final_cols,
+        micro_module_path=Path('src/features/micro_ohlcv.py'),
+        curated_token=LAST_CURATED_CACHE_TOKEN,
+    )
+    cache_path = feature_cache_path(
+        run_name=run_name,
+        ticker=ticker,
+        split=f"window{window_k:02d}",
+        start=start,
+        end=end,
+        cfg_hash=cfg_hash,
+    )
+
+    feats: Optional[pd.DataFrame] = None
+    if use_cache and cache_path.exists():
+        try:
+            log.info("Feature cache HIT -> %s", cache_path)
+            cached = load_features(cache_path)
+            missing_cols = [c for c in final_cols if c not in cached.columns]
+            if missing_cols:
+                log.warning(
+                    "Feature cache %s missing columns %s; recomputing",
+                    cache_path,
+                    missing_cols,
+                )
+            else:
+                keep = ['ticker'] + final_cols if 'ticker' in cached.columns else final_cols
+                feats = cached.loc[:, keep].copy()
+        except Exception as exc:
+            log.warning("Failed to load feature cache %s (%s); recomputing", cache_path, exc)
+            feats = None
+
+    if feats is None:
+        status = "BYPASS" if not use_cache else "MISS"
+        log.info(
+            "Feature cache %s -> computing %d features for window %02d ticker %s",
+            status,
+            len(final_cols),
+            window_k,
+            ticker,
+        )
+        cols_to_keep = ['ticker'] + final_cols if 'ticker' in base_features.columns else final_cols
+        feats = base_features.loc[:, [c for c in cols_to_keep if c in base_features.columns]].copy()
+        if use_cache:
+            save_features(feats, cache_path)
+
+    curated = [c for c in final_cols if c != 'ticker']
+
+    try:
+        (window_path / 'features_used.txt').write_text("\n".join(curated) + "\n")
+        # Also write to screen_path for consistency
+        if screen_path != window_path:
+            (screen_path / 'features_used.txt').write_text("\n".join(curated) + "\n")
+    except Exception:
+        pass
+
+    missing_micro = [f for f in MICROSTRUCTURE_OHLCV if f in curated and f not in feats.columns]
+    if missing_micro:
+        raise AssertionError(f"Requested microstructure proxies missing from features: {missing_micro}")
+
+    return feats, curated

@@ -1,0 +1,81 @@
+                    out = np.pad(out, (0, expected - got), mode='constant', constant_values=0.0)
+            except Exception:
+                # Best-effort fallback
+                out = (out[:expected] if got > expected else np.pad(out, (0, expected - got), mode='constant'))
+        return out
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        super().reset(seed=seed)
+        self.i = 1  # start at index 1 so prev bar exists
+        self.cash = float(self.cfg.cash)
+        self.pos = np.zeros((self.N,), dtype=np.int32)
+        self.equity = float(self.cash)
+        self.equity_curve: List[float] = [self.equity]
+        # Preserve last snapshots across auto-reset; do not clear here
+        if not hasattr(self, '_last_equity_curve'):
+            self._last_equity_curve = None
+        if not hasattr(self, '_last_history'):
+            self._last_history: Optional[List[Dict[str, Any]]] = None
+        self.history: List[Dict[str, Any]] = []
+        # Trades tracking (per-ticker open trade, and list of closed trades)
+        self._open_trades: Dict[str, Optional[Dict[str, Any]]] = {t: None for t in self.tickers}
+        self.trades: List[Dict[str, Any]] = []
+        # Signed units per ticker
+        self.units = np.zeros((self.N,), dtype=np.int64)
+        # Holding durations in bars per ticker
+        self.hold_bars = np.zeros((self.N,), dtype=np.int32)
+        # Per-day entry counter and current day tracker
+        self.current_day = pd.Timestamp(self.index[self.i]).date() if len(self.index) else None
+        self.daily_entries = 0
+        # Allowed tickers mask
+        allowed = set(self.cfg.allowed_trade_tickers or [])
+        self.allowed_mask = np.array([(t in allowed) for t in self.tickers], dtype=bool) if allowed else None
+        return self._obs(self.i), {}
+
+    def step(self, action: np.ndarray):
+        # map 0→-1, 1→0, 2→1 per ticker
+        a = np.asarray(action).reshape(-1)
+        desired = (a - 1).astype(np.int32)
+        desired = np.clip(desired, -1, 1)
+
+        # Time and session bookkeeping
+        ts_cur = self.index[self.i]
+        day_cur = ts_cur.date()
+        # Day change: reset counters
+        if self.current_day is None or day_cur != self.current_day:
+            self.current_day = day_cur
+            self.daily_entries = 0
+            # Reset holding bars because we consider overnight not allowed
+            self.hold_bars[:] = 0
+        # End-of-day check: if next timestamp is a new day (or we're at the end), force flat
+        is_last_bar = (self.i >= self.n - 1)
+        if not is_last_bar:
+            next_day = self.index[self.i + 1].date()
+            eod_incoming = (next_day != day_cur)
+        else:
+            eod_incoming = True
+
+        # Apply allowed tickers gating
+        if self.allowed_mask is not None:
+            desired = desired.copy()
+            desired[~self.allowed_mask] = 0
+
+        prev_pos = self.pos.copy()
+
+        # Convert minute constraints to bars
+        min_hold_bars = int(max(0, np.ceil(self.cfg.min_hold_minutes / max(1e-6, self.bar_minutes))))
+        max_hold_bars = int(max(1, np.floor(self.cfg.max_hold_minutes / max(1e-6, self.bar_minutes))))
+        # Remaining bars today (including current step outcome before advancing)
+        if eod_incoming:
+            remaining_bars_today = 1
+        else:
+            # Count how many consecutive indices remain with same day
+            j = self.i
+            remaining = 0
+            while j < self.n and self.index[j].date() == day_cur:
+                remaining += 1
+                j += 1
+            remaining_bars_today = remaining
+
+        # Enforce intraday discipline
+        if self.cfg.enforce_intraday:

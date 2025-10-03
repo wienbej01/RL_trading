@@ -1,112 +1,53 @@
 #!/usr/bin/env python3
-"""
-Paper trading script for RL trading system.
-
-This script provides a command-line interface for running paper trading
-sessions with trained RL models.
-"""
-import asyncio
 import argparse
-import sys
+import asyncio
 from pathlib import Path
-from datetime import datetime, timedelta
+import sys
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add project root to path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.config_loader import Settings
-from trading.paper_trading import PaperTradingEngine, PaperTradingConfig
-from utils.logging import get_logger
+from src.utils.config_loader import Settings
+from src.trading.paper_trading import PaperTradingEngine, PaperTradingConfig
 
-logger = get_logger(__name__)
+def main():
+    parser = argparse.ArgumentParser(description="Run paper trading session.")
+    parser.add_argument("--config", type=str, default="configs/settings.yaml", help="Path to configuration file.")
+    parser.add_argument("--duration", type=int, default=None, help="Duration of the trading session in minutes.")
+    args = parser.parse_args()
 
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Run paper trading session")
-    
-    parser.add_argument("--config", default="configs/settings.yaml", help="Configuration file")
-    parser.add_argument("--model", required=True, help="Path to trained model")
-    parser.add_argument("--symbol", default="MES", help="Trading symbol")
-    parser.add_argument("--exchange", default="CME", help="Trading exchange")
-    parser.add_argument("--currency", default="USD", help="Trading currency")
-    parser.add_argument("--capital", type=float, default=100000.0, help="Initial capital")
-    parser.add_argument("--duration", type=int, help="Duration in minutes")
-    parser.add_argument("--output", default="paper_trading_results", help="Output directory")
-    parser.add_argument("--dry-run", action="store_true", help="Dry run mode (no actual trading)")
-    
-    return parser.parse_args()
-
-
-async def main():
-    """Main function."""
-    args = parse_args()
-    
-    # Load settings
     settings = Settings.from_paths(args.config)
     
-    # Create paper trading configuration
-    config = PaperTradingConfig(
-        model_path=args.model,
-        trading_symbol=args.symbol,
-        trading_exchange=args.exchange,
-        trading_currency=args.currency,
-        initial_capital=args.capital,
-        output_dir=args.output
+    # Create PaperTradingConfig from settings
+    paper_trading_config = PaperTradingConfig(
+        model_path=settings.get('paper_trading', 'model_path', default="models/trained_model.zip"),
+        trading_symbol=settings.get('paper_trading', 'trading_symbol', default="MES"),
+        trading_exchange=settings.get('paper_trading', 'trading_exchange', default="CME"),
+        trading_currency=settings.get('paper_trading', 'trading_currency', default="USD"),
+        initial_capital=settings.get('paper_trading', 'initial_capital', default=100000.0),
+        max_position_size=settings.get('paper_trading', 'max_position_size', default=10),
+        risk_per_trade_frac=settings.get('risk', 'risk_per_trade_frac', default=0.02),
+        stop_loss_r_multiple=settings.get('risk', 'stop_r_multiple', default=1.0),
+        take_profit_r_multiple=settings.get('risk', 'tp_r_multiple', default=1.5),
+        max_daily_loss_r=settings.get('risk', 'max_daily_loss_r', default=3.0),
+        update_frequency=settings.get('paper_trading', 'update_frequency', default=60),
+        data_lookback=settings.get('paper_trading', 'data_lookback', default=120),
+        output_dir=settings.get('paper_trading', 'output_dir', default="paper_trading_results"),
     )
-    
-    # Create paper trading engine
-    engine = PaperTradingEngine(settings, config)
-    
-    try:
-        # Initialize
-        logger.info("Initializing paper trading engine...")
-        if not await engine.initialize():
-            logger.error("Failed to initialize paper trading engine")
-            return 1
-        
-        # Print configuration
-        logger.info("Paper Trading Configuration:")
-        logger.info(f"  Model: {args.model}")
-        logger.info(f"  Symbol: {args.symbol}")
-        logger.info(f"  Exchange: {args.exchange}")
-        logger.info(f"  Currency: {args.currency}")
-        logger.info(f"  Initial Capital: ${args.capital:,.2f}")
-        logger.info(f"  Duration: {args.duration or 'Indefinite'} minutes")
-        logger.info(f"  Output Directory: {args.output}")
-        logger.info(f"  Dry Run: {args.dry_run}")
-        
-        # Run trading session
-        logger.info("Starting paper trading session...")
-        await engine.run_trading_session(duration_minutes=args.duration)
-        
-        # Print summary
-        summary = engine.get_trading_summary()
-        logger.info("\nTrading Session Summary:")
-        logger.info(f"  Final Equity: ${summary['final_equity']:,.2f}")
-        logger.info(f"  Total Return: {summary['performance_metrics']['total_return']:.2%}")
-        logger.info(f"  Annual Return: {summary['performance_metrics']['annual_return']:.2%}")
-        logger.info(f"  Sharpe Ratio: {summary['performance_metrics']['sharpe_ratio']:.2f}")
-        logger.info(f"  Max Drawdown: {summary['performance_metrics']['max_drawdown']:.2%}")
-        logger.info(f"  Win Rate: {summary['performance_metrics']['win_rate']:.2%}")
-        logger.info(f"  Total Trades: {summary['total_trades']}")
-        
-        return 0
-        
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        await engine.stop_trading_session()
-        return 0
-        
-    except Exception as e:
-        logger.error(f"Error in paper trading: {e}")
-        await engine.stop_trading_session()
-        return 1
-    
-    finally:
-        await engine.stop_trading_session()
 
+    engine = PaperTradingEngine(settings=settings, config=paper_trading_config)
+    
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(engine.initialize())
+        loop.run_until_complete(engine.run_trading_session(duration_minutes=args.duration))
+    except KeyboardInterrupt:
+        print("Paper trading session interrupted by user.")
+    finally:
+        loop.run_until_complete(engine.stop_trading_session())
+        loop.close()
 
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    main()

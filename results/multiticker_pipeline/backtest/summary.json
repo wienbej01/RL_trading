@@ -1,0 +1,61 @@
+{
+  "tickers": [
+    "SPY"
+  ],
+  "portfolio_metrics": {
+    "mean_reward": 0.0,
+    "std_reward": 0.0,
+    "mean_length": 3518.0,
+    "std_length": 0.0,
+    "max_reward": 0.0,
+    "min_reward": 0.0,
+    "total_return": 0.0,
+    "annual_return": 0.0,
+    "annual_volatility": 0.0,
+    "sharpe_ratio": 0.0,
+    "max_drawdown": 0.0,
+    "calmar_ratio": NaN,
+    "win_rate": 0.0,
+    "profit_factor": 0.0,
+    "sortino_ratio": Infinity,
+    "tx_costs_total": 0.0,
+    "long_pf": 0.0,
+    "short_pf": 0.0,
+    "long_ret": 0.0,
+    "short_ret": 0.0,
+    "total_trades": 0,
+    "long_trades": 0,
+    "short_trades": 0,
+    "avg_duration_minutes": 0.0,
+    "avg_duration_minutes_long": 0.0,
+    "avg_duration_minutes_short": 0.0,
+    "avg_pnl": 0.0,
+    "avg_pnl_long": 0.0,
+    "avg_pnl_short": 0.0,
+    "long_steps": 0,
+    "short_steps": 0,
+    "flat_steps": 3518,
+    "flips": 0,
+    "turnover": 0.0,
+    "exposure_pct": 0.0,
+    "tx_costs_per_trade": 0.0,
+    "parity_flag": "NONE",
+    "daily_sharpe_proxy": 0.0,
+    "intraday_max_drawdown": 0.0,
+    "entries": 0,
+    "exits": 0,
+    "avg_abs_pos": 0.0,
+    "avg_abs_dpos": 0.0,
+    "action_entropy": -1.4428232973175175e-12,
+    "corr_action_flow": NaN,
+    "baselines": {
+      "no_trade": {
+        "sharpe": 0.0,
+        "pf": 0.0,
+        "ret": 0.0,
+        "maxdd": 0.0
+      }
+    }
+  },
+  "parity_flag": "NONE"
+}

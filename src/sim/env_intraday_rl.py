@@ -10,6 +10,7 @@ import pandas as pd
 from typing import Dict, List, Optional, Union, Tuple, Any
 from dataclasses import dataclass
 import logging
+import time
 from gymnasium import Env, spaces
 from gymnasium.spaces import Box, Discrete
 
@@ -31,6 +32,8 @@ class EnvConfig:
     reward_type: str = 'dsr'  # 'dsr', 'pnl', 'sharpe'
     penalty_factor: float = 0.1
     reward_scaling: float = 0.1
+    allow_shorts: bool = True
+    allow_long: bool = True
 
 
 class IntradayRLEnv(Env):
@@ -78,12 +81,32 @@ class IntradayRLEnv(Env):
         self.point_value = point_value
         self.env_config = env_config or EnvConfig(cash=cash)
         self.config = config  # Store config for compatibility
+        logger.info(f"allow_shorts={getattr(self.env_config, 'allow_shorts', True)}")
+        # Parity enforcement: equities require allow_shorts=True
+        if not bool(getattr(self.env_config, 'allow_shorts', True)):
+            raise ValueError("EnvConfig.allow_shorts must be True for equity runs (parity enforcement)")
+        # Optional: max_short_exposure must be None or > 0 if present in settings
+        try:
+            msexp = self.settings.get('env', 'max_short_exposure', default=None)
+            if msexp is not None and float(msexp) <= 0:
+                raise ValueError("max_short_exposure must be > 0 when allow_shorts=True")
+        except Exception:
+            pass
 
         # Data
         self.ohlcv = ohlcv[['open', 'high', 'low', 'close', 'volume']].copy()
         self.features = features.reindex(ohlcv.index, method='ffill').copy()
         self.df = ohlcv.copy()  # For compatibility
         self.X = features.copy()  # For compatibility
+
+        # Promote boolean features to floats so train/test pipelines agree on shape
+        bool_cols = self.features.select_dtypes(include=['bool']).columns
+        if len(bool_cols):
+            self.features.loc[:, bool_cols] = self.features[bool_cols].astype(np.float32)
+            try:
+                self.X.loc[:, bool_cols] = self.X[bool_cols].astype(np.float32)
+            except Exception:
+                pass
 
         # Ensure alignment
         self.ohlcv = self.ohlcv.loc[self.features.index]
@@ -156,6 +179,15 @@ class IntradayRLEnv(Env):
             logger.debug(f"Updating RiskManager with risk_cfg: {risk_cfg}")
             self.risk_manager.risk_config = risk_cfg
 
+        # Reward-related placeholders (reset_state relies on these attributes)
+        self.composite_reward = None
+        self.include_costs = True
+        self._reward_episode_trace: List[Dict[str, float]] = []
+        self._reward_breakdown: List[Dict[str, float]] = []
+        self._reward_history: List[Dict[str, float]] = []
+        self._reward_episode_idx = 0
+        self._last_episode_trades: List[Dict[str, Any]] = []
+
         # State tracking
         self.reset_state()
 
@@ -193,6 +225,27 @@ class IntradayRLEnv(Env):
         # Reward tracking
         self.dsr = DifferentialSharpe()
 
+        # Initialize composite reward if configured
+        try:
+            rw_cfg = (self.config.get('env', {}).get('reward', {}) if isinstance(self.config, dict) else {}) or {}
+            if rw_cfg.get('kind') == 'composite':
+                from ..rl.composite_reward import CompositeReward
+                self.composite_reward = CompositeReward(
+                    w_ret=float(rw_cfg.get('w_ret', 1.0)),
+                    w_turnover=float(rw_cfg.get('w_turnover', 0.2)),
+                    w_inv=float(rw_cfg.get('w_inv', 0.05)),
+                    w_dsr=float(rw_cfg.get('w_dsr', 0.0)),
+                    include_costs=bool(rw_cfg.get('include_costs', True))
+                )
+                self.include_costs = bool(rw_cfg.get('include_costs', True))
+                logger.info(f"Initialized CompositeReward with config: {rw_cfg}")
+            else:
+                self.composite_reward = None
+                logger.info(f"Using legacy reward system (kind: {rw_cfg.get('kind', 'unknown')})")
+        except Exception as e:
+            self.composite_reward = None
+            logger.warning(f"Failed to initialize CompositeReward: {e}")
+
         logger.info(f"Environment initialized with {len(self.ohlcv)} bars, {feature_dim} features from {getattr(self, 'data_source', 'unknown')} data")
     
     def reset_state(self):
@@ -210,12 +263,23 @@ class IntradayRLEnv(Env):
         self.day_start_equity = self.cash
         self.i = 0
         self.done = False
+        # Preserve the previous episode's trades so they remain accessible after
+        # a VecEnv-triggered auto-reset (e.g., at evaluation end).
+        if hasattr(self, 'trades'):
+            try:
+                self._last_episode_trades = list(self.trades)
+            except Exception:
+                self._last_episode_trades = list(getattr(self, '_last_episode_trades', []))
+        else:
+            self._last_episode_trades = []
         self.trades = []
         # Daily trade tracking for reward shaping
         self._daily_date = None
         self._daily_trade_count = 0
         self._day_return_sum = 0.0
         self._day_return_count = 0
+        # Episode step counter for truncation by max_steps
+        self._steps_in_episode = 0
         # Lagrangian multiplier for activity soft-constraint
         try:
             self._lambda_activity = float(self.config.get('env', {}).get('reward', {}).get('activity', {}).get('lambda_init', 0.0)) if isinstance(self.config, dict) else 0.0
@@ -226,11 +290,45 @@ class IntradayRLEnv(Env):
         self._dd_slope_ema = 0.0
         # Last action direction for churn penalty
         self._last_action_dir = 0
-        
+        # Action counts (for diagnostics)
+        self._act_counts = {"long": 0, "short": 0, "flat": 0}
+        # Flip tracker and cumulative tx costs (commission+spread+slippage+impact)
+        self._flips = 0
+        self._last_nonzero_dir = 0
+        self.tx_costs_total = 0.0
+        # Composite reward accumulators and diagnostics
+        self._sum_abs_pos = 0.0
+        self._sum_abs_dpos = 0.0
+        self._reward_steps = 0
+        self._diagnostics = []
+        # Track previous transaction costs for composite reward calculation
+        self._prev_tx_costs = 0.0
+
+        # Reset reward tracking structures
+        if self.composite_reward is not None:
+            try:
+                if self._reward_episode_trace:
+                    self._finalize_reward_episode()
+            except Exception:
+                pass
+            if self._reward_episode_idx == 0:
+                self._reward_breakdown = []
+                self._reward_history = []
+            self._reward_episode_idx += 1
+            self._reward_episode_trace = []
+
+        # Reset composite reward if it exists
+        if self.composite_reward is not None:
+            self.composite_reward.reset()
+
         # Reset risk manager
         self.risk_manager.reset_daily_metrics()
     
     def reset(self, seed=None, options: Dict[str, Any] = None):
+        self._act_counts = {'long':0,'short':0,'flat':0}
+        self._flips = 0
+        self._last_nonzero_dir = 0
+        self.tx_costs_total = 0.0
         """
         Reset environment.
         
@@ -266,16 +364,31 @@ class IntradayRLEnv(Env):
             self._day_ptr = (self._day_ptr + 1) % max(1, len(self._day_starts))
             self.i = int(self._day_starts[self._day_ptr])
 
-        # Ensure we land within RTH
+        # Ensure we land within RTH; guard against running past the end
         while self.i < len(self.df) and not self._tod(self.df.index[self.i]):
             self.i += 1
-        
+
+        # If we advanced past the end (e.g., malformed day start), fall back to the
+        # last available RTH bar; if none exist, use the final bar safely.
+        if self.i >= len(self.df):
+            fallback_idx = None
+            try:
+                for idx in range(len(self.df) - 1, -1, -1):
+                    if self._tod(self.df.index[idx]):
+                        fallback_idx = idx
+                        break
+            except Exception:
+                fallback_idx = None
+            self.i = int(fallback_idx) if fallback_idx is not None else max(0, len(self.df) - 1)
+
         ts = self.df.index[self.i]
+        prev_pos = int(getattr(self, 'pos', 0))
         obs = self._obs(ts, float(self.df["close"].iloc[self.i]))
         
         return obs, {}
     
     def step(self, action: int):
+        step_start_time = time.time()
         """
         Take a step in the environment.
         
@@ -298,6 +411,11 @@ class IntradayRLEnv(Env):
 
         # Current bar
         ts = self.df.index[self.i]
+        # Increment episode step count early
+        try:
+            self._steps_in_episode = int(self._steps_in_episode) + 1
+        except Exception:
+            self._steps_in_episode = 1
         # Reset daily counters on date change
         try:
             cur_date = ts.date()
@@ -342,14 +460,43 @@ class IntradayRLEnv(Env):
         # Execute action mapping used by this environment (internal actions 0,1,2 map to -1,0,1 dir)
         # Robust containment check now that act is an int
         desired_dir = {-1: -1, 0: 0, 1: 1}[act - 1] if act in (0, 1, 2) else 0
+        # Respect environment setting for shorting
+        if not bool(getattr(self.env_config, "allow_shorts", True)) and desired_dir < 0:
+            desired_dir = 0
+        # Count action intent
+        try:
+            if desired_dir > 0:
+                self._act_counts["long"] += 1
+            elif desired_dir < 0:
+                self._act_counts["short"] += 1
+            else:
+                self._act_counts["flat"] += 1
+            # Count flips across consecutive non-zero action intents
+            if desired_dir != 0 and self._last_nonzero_dir != 0 and int(np.sign(desired_dir)) != int(np.sign(self._last_nonzero_dir)):
+                self._flips = int(self._flips) + 1
+            if desired_dir != 0:
+                self._last_nonzero_dir = int(np.sign(desired_dir))
+        except Exception:
+            pass
         reward = 0.0
         info: Dict[str, Any] = {}
 
         # Flatten at EOD regardless of action
         if self._eod(ts):
             if self.pos != 0:
-                # charge closing cost
-                tc = estimate_tc(self.pos, price, self.exec_sim)
+                # charge closing cost (once)
+                try:
+                    side = 'sell' if self.pos > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(comp.get('spread', 0.0))
+                    total_cost = float(comp.get('total', commission_cost + slippage_cost + impact_cost + spread_cost))
+                except Exception:
+                    total_cost = estimate_tc(self.pos, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = spread_cost = 0.0
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
                 # Log close event at EOD
                 try:
                     open_ts = getattr(self, '_open_ts', None)
@@ -358,7 +505,7 @@ class IntradayRLEnv(Env):
                     direction = 'long' if self.pos > 0 else 'short'
                     exit_price = float(price)
                     gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
-                    net_pnl = gross_pnl - entry_tc - float(tc)
+                    net_pnl = gross_pnl - entry_tc - float(total_cost)
                     self.trades.append({
                         'ts': ts,
                         'pos': 0,
@@ -371,14 +518,19 @@ class IntradayRLEnv(Env):
                         'exit_price': float(exit_price),
                         'quantity': qty,
                         'direction': direction,
+                        'gross_pnl': float(gross_pnl),
                         'pnl': float(net_pnl),
                         'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
                         'commission_entry': float(entry_tc),
-                        'commission_exit': float(tc)
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
                     })
                 except Exception:
                     pass
-                self.cash -= tc
+                self.cash -= float(total_cost)
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -426,8 +578,19 @@ class IntradayRLEnv(Env):
                     (self.pos < 0 and row["low"] <= self.tp_price)
                 ) else self.stop_price
                 pnl_exit = (exit_price - self.entry_price) * self.pos * self.point_value
-                tc_exit = estimate_tc(self.pos, float(exit_price), self.exec_sim)
-                self.cash += pnl_exit - tc_exit
+                try:
+                    side = 'sell' if self.pos > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), float(exit_price), side)
+                    commission_exit = float(comp.get('commission', 0.0))
+                    slippage_exit = float(comp.get('slippage', 0.0))
+                    impact_exit = float(comp.get('impact', 0.0))
+                    spread_exit = float(comp.get('spread', 0.0))
+                    total_exit_cost = float(comp.get('total', commission_exit + slippage_exit + impact_exit + spread_exit))
+                except Exception:
+                    total_exit_cost = estimate_tc(self.pos, float(exit_price), self.exec_sim)
+                    commission_exit = slippage_exit = impact_exit = spread_exit = 0.0
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_exit_cost)
+                self.cash += pnl_exit - total_exit_cost
                 # Log trade close with PnL/duration metadata
                 try:
                     open_ts = getattr(self, '_open_ts', None)
@@ -435,7 +598,8 @@ class IntradayRLEnv(Env):
                     qty = int(abs(self.pos))
                     direction = 'long' if self.pos > 0 else 'short'
                     gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
-                    net_pnl = gross_pnl - entry_tc - float(tc_exit)
+                    net_pnl = gross_pnl - entry_tc - float(total_exit_cost)
+                    exit_reason = 'take_profit' if np.isclose(exit_price, self.tp_price) else 'stop_loss'
                     self.trades.append({
                         'ts': ts,
                         'pos': 0,
@@ -450,7 +614,12 @@ class IntradayRLEnv(Env):
                         'pnl': float(net_pnl),
                         'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
                         'commission_entry': float(entry_tc),
-                        'commission_exit': float(tc_exit)
+                        'commission_exit': float(commission_exit),
+                        'slippage_exit': float(slippage_exit),
+                        'impact_exit': float(impact_exit),
+                        'spread_exit': float(spread_exit),
+                        'total_cost_exit': float(total_exit_cost),
+                        'reason': exit_reason
                     })
                 except Exception:
                     pass
@@ -462,9 +631,9 @@ class IntradayRLEnv(Env):
 
         # Time-stop (max holding minutes)
         try:
-            max_hold = int(self.config.get('env', {}).get('trading', {}).get('max_holding_minutes', 0)) if isinstance(self.config, dict) else 0
+            max_hold = int(self.config.get('env', {}).get('trading', {}).get('max_hold_minutes', 120)) if isinstance(self.config, dict) else 120
         except Exception:
-            max_hold = 0
+            max_hold = 120
         if max_hold and self.pos != 0:
             # approximate bar count equals minutes since entry
             # track entry step index lazily
@@ -473,35 +642,51 @@ class IntradayRLEnv(Env):
             held = self.i - int(self.entry_index)
             if held >= max_hold:
                 # flatten at market price with transaction cost
-                tc_exit = estimate_tc(self.pos, price, self.exec_sim)
                 try:
-                    # Log trade close with PnL/duration metadata
+                    side = 'sell' if self.pos > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(comp.get('spread', 0.0))
+                    total_cost = float(comp.get('total', commission_cost + slippage_cost + impact_cost + spread_cost))
+                except Exception:
+                    total_cost = estimate_tc(self.pos, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = spread_cost = 0.0
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
+                try:
                     open_ts = getattr(self, '_open_ts', None)
                     entry_tc = float(getattr(self, '_entry_tc', 0.0))
                     qty = int(abs(self.pos))
                     direction = 'long' if self.pos > 0 else 'short'
                     exit_price = float(price)
                     gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
-                    net_pnl = gross_pnl - entry_tc - float(tc_exit)
+                    net_pnl = gross_pnl - entry_tc - float(total_cost)
                     self.trades.append({
                         'ts': ts,
                         'pos': 0,
                         'price': float(exit_price),
                         'action': 'close',
+                        'reason': 'time_barrier',
                         'entry_time': open_ts if open_ts is not None else ts,
                         'exit_time': ts,
                         'entry_price': float(self.entry_price),
                         'exit_price': float(exit_price),
                         'quantity': qty,
                         'direction': direction,
+                        'gross_pnl': float(gross_pnl),
                         'pnl': float(net_pnl),
                         'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
                         'commission_entry': float(entry_tc),
-                        'commission_exit': float(tc_exit)
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
                     })
                 except Exception:
                     pass
-                self.cash -= tc_exit
+                self.cash -= float(total_cost)
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -549,6 +734,14 @@ class IntradayRLEnv(Env):
                 pass
 
         if desired_dir != 0 and self.pos == 0 and not hit_exit and not in_no_trade:
+            # Daily cap on entries (optional)
+            try:
+                max_epd = int(self.config.get('env', {}).get('trading', {}).get('max_entries_per_day', 0)) if isinstance(self.config, dict) else 0
+            except Exception:
+                max_epd = 0
+            if max_epd and int(getattr(self, '_daily_trade_count', 0)) >= max_epd:
+                logger.debug("Skip open: reached max_entries_per_day=%d (count=%d) on %s", max_epd, int(getattr(self, '_daily_trade_count', 0)), ts)
+                desired_dir = 0
             # Cap trades per hour
             try:
                 max_tph = int(self.config.get('env', {}).get('trading', {}).get('max_trades_per_hour', 0)) if isinstance(self.config, dict) else 0
@@ -564,19 +757,40 @@ class IntradayRLEnv(Env):
                 self.pos = contracts * int(np.sign(desired_dir))
                 self.entry_price = price
                 self._set_barrier_prices(self.pos, price, atr_val)
-                # pay entry cost
-                entry_tc = estimate_tc(self.pos, price, self.exec_sim)
-                self.cash -= entry_tc
+                # pay entry cost (once)
                 try:
+                    side = 'buy' if self.pos > 0 else 'sell'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(comp.get('spread', 0.0))
+                    total_cost = float(comp.get('total', commission_cost + slippage_cost + impact_cost + spread_cost))
+                except Exception:
+                    total_cost = estimate_tc(self.pos, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = spread_cost = 0.0
+                self.cash -= float(total_cost)
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
+                try:
+                    direction = 'long' if self.pos > 0 else 'short'
+                    qty = int(abs(self.pos))
                     self.trades.append({
                         'ts': ts,
                         'pos': int(self.pos),
                         'price': float(price),
-                        'action': 'open'
+                        'action': 'open',
+                        'direction': direction,
+                        'quantity': qty,
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
+                        'reason': 'open'
                     })
                     # Track open trade context for close logging
                     self._open_ts = ts
-                    self._entry_tc = float(entry_tc)
+                    self._entry_tc = float(total_cost)
                     # Increment daily trade count
                     self._daily_trade_count = int(self._daily_trade_count) + 1
                     # Side-balance counters (opens)
@@ -590,13 +804,15 @@ class IntradayRLEnv(Env):
                 self.scale_out_done = False
             else:
                 # Helpful debug breadcrumbs when trades fail to open
-                logger.debug(
-                    "Skip open: contracts=0 (risk sizing) | price=%.4f atr=%.4f equity=%.2f stop_r=%.3f",
-                    price, atr_val, self.equity,
-                    float(getattr(self.risk_manager.risk_config, 'stop_r_multiple', 1.0))
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Skip open: contracts=0 (risk sizing) | price=%.4f atr=%.4f equity=%.2f stop_r=%.3f",
+                        price, atr_val, self.equity,
+                        float(getattr(self.risk_manager.risk_config, 'stop_r_multiple', 1.0))
+                    )
         elif desired_dir != 0 and self.pos == 0 and in_no_trade:
-            logger.debug("Skip open: in no-trade window at %s", ts)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Skip open: in no-trade window at %s", ts)
 
         # Partial scale-out when in profit (optional)
         try:
@@ -608,10 +824,34 @@ class IntradayRLEnv(Env):
             if r_unreal >= scale_r and abs(self.pos) > 1:
                 half = int(abs(self.pos) // 2) * int(np.sign(self.pos))
                 self.cash += (price - self.entry_price) * half * self.point_value
-                self.cash -= estimate_tc(half, price, self.exec_sim)
+                try:
+                    side = 'sell' if half > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(half)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(comp.get('spread', 0.0))
+                    total_cost = float(comp.get('total', commission_cost + slippage_cost + impact_cost + spread_cost))
+                except Exception:
+                    total_cost = estimate_tc(half, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = spread_cost = 0.0
+                self.cash -= float(total_cost)
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
                 self.pos -= half
                 try:
-                    self.trades.append({'ts': ts, 'pos': int(self.pos), 'price': float(price), 'action': 'scale_out'})
+                    self.trades.append({
+                        'ts': ts,
+                        'pos': int(self.pos),
+                        'price': float(price),
+                        'action': 'scale_out',
+                        'quantity': int(abs(half)),
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
+                        'reason': 'scale_out'
+                    })
                 except Exception:
                     pass
                 self.scale_out_done = True
@@ -624,6 +864,10 @@ class IntradayRLEnv(Env):
 
         # Compute pnl for reward as realized delta in equity this step
         pnl = float(self.equity - prev_equity)
+        
+        # Track transaction costs for composite reward
+        if self.composite_reward is not None:
+            self._prev_tx_costs = float(getattr(self, 'tx_costs_total', 0.0))
 
         # Compute risk penalties per modified_step logic
         # Drawdown as fraction from peak equity
@@ -647,162 +891,196 @@ class IntradayRLEnv(Env):
         risk_penalty = max(0.0, float(realised_fraction))  # penalize only when drawdown is present
 
         # --- Reward Calculation ---
-        # Compute bar return for optional directional shaping (de-meaned within day)
-        try:
-            prev_price = float(self.df["close"].iloc[self.i - 1]) if self.i > 0 else price
-            bar_return = (price - prev_price) / max(prev_price, 1e-8)
-        except Exception:
-            bar_return = 0.0
+        reward_info: Dict[str, float] = {}
+        reward_raw = 0.0
+        reward_scaled = 0.0
+        reward_clipped = 0.0
+        applied_reward_scaling = False
+        # Use composite reward if configured, otherwise use existing reward calculation
+        if self.composite_reward is not None:
+            # Calculate transaction cost for this step
+            tx_cost = 0.0
+            if self.include_costs:
+                try:
+                    tx_cost = float(getattr(self, 'tx_costs_total', 0.0)) - float(getattr(self, '_prev_tx_costs', 0.0))
+                    self._prev_tx_costs = float(getattr(self, 'tx_costs_total', 0.0))
+                except Exception:
+                    tx_cost = 0.0
 
-        # Update daily mean return trackers (use previous mean to de-mean current return)
-        try:
-            day_mean_ret = (self._day_return_sum / max(1, self._day_return_count))
-        except Exception:
-            day_mean_ret = 0.0
-        # Remove de-meaning bias - use raw bar_return for directional rewards
-        # The de-meaning was penalizing correct directional bets
-        eff_bar_return = float(bar_return)  # Use raw return, not de-meaned
-        # Update running stats after computing eff return
-        try:
-            self._day_return_sum += float(bar_return)
-            self._day_return_count += 1
-        except Exception:
-            pass
-        # Compute normalized PnL using ATR if requested
-        try:
-            pnl_cap = float(self.config.get('env', {}).get('reward', {}).get('pnl_cap', 1.0)) if isinstance(self.config, dict) else 1.0
-        except Exception:
-            pnl_cap = 1.0
-        pnl_norm = 0.0
-        try:
-            denom = max(1e-6, atr_val * float(getattr(self, 'point_value', 1.0)))
-            pnl_norm = float(np.clip(pnl / denom, -pnl_cap, pnl_cap))
-        except Exception:
+            # Calculate composite reward
+            reward_raw, reward_info = self.composite_reward.step(float(pnl), int(self.pos), float(tx_cost))
+            reward_scaled = float(reward_raw) * float(getattr(self.env_config, 'reward_scaling', 1.0))
+            reward_clipped = float(np.clip(reward_scaled, -1.0, 1.0))
+            reward_info = dict(reward_info)
+            reward_info.update({
+                'reward_raw': float(reward_raw),
+                'reward_scaled': float(reward_scaled),
+                'reward_clipped': float(reward_clipped),
+                'tx_cost': float(tx_cost),
+            })
+            reward = reward_clipped
+            applied_reward_scaling = True
+        else:
+            # Compute bar return for optional directional shaping (de-meaned within day)
+            try:
+                prev_price = float(self.df["close"].iloc[self.i - 1]) if self.i > 0 else price
+                bar_return = (price - prev_price) / max(prev_price, 1e-8)
+            except Exception:
+                bar_return = 0.0
+
+            # Update daily mean return trackers (use previous mean to de-mean current return)
+            try:
+                day_mean_ret = (self._day_return_sum / max(1, self._day_return_count))
+            except Exception:
+                day_mean_ret = 0.0
+            # Remove de-meaning bias - use raw bar_return for directional rewards
+            # The de-meaning was penalizing correct directional bets
+            eff_bar_return = float(bar_return)  # Use raw return, not de-meaned
+            # Update running stats after computing eff return
+            try:
+                self._day_return_sum += float(bar_return)
+                self._day_return_count += 1
+            except Exception:
+                pass
+            # Compute normalized PnL using ATR if requested
+            try:
+                pnl_cap = float(self.config.get('env', {}).get('reward', {}).get('pnl_cap', 1.0)) if isinstance(self.config, dict) else 1.0
+            except Exception:
+                pnl_cap = 1.0
             pnl_norm = 0.0
-
-        # Drawdown acceleration penalty (EMA of dd slope)
-        try:
-            dd = (self.equity / max(self.max_equity, 1e-6)) - 1.0
-            dd_slope = float(dd - self._prev_dd)
-            self._prev_dd = float(dd)
-            # EMA update
-            dd_alpha = 0.2
-            self._dd_slope_ema = (1 - dd_alpha) * self._dd_slope_ema + dd_alpha * dd_slope
-        except Exception:
-            dd_slope = 0.0
-
-        if self.env_config.reward_type == 'pnl':
-            reward = pnl
-        elif self.env_config.reward_type == 'dsr':
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            reward = self.dsr.update(step_return)
-        elif self.env_config.reward_type == 'sharpe':
-            # Note: simplified Sharpe ratio proxy per step
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            reward = step_return / (np.std(self.equity_curve) + 1e-8) if len(self.equity_curve) > 1 else 0.0
-        elif self.env_config.reward_type == 'blend':
-            # Blended reward: alpha * DSR + beta * raw_pnl - penalties
-            alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.5)) if isinstance(self.config, dict) else 0.5
-            beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.5)) if isinstance(self.config, dict) else 0.5
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            dsr_val = self.dsr.update(step_return)
-            reward = alpha * dsr_val + beta * pnl
-            # Microstructure penalty (optional): discourage trading in poor liquidity
             try:
-                rvol = float(self.X.loc[ts].get('rvol', 1.0))
-                spread = float(self.X.loc[ts].get('spread', 0.0))
-                mu_pen = float(self.config.get('env', {}).get('reward', {}).get('micro_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
-                # time-of-day widening: add extra penalty during first/last widen window
-                widen_min = int(self.config.get('env', {}).get('trading', {}).get('widen_spread_minutes', 0)) if isinstance(self.config, dict) else 0
-                minutes_since_midnight = ts.hour * 60 + ts.minute
-                session_open = 9 * 60 + 30
-                session_close = 16 * 60
-                in_widen = (widen_min and session_open <= minutes_since_midnight < session_open + widen_min) or \
-                           (widen_min and session_close - widen_min <= minutes_since_midnight < session_close)
-                widen_factor = 1.0 + (0.25 if in_widen else 0.0)
-                # apply micro penalty only under poor liquidity
-                if rvol < 1.0:
-                    reward -= mu_pen * widen_factor * (max(0.0, 1.5 - rvol) + spread)
+                denom = max(1e-6, atr_val * float(getattr(self, 'point_value', 1.0)))
+                pnl_norm = float(np.clip(pnl / denom, -pnl_cap, pnl_cap))
             except Exception:
-                pass
-            # Optional activity shaping toward target trades/day
+                pnl_norm = 0.0
+
+            # Drawdown acceleration penalty (EMA of dd slope)
             try:
-                if self.entry_index == self.i:
-                    target = int(self.config.get('env', {}).get('reward', {}).get('trade_target_per_day', 2)) if isinstance(self.config, dict) else 2
-                    bonus = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
-                    penalty = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
-                    if self._daily_trade_count <= target:
-                        reward += bonus
+                dd = (self.equity / max(self.max_equity, 1e-6)) - 1.0
+                dd_slope = float(dd - self._prev_dd)
+                self._prev_dd = float(dd)
+                # EMA update
+                dd_alpha = 0.2
+                self._dd_slope_ema = (1 - dd_alpha) * self._dd_slope_ema + dd_alpha * dd_slope
+            except Exception:
+                dd_slope = 0.0
+
+            if self.env_config.reward_type == 'pnl':
+                reward = pnl
+            elif self.env_config.reward_type == 'dsr':
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                reward = self.dsr.update(step_return)
+            elif self.env_config.reward_type == 'sharpe':
+                # Note: simplified Sharpe ratio proxy per step
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                reward = step_return / (np.std(self.equity_curve) + 1e-8) if len(self.equity_curve) > 1 else 0.0
+            elif self.env_config.reward_type == 'blend':
+                # Blended reward: alpha * DSR + beta * raw_pnl - penalties
+                alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.5)) if isinstance(self.config, dict) else 0.5
+                beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.5)) if isinstance(self.config, dict) else 0.5
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                dsr_val = self.dsr.update(step_return)
+                reward = alpha * dsr_val + beta * pnl
+                # Microstructure penalty (optional): discourage trading in poor liquidity
+                try:
+                    rvol = float(self.X.loc[ts].get('rvol', 1.0))
+                    spread = float(self.X.loc[ts].get('spread', 0.0))
+                    mu_pen = float(self.config.get('env', {}).get('reward', {}).get('micro_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                    # time-of-day widening: add extra penalty during first/last widen window
+                    widen_min = int(self.config.get('env', {}).get('trading', {}).get('widen_spread_minutes', 0)) if isinstance(self.config, dict) else 0
+                    minutes_since_midnight = ts.hour * 60 + ts.minute
+                    session_open = 9 * 60 + 30
+                    session_close = 16 * 60
+                    in_widen = (widen_min and session_open <= minutes_since_midnight < session_open + widen_min) or \
+                               (widen_min and session_close - widen_min <= minutes_since_midnight < session_close)
+                    widen_factor = 1.0 + (0.25 if in_widen else 0.0)
+                    # apply micro penalty only under poor liquidity
+                    if rvol < 1.0:
+                        reward -= mu_pen * widen_factor * (max(0.0, 1.5 - rvol) + spread)
+                except Exception:
+                    pass
+                # Optional activity shaping toward target trades/day
+                try:
+                    if self.entry_index == self.i:
+                        target = int(self.config.get('env', {}).get('reward', {}).get('trade_target_per_day', 2)) if isinstance(self.config, dict) else 2
+                        bonus = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
+                        penalty = float(self.config.get('env', {}).get('reward', {}).get('trade_activity_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                        if self._daily_trade_count <= target:
+                            reward += bonus
+                        else:
+                            # penalize excess trades beyond target
+                            reward -= penalty * max(0, int(self._daily_trade_count) - target)
                     else:
-                        # penalize excess trades beyond target
-                        reward -= penalty * max(0, int(self._daily_trade_count) - target)
-                else:
-                    # Backward-compatible open bonus
-                    open_bonus = float(self.config.get('env', {}).get('reward', {}).get('open_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
-                    if open_bonus > 0 and self.entry_index == self.i:
-                        reward += open_bonus
-            except Exception:
-                pass
-            reward -= float(drawdown_penalty) + float(risk_penalty)
-        elif self.env_config.reward_type == 'directional':
-            # Pure directional shaping on chosen action (short=-1, hold=0, long=1)
-            # Encourages taking a side even before a position is opened.
-            try:
-                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
-            except Exception:
-                dir_w = 100.0
-            reward = dir_w * float(desired_dir) * float(eff_bar_return)
-            reward -= float(drawdown_penalty) + float(risk_penalty)
-        elif self.env_config.reward_type == 'hybrid':
-            # Hybrid: blend of DSR, PnL, and directional shaping
-            try:
-                alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.2)) if isinstance(self.config, dict) else 0.2
-                beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.3)) if isinstance(self.config, dict) else 0.3
-                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
-            except Exception:
-                alpha, beta, dir_w = 0.2, 0.3, 100.0
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            dsr_val = self.dsr.update(step_return)
-            reward = alpha * dsr_val + beta * pnl + dir_w * float(desired_dir) * float(eff_bar_return)
-            reward -= float(drawdown_penalty) + float(risk_penalty)
-        elif self.env_config.reward_type == 'hybrid2':
-            # Best-practice hybrid: normalized PnL + DSR + drift-neutral directional + activity soft-constraint + churn + dd accel
-            try:
-                alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.15)) if isinstance(self.config, dict) else 0.15
-                beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.25)) if isinstance(self.config, dict) else 0.25
-                dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 300.0)) if isinstance(self.config, dict) else 300.0
-                churn_pen = float(self.config.get('env', {}).get('reward', {}).get('churn_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
-                dd_accel_pen = float(self.config.get('env', {}).get('reward', {}).get('dd_accel_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
-            except Exception:
-                alpha, beta, dir_w, churn_pen, dd_accel_pen = 0.15, 0.25, 300.0, 0.0, 0.0
-            # Regime weighting via VIX if available
-            try:
-                vix = float(self.X.loc[ts].get('vix', np.nan))
-                if vix == vix:
-                    vix_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_low', 15.0))
-                    vix_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_high', 25.0))
-                    w_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_low', 0.7))
-                    w_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_high', 1.2))
-                    regime_mult = w_low if vix < vix_low else (w_high if vix > vix_high else 1.0)
-                else:
+                        # Backward-compatible open bonus
+                        open_bonus = float(self.config.get('env', {}).get('reward', {}).get('open_bonus', 0.0)) if isinstance(self.config, dict) else 0.0
+                        if open_bonus > 0 and self.entry_index == self.i:
+                            reward += open_bonus
+                except Exception:
+                    pass
+                reward -= float(drawdown_penalty) + float(risk_penalty)
+            elif self.env_config.reward_type == 'directional':
+                # Pure directional shaping on chosen action (short=-1, hold=0, long=1)
+                # Encourages taking a side even before a position is opened.
+                try:
+                    dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
+                except Exception:
+                    dir_w = 100.0
+                reward = dir_w * float(desired_dir) * float(eff_bar_return)
+                reward -= float(drawdown_penalty) + float(risk_penalty)
+            elif self.env_config.reward_type == 'hybrid':
+                # Hybrid: blend of DSR, PnL, and directional shaping
+                try:
+                    alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.2)) if isinstance(self.config, dict) else 0.2
+                    beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.3)) if isinstance(self.config, dict) else 0.3
+                    dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 100.0)) if isinstance(self.config, dict) else 100.0
+                except Exception:
+                    alpha, beta, dir_w = 0.2, 0.3, 100.0
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                dsr_val = self.dsr.update(step_return)
+                reward = alpha * dsr_val + beta * pnl + dir_w * float(desired_dir) * float(eff_bar_return)
+                reward -= float(drawdown_penalty) + float(risk_penalty)
+            elif self.env_config.reward_type == 'hybrid2':
+                # Best-practice hybrid: normalized PnL + DSR + drift-neutral directional + activity soft-constraint + churn + dd accel
+                try:
+                    alpha = float(self.config.get('env', {}).get('reward', {}).get('alpha', 0.15)) if isinstance(self.config, dict) else 0.15
+                    beta = float(self.config.get('env', {}).get('reward', {}).get('beta', 0.25)) if isinstance(self.config, dict) else 0.25
+                    dir_w = float(self.config.get('env', {}).get('reward', {}).get('dir_weight', 300.0)) if isinstance(self.config, dict) else 300.0
+                    churn_pen = float(self.config.get('env', {}).get('reward', {}).get('churn_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                    dd_accel_pen = float(self.config.get('env', {}).get('reward', {}).get('dd_accel_penalty', 0.0)) if isinstance(self.config, dict) else 0.0
+                except Exception:
+                    alpha, beta, dir_w, churn_pen, dd_accel_pen = 0.15, 0.25, 300.0, 0.0, 0.0
+                # Regime weighting via VIX if available
+                try:
+                    vix = float(self.X.loc[ts].get('vix', np.nan))
+                    if vix == vix:
+                        vix_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_low', 15.0))
+                        vix_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('vix_high', 25.0))
+                        w_low = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_low', 0.7))
+                        w_high = float(self.config.get('env', {}).get('reward', {}).get('regime_weights', {}).get('dir_weight_high', 1.2))
+                        regime_mult = w_low if vix < vix_low else (w_high if vix > vix_high else 1.0)
+                    else:
+                        regime_mult = 1.0
+                except Exception:
                     regime_mult = 1.0
-            except Exception:
-                regime_mult = 1.0
-            # Activity term (apply on opens tracked separately below)
-            activity_term = 0.0
-            # Churn penalty: penalize side flips when flat
-            if self.pos == 0 and desired_dir != 0 and self._last_action_dir != 0 and desired_dir != self._last_action_dir:
-                activity_term -= churn_pen
-            # Drawdown acceleration penalty (only penalize positive slope)
-            if self._dd_slope_ema > 0:
-                activity_term -= dd_accel_pen * float(self._dd_slope_ema)
-            # Core blend
-            step_return = pnl / prev_equity if prev_equity != 0 else 0.0
-            dsr_val = self.dsr.update(step_return)
-            reward = alpha * dsr_val + beta * pnl_norm + dir_w * regime_mult * float(desired_dir) * float(eff_bar_return) + activity_term
-            reward -= float(drawdown_penalty) + float(risk_penalty)
-        else:  # Default to pnl with penalties
-            reward = pnl - float(drawdown_penalty) - float(risk_penalty)
+                # Activity term (apply on opens tracked separately below)
+                activity_term = 0.0
+                # Churn penalty: penalize side flips when flat
+                if self.pos == 0 and desired_dir != 0 and self._last_action_dir != 0 and desired_dir != self._last_action_dir:
+                    activity_term -= churn_pen
+                # Drawdown acceleration penalty (only penalize positive slope)
+                if self._dd_slope_ema > 0:
+                    activity_term -= dd_accel_pen * float(self._dd_slope_ema)
+                # Core blend
+                step_return = pnl / prev_equity if prev_equity != 0 else 0.0
+                dsr_val = self.dsr.update(step_return)
+                reward = alpha * dsr_val + beta * pnl_norm + dir_w * regime_mult * float(desired_dir) * float(eff_bar_return) + activity_term
+                reward -= float(drawdown_penalty) + float(risk_penalty)
+            else:  # Default to pnl with penalties
+                reward = pnl - float(drawdown_penalty) - float(risk_penalty)
+            
+            # Apply reward scaling for non-composite rewards
+            reward *= self.env_config.reward_scaling
+            reward = np.clip(reward, -1, 1)
 
         # Optional hold penalty to discourage persistent inactivity when flat
         try:
@@ -841,8 +1119,44 @@ class IntradayRLEnv(Env):
         except Exception:
             pass
 
-        reward *= self.env_config.reward_scaling
-        reward = np.clip(reward, -1, 1)
+        # Optional small stochastic reward to break zero-variance targets early in training
+        try:
+            noise_std = float(self.config.get('env', {}).get('reward', {}).get('noise_std', 0.0)) if isinstance(self.config, dict) else 0.0
+        except Exception:
+            noise_std = 0.0
+        if noise_std > 0.0:
+            try:
+                reward += float(np.random.normal(0.0, noise_std))
+            except Exception:
+                pass
+
+        # Note: Composite reward is now handled above in the main reward calculation section
+        # This section is removed to avoid double-counting
+
+        if not applied_reward_scaling:
+            reward *= self.env_config.reward_scaling
+        reward = float(np.clip(reward, -1, 1))
+        reward_clipped = float(reward)
+
+        if self.composite_reward is not None:
+            record = dict(reward_info)
+            record.setdefault('reward_raw', float(reward_raw))
+            record.setdefault('reward_scaled', float(reward_scaled))
+            record.setdefault('reward_clipped', float(reward_clipped))
+            record.setdefault('pnl_term', float(reward_info.get('pnl_term', reward_raw)))
+            record.setdefault('turnover_pen', float(reward_info.get('turnover_pen', 0.0)))
+            record.setdefault('inv_pen', float(reward_info.get('inv_pen', 0.0)))
+            record.setdefault('dsr_pen', float(reward_info.get('dsr_pen', 0.0)))
+            record['ts'] = ts
+            record['episode'] = float(self._reward_episode_idx)
+            record['pos'] = int(self.pos)
+            try:
+                self._reward_episode_trace.append(record)
+                self._reward_history.append(record)
+                if len(self._reward_history) > 100000:
+                    self._reward_history = self._reward_history[-100000:]
+            except Exception:
+                pass
         # Track last action dir for churn evaluation next step
         try:
             self._last_action_dir = int(np.sign(desired_dir))
@@ -854,7 +1168,17 @@ class IntradayRLEnv(Env):
         if self.realized_drawdown > max_daily_pct:
             # Force flat and charge closing costs
             if self.pos != 0:
-                tc = estimate_tc(self.pos, price, self.exec_sim)
+                try:
+                    side = 'sell' if self.pos > 0 else 'buy'
+                    comp = self.exec_sim.estimate_transaction_costs(abs(int(self.pos)), price, side)
+                    commission_cost = float(comp.get('commission', 0.0))
+                    slippage_cost = float(comp.get('slippage', 0.0))
+                    impact_cost = float(comp.get('impact', 0.0))
+                    spread_cost = float(comp.get('spread', 0.0))
+                    total_cost = float(comp.get('total', commission_cost + slippage_cost + impact_cost + spread_cost))
+                except Exception:
+                    total_cost = estimate_tc(self.pos, price, self.exec_sim)
+                    commission_cost = slippage_cost = impact_cost = spread_cost = 0.0
                 try:
                     # Log close due to kill-switch
                     open_ts = getattr(self, '_open_ts', None)
@@ -863,7 +1187,7 @@ class IntradayRLEnv(Env):
                     direction = 'long' if self.pos > 0 else 'short'
                     exit_price = float(price)
                     gross_pnl = (exit_price - self.entry_price) * (1 if direction == 'long' else -1) * qty * self.point_value
-                    net_pnl = gross_pnl - entry_tc - float(tc)
+                    net_pnl = gross_pnl - entry_tc - float(total_cost)
                     self.trades.append({
                         'ts': ts,
                         'pos': 0,
@@ -876,14 +1200,20 @@ class IntradayRLEnv(Env):
                         'exit_price': float(exit_price),
                         'quantity': qty,
                         'direction': direction,
+                        'gross_pnl': float(gross_pnl),
                         'pnl': float(net_pnl),
                         'duration_min': float(((ts - open_ts).total_seconds() / 60.0) if open_ts is not None else 0.0),
                         'commission_entry': float(entry_tc),
-                        'commission_exit': float(tc)
+                        'commission_cost': float(commission_cost),
+                        'slippage_cost': float(slippage_cost),
+                        'impact_cost': float(impact_cost),
+                        'spread_cost': float(spread_cost),
+                        'total_cost': float(total_cost),
                     })
                 except Exception:
                     pass
-                self.cash -= tc
+                self.cash -= float(total_cost)
+                self.tx_costs_total = float(self.tx_costs_total) + float(total_cost)
                 self.pos = 0
                 self.entry_price = None
                 self.stop_price = None
@@ -903,17 +1233,129 @@ class IntradayRLEnv(Env):
         if np.isnan(next_price) or np.isinf(next_price):
             next_price = 0.0
 
+        # Diagnostics: per-step action intent and OFI sign proxy
+        try:
+            dpos = int(self.pos) - int(prev_pos)
+        except Exception:
+            dpos = 0
+        try:
+            ofi_val = float(self.X.loc[ts].get('order_flow_imbalance', np.nan))
+            ofi_sign = 0 if not np.isfinite(ofi_val) or ofi_val == 0 else (1 if ofi_val > 0 else -1)
+        except Exception:
+            ofi_val = float('nan')
+            ofi_sign = 0
+        try:
+            self._diagnostics.append({
+                'ts': ts,
+                'action': int(np.sign(desired_dir)) if desired_dir != 0 else 0,
+                'pos': int(self.pos),
+                'prev_pos': int(prev_pos),
+                'dpos': int(dpos),
+                'price': float(price),
+                'ofi_best': float(ofi_val),
+                'ofi_sign': int(ofi_sign),
+                'reward': float(reward_clipped),
+                'reward_raw': float(reward_raw) if self.composite_reward is not None else float('nan'),
+                'reward_scaled': float(reward_scaled) if self.composite_reward is not None else float('nan'),
+                'pnl_term': float(reward_info.get('pnl_term', reward_raw)) if self.composite_reward is not None else float('nan'),
+                'turnover_pen': float(reward_info.get('turnover_pen', 0.0)) if self.composite_reward is not None else float('nan'),
+                'inv_pen': float(reward_info.get('inv_pen', 0.0)) if self.composite_reward is not None else float('nan'),
+                'dsr_pen': float(reward_info.get('dsr_pen', 0.0)) if self.composite_reward is not None else float('nan'),
+            })
+        except Exception:
+            pass
+
+        # Check episode truncation by max_steps
+        truncated = False
+        try:
+            max_steps = int(getattr(self.env_config, 'max_steps', 0))
+        except Exception:
+            max_steps = 0
+        if max_steps and int(self._steps_in_episode) >= max_steps and not done:
+            truncated = True
+            done = True
+
+        dsr_value: Optional[float] = None
+        if (done or truncated) and self.composite_reward is not None:
+            try:
+                self._finalize_reward_episode()
+                dsr_value = float(self.composite_reward.get_final_dsr())
+            except Exception:
+                dsr_value = None
+
         obs = self._obs(next_ts, next_price)
 
-        # Diagnostic info
+        # Diagnostic info (only when DEBUG to reduce overhead)
         info = {
             "pnl": float(pnl),
             "drawdown_penalty": float(drawdown_penalty),
             "risk_penalty": float(risk_penalty),
             "realized_drawdown": float(self.realized_drawdown),
+            "equity": float(self.equity),
         }
-        info["equity"] = float(self.equity)
-        return obs, float(reward), bool(done), False, info
+        if dsr_value is not None and np.isfinite(dsr_value):
+            info["dsr"] = dsr_value
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Before returning from step")
+            logger.debug("Total step time: %.6fs", (time.time() - step_start_time))
+        return obs, float(reward), bool(done), bool(truncated), info
+
+    def get_diagnostics(self):
+        """Return per-step diagnostics as a DataFrame if available."""
+        try:
+            import pandas as _pd
+            return _pd.DataFrame(self._diagnostics)
+        except Exception:
+            return None
+
+    def _finalize_reward_episode(self) -> None:
+        """Aggregate per-episode reward component statistics."""
+        if self.composite_reward is None or not self._reward_episode_trace:
+            self._reward_episode_trace = []
+            return
+        try:
+            df = pd.DataFrame(self._reward_episode_trace)
+            if df.empty:
+                self._reward_episode_trace = []
+                return
+            stats: Dict[str, float] = {'episode': float(self._reward_episode_idx or 0)}
+            reward_cols = [
+                'pnl_term',
+                'turnover_pen',
+                'inv_pen',
+                'dsr_pen',
+                'reward_raw',
+                'reward_scaled',
+                'reward_clipped',
+            ]
+            for col in reward_cols:
+                if col in df.columns:
+                    series = pd.to_numeric(df[col], errors='coerce')
+                    stats[f'{col}_mean'] = float(series.mean()) if len(series) else 0.0
+                    stats[f'{col}_std'] = float(series.std(ddof=0)) if len(series) else 0.0
+            self._reward_breakdown.append(stats)
+        except Exception as exc:
+            logger.debug(f"Failed to finalize reward episode stats: {exc}")
+        finally:
+            self._reward_episode_trace = []
+
+    def get_reward_breakdown(self):
+        """Return per-episode reward component stats as DataFrame if available."""
+        if not self._reward_breakdown:
+            return None
+        try:
+            return pd.DataFrame(self._reward_breakdown)
+        except Exception:
+            return None
+
+    def get_reward_history(self):
+        """Return per-step reward component history as DataFrame if available."""
+        if not self._reward_history:
+            return None
+        try:
+            return pd.DataFrame(self._reward_history)
+        except Exception:
+            return None
     
     def _obs(self, ts, price):
         """Construct observation vector."""
@@ -1103,8 +1545,11 @@ class IntradayRLEnv(Env):
         return pd.Series(self.equity_curve, index=self.df.index[:len(self.equity_curve)])
     
     def get_trades(self):
-        """Get trade history."""
-        return self.trades
+        """Get trade history for the most recently completed episode."""
+        trades = list(getattr(self, 'trades', []))
+        if trades:
+            return trades
+        return list(getattr(self, '_last_episode_trades', []))
     
     def get_performance_metrics(self):
         """Get performance metrics."""
@@ -1367,6 +1812,18 @@ class IntradayRLEnvironment(IntradayRLEnv):
         """Check triple barrier conditions for test compatibility."""
         # This would be implemented based on the current price and barrier prices
         return False  # Placeholder
+
+    # Diagnostics summary for richer logging consumers
+    def get_action_counts(self) -> Dict[str, int]:
+        try:
+            return {
+                'long_steps': int(self._act_counts.get('long', 0)),
+                'short_steps': int(self._act_counts.get('short', 0)),
+                'flat_steps': int(self._act_counts.get('flat', 0)),
+                'flips': int(getattr(self, '_flips', 0)),
+            }
+        except Exception:
+            return {'long_steps': 0, 'short_steps': 0, 'flat_steps': 0, 'flips': 0}
 
 
 # Keep the original alias for backward compatibility

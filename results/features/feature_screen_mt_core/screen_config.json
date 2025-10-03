@@ -1,0 +1,15 @@
+{
+  "config": "configs/settings.yaml",
+  "horizon_min": 5,
+  "embargo_min": 15,
+  "n_slices": 6,
+  "rf": {
+    "n": 200,
+    "depth": 7
+  },
+  "ridge": {
+    "alpha": 5.0
+  },
+  "seed": 123,
+  "n_features": 52
+}
